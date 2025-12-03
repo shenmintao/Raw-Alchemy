@@ -17,8 +17,8 @@ LOG_TO_WORKING_SPACE = {
     'Canon Log 3': 'Cinema Gamut',
     'S-Log3': 'S-Gamut3',
     'S-Log3.Cine': 'S-Gamut3.Cine',
-    'LogC3': 'ARRI Wide Gamut 3',
-    'LogC4': 'ARRI Wide Gamut 4',
+    'Arri LogC3': 'ARRI Wide Gamut 3',
+    'Arri LogC4': 'ARRI Wide Gamut 4',
     'Log3G10': 'RED Wide Gamut RGB',
 }
 
