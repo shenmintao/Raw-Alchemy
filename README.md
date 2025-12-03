@@ -96,7 +96,7 @@ raw-alchemy "input.ARW" "output.tiff" --log-space "S-Log3" --lut "looks/my_look.
 This example manually applies a +1.5 stop exposure compensation, overriding any auto-exposure logic.
 
 ```bash
-raw-alchemy "input.CR3" "output_bright.tiff" --exposure 1.5
+raw-alchemy "input.CR3" "output_bright.tiff" --log-space "S-Log3" --exposure 1.5
 ```
 
 ### Command Line Options

@@ -96,7 +96,7 @@ raw-alchemy "input.ARW" "output.tiff" --log-space "S-Log3" --lut "looks/my_look.
 此示例手动应用 +1.5 档的曝光补偿，它将覆盖任何自动曝光逻辑。
 
 ```bash
-raw-alchemy "input.CR3" "output_bright.tiff" --exposure 1.5
+raw-alchemy "input.CR3" "output_bright.tiff" --log-space "S-Log3" --exposure 1.5
 ```
 
 ### 命令行选项
