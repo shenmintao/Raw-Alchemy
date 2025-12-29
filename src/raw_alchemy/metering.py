@@ -52,6 +52,8 @@ class AverageMeteringStrategy:
         coeffs = utils.get_luminance_coeffs(source_colorspace)
         luminance = np.dot(sample, coeffs)
         
+        # 确保亮度值为正，避免对数运算中的无效值
+        luminance = np.maximum(luminance, 1e-10)
         avg_log_lum = np.mean(np.log(luminance + 1e-6))
         avg_lum = np.exp(avg_log_lum)
         
@@ -147,6 +149,8 @@ class HybridMeteringStrategy:
         coeffs = utils.get_luminance_coeffs(source_colorspace)
         luminance = np.dot(sample, coeffs)
         
+        # 确保亮度值为正，避免对数运算中的无效值
+        luminance = np.maximum(luminance, 1e-10)
         avg_log_lum = np.mean(np.log(luminance + 1e-6))
         avg_lum = np.exp(avg_log_lum)
         base_gain = target_gray / (avg_lum + 1e-6)
