@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*' # Push events to tags matching v*, e.g. v1.0, v20.15.10
+      - 'studio-v*' # Push events to tags matching studio-v*, e.g. studio-v1.0
 
 jobs:
   build-windows:
@@ -35,7 +36,7 @@ jobs:
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RawAlchemy-windows
+          name: RawAlchemyStudio-windows
           path: dist/RawAlchemy.exe
 
   build-linux:
@@ -63,7 +64,7 @@ jobs:
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RawAlchemy-linux
+          name: RawAlchemyStudio-linux
           path: dist/RawAlchemy
 
   build-macos:
@@ -111,20 +112,20 @@ jobs:
         run: |
           tag="${{ github.ref_name }}"
           create-dmg \
-            --volname "RawAlchemy Installer" \
+            --volname "RawAlchemyStudio Installer" \
             --window-pos 200 120 \
             --window-size 800 400 \
             --icon-size 100 \
             --icon "RawAlchemy.app" 200 190 \
             --hide-extension "RawAlchemy.app" \
             --app-drop-link 600 185 \
-            "dist/RawAlchemy-${tag}-macos.dmg" \
+            "dist/RawAlchemyStudio-${tag}-macos.dmg" \
             "dist/RawAlchemy.app"
 
       - name: Upload macOS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RawAlchemy-macos-dmg
+          name: RawAlchemyStudio-macos-dmg
           path: dist/*.dmg
 
   release:
@@ -142,16 +143,16 @@ jobs:
       - name: Prepare Artifacts for Release
         run: |
           tag="${{ github.ref_name }}"
-          mv artifacts/RawAlchemy-windows/RawAlchemy.exe "RawAlchemy-${tag}-windows.exe"
-          mv artifacts/RawAlchemy-linux/RawAlchemy "RawAlchemy-${tag}-linux"
+          mv artifacts/RawAlchemyStudio-windows/RawAlchemy.exe "RawAlchemyStudio-${tag}-windows.exe"
+          mv artifacts/RawAlchemyStudio-linux/RawAlchemy "RawAlchemyStudio-${tag}-linux"
           # The macOS artifact is now a DMG and already named correctly
-          mv artifacts/RawAlchemy-macos-dmg/*.dmg .
+          mv artifacts/RawAlchemyStudio-macos-dmg/*.dmg .
         shell: bash
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            RawAlchemy-*-windows.exe
-            RawAlchemy-*-linux
-            RawAlchemy-*-macos.dmg
+            RawAlchemyStudio-*-windows.exe
+            RawAlchemyStudio-*-linux
+            RawAlchemyStudio-*-macos.dmg
