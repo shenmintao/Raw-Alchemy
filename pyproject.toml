@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "raw_alchemy_studio"
-version = "0.5.0"
+version = "0.1.0"
 description = "Raw Alchemy Studio - A fast culling/grading tool that applies cinematic LUTs to RAW photos with mathematical precision."
 readme = "README.md"
 requires-python = ">=3.11"
