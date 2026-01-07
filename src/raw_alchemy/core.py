@@ -106,29 +106,32 @@ def process_image(
     img = utils.apply_saturation_and_contrast(img, saturation=saturation, contrast=contrast, colourspace=source_cs)
 
     # --- Step 4: 色彩空间转换 (ProPhoto Linear -> Log) ---
-    log_color_space_name = LOG_TO_WORKING_SPACE.get(log_space)
-    log_curve_name = LOG_ENCODING_MAP.get(log_space, log_space)
-    
-    if not log_color_space_name:
-         raise ValueError(f"Unknown Log Space: {log_space}")
+    if log_space and log_space != 'None':
+        log_color_space_name = LOG_TO_WORKING_SPACE.get(log_space)
+        log_curve_name = LOG_ENCODING_MAP.get(log_space, log_space)
+        
+        if not log_color_space_name:
+             raise ValueError(f"Unknown Log Space: {log_space}")
 
-    logger.info(f"  🔹 [Step 4] Color Transform (ProPhoto -> {log_color_space_name} -> {log_curve_name})")
+        logger.info(f"  🔹 [Step 4] Color Transform (ProPhoto -> {log_color_space_name} -> {log_curve_name})")
 
-    # 4.1 Gamut 变换 (矩阵运算)
-    M = colour.matrix_RGB_to_RGB(
-        colour.RGB_COLOURSPACES['ProPhoto RGB'],
-        colour.RGB_COLOURSPACES[log_color_space_name],
-    )
-    if not img.flags['C_CONTIGUOUS']:
-        img = np.ascontiguousarray(img)
-    if img.dtype != np.float32:
-        img = img.astype(np.float32)
-    utils.apply_matrix_inplace(img, M)
-    
-    # 4.2 Log 编码
-    # Log 函数无法处理负值，需裁剪微小底噪
-    np.maximum(img, 1e-6, out=img) 
-    img = colour.cctf_encoding(img, function=log_curve_name)
+        # 4.1 Gamut 变换 (矩阵运算)
+        M = colour.matrix_RGB_to_RGB(
+            colour.RGB_COLOURSPACES['ProPhoto RGB'],
+            colour.RGB_COLOURSPACES[log_color_space_name],
+        )
+        if not img.flags['C_CONTIGUOUS']:
+            img = np.ascontiguousarray(img)
+        if img.dtype != np.float32:
+            img = img.astype(np.float32)
+        utils.apply_matrix_inplace(img, M)
+        
+        # 4.2 Log 编码
+        # Log 函数无法处理负值，需裁剪微小底噪
+        np.maximum(img, 1e-6, out=img)
+        img = colour.cctf_encoding(img, function=log_curve_name)
+    else:
+        logger.info("  🔹 [Step 4] Skipping Color Transform (Log Space is None)")
 
     # --- Step 5: 应用 LUT ---
     if lut_path:

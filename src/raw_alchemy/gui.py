@@ -12,7 +12,8 @@ from typing import Optional, Dict
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QFileDialog, QListWidget, QListWidgetItem, QFrame,
-    QSplitter, QSizePolicy, QGraphicsDropShadowEffect, QGridLayout
+    QSplitter, QSizePolicy, QGraphicsDropShadowEffect, QGridLayout,
+    QInputDialog
 )
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QTimer, QEvent
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QPainter, QColor, QResizeEvent, QTransform
@@ -22,7 +23,7 @@ from qfluentwidgets import (
     ComboBox, Slider, CaptionLabel, SwitchButton, StrongBodyLabel,
     BodyLabel, LineEdit, ToolButton, FluentIcon as FIF,
     CardWidget, SimpleCardWidget, ScrollArea, IndeterminateProgressRing,
-    InfoBar, InfoBarPosition, Theme, setTheme, CheckBox
+    InfoBar, InfoBarPosition, Theme, setTheme, CheckBox, ProgressRing
 )
 
 from raw_alchemy import config, utils, orchestrator, metering, lensfun_wrapper
@@ -402,7 +403,6 @@ class GalleryItem(QWidget):
         super().__init__(parent)
         self.path = path
         self.base_name = os.path.basename(path)
-        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
         
@@ -502,6 +502,7 @@ class InspectorPanel(ScrollArea):
         color_layout.addWidget(BodyLabel("LUT"))
         lut_layout = QHBoxLayout()
         self.lut_combo = ComboBox()
+        self.lut_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.lut_combo.addItem("None")
         self.lut_combo.currentTextChanged.connect(self._on_param_change)
         
@@ -555,6 +556,7 @@ class InspectorPanel(ScrollArea):
             layout = QVBoxLayout()
             lbl = BodyLabel(f"{name}: {default_v}")
             slider = Slider(Qt.Orientation.Horizontal)
+            # slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             slider.setRange(int(min_v*scale), int(max_v*scale))
             slider.setValue(int(default_v*scale))
             
@@ -579,7 +581,7 @@ class InspectorPanel(ScrollArea):
         add_slider('shadow', 'Shadows', -100, 100, 0, 1)
         
         self.reset_btn = PushButton("Reset All")
-        self.reset_btn.clicked.connect(self.reset_params)
+        self.reset_btn.clicked.connect(self.reset_adjustments)
         adj_layout.addWidget(self.reset_btn)
         
         self.add_section("Adjustments", self.adj_card)
@@ -710,6 +712,11 @@ class InspectorPanel(ScrollArea):
     def _on_param_change(self):
         self.param_changed.emit(self.get_params())
 
+    def reset_adjustments(self):
+        for key, (slider, scale, default, name) in self.sliders.items():
+            slider.setValue(int(default * scale))
+        self._on_param_change()
+
     def reset_params(self):
         self.auto_exp_radio.setChecked(True)  # Default to Auto Exposure
         self.metering_combo.setCurrentText('Matrix')
@@ -813,6 +820,7 @@ class MainWindow(FluentWindow):
         self.gallery_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.gallery_list.setSpacing(10)
         self.gallery_list.itemClicked.connect(self.on_gallery_item_clicked)
+        self.gallery_list.currentItemChanged.connect(lambda current, prev: self.on_gallery_item_clicked(current))
         self.gallery_list.setStyleSheet("""
             QListWidget {
                 background-color: transparent;
@@ -875,7 +883,14 @@ class MainWindow(FluentWindow):
         self.btn_mark.clicked.connect(self.toggle_mark)
         self.btn_delete.clicked.connect(self.delete_image)
         self.btn_export_curr.clicked.connect(self.export_current)
+        self.btn_export_all.clicked.connect(self.export_all)
         
+        # Progress Ring for Batch Export
+        self.export_progress = ProgressRing()
+        self.export_progress.setFixedSize(40, 40)
+        self.export_progress.setTextVisible(True)
+        self.export_progress.hide()
+
         # Make compare button toggle between original and processed
         self.btn_compare.pressed.connect(lambda: self.show_original(None))
         self.btn_compare.released.connect(lambda: self.show_processed(None))
@@ -887,6 +902,7 @@ class MainWindow(FluentWindow):
         self.toolbar_layout.addWidget(self.btn_delete)
         self.toolbar_layout.addStretch()
         self.toolbar_layout.addWidget(self.btn_compare)
+        self.toolbar_layout.addWidget(self.export_progress) # Add progress ring
         self.toolbar_layout.addWidget(self.btn_export_curr)
         self.toolbar_layout.addWidget(self.btn_export_all)
         
@@ -907,6 +923,34 @@ class MainWindow(FluentWindow):
         
         # Apply Dark Theme
         setTheme(Theme.DARK)
+
+        # Install event filter to capture keys globally
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if isinstance(obj, QWidget) and obj.window() == self:
+            if event.type() == QEvent.Type.KeyPress:
+                key = event.key()
+                if key == Qt.Key.Key_Left:
+                    self.prev_image()
+                    return True
+                elif key == Qt.Key.Key_Right:
+                    self.next_image()
+                    return True
+                elif key == Qt.Key.Key_Space:
+                    if not event.isAutoRepeat():
+                        self.show_original(None)
+                    return True
+                elif key == Qt.Key.Key_Delete:
+                    self.delete_image()
+                    return True
+            elif event.type() == QEvent.Type.KeyRelease:
+                if event.key() == Qt.Key.Key_Space:
+                    if not event.isAutoRepeat():
+                        self.show_processed(None)
+                    return True
+        
+        return super().eventFilter(obj, event)
 
     # --- Actions ---
 
@@ -950,6 +994,7 @@ class MainWindow(FluentWindow):
         self.gallery_list.addItem(item)
 
     def on_gallery_item_clicked(self, item):
+        if not item: return
         path = item.data(Qt.ItemDataRole.UserRole)
         if path == self.current_raw_path: return
 
@@ -970,7 +1015,11 @@ class MainWindow(FluentWindow):
         if path in self.file_params_cache:
             self.right_panel.set_params(self.file_params_cache[path])
         else:
-            self.right_panel.reset_params() # This resets UI
+            # Keep previous params (inherit from previous image)
+            # We do NOT reset params here, so the new image inherits current UI settings
+            # Just trigger a param change to ensure pipeline picks it up for new image
+            # This ensures ALL settings (Exposure, WB, LUT, etc.) are carried over
+            self.right_panel._on_param_change()
         
         # 5. Update mark button state
         self.update_mark_button_state()
@@ -1035,6 +1084,21 @@ class MainWindow(FluentWindow):
         # Store for compare
         self.last_processed_pixmap = scaled
         
+        # Update Thumbnail in Gallery
+        # Find the item corresponding to image_path
+        current_item = self.gallery_list.currentItem()
+        if current_item and current_item.data(Qt.ItemDataRole.UserRole) == image_path:
+            thumb_pixmap = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            current_item.setIcon(QIcon(thumb_pixmap))
+        else:
+            # Fallback: search for item
+            for i in range(self.gallery_list.count()):
+                item = self.gallery_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == image_path:
+                    thumb_pixmap = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    item.setIcon(QIcon(thumb_pixmap))
+                    break
+
         # Update Histogram
         self.right_panel.hist_widget.update_data(img_float)
 
@@ -1060,19 +1124,26 @@ class MainWindow(FluentWindow):
         self.preview_lbl.setText(f"Error: {msg}")
         InfoBar.error("Error", msg, parent=self)
 
+
     # --- Toolbar Actions ---
     
     def prev_image(self):
+        count = self.gallery_list.count()
+        if count == 0: return
+        
         row = self.gallery_list.currentRow()
-        if row > 0:
-            self.gallery_list.setCurrentRow(row - 1)
-            self.on_gallery_item_clicked(self.gallery_list.currentItem())
+        # Loop to the end if at beginning
+        new_row = (row - 1) % count
+        self.gallery_list.setCurrentRow(new_row)
 
     def next_image(self):
+        count = self.gallery_list.count()
+        if count == 0: return
+
         row = self.gallery_list.currentRow()
-        if row < self.gallery_list.count() - 1:
-            self.gallery_list.setCurrentRow(row + 1)
-            self.on_gallery_item_clicked(self.gallery_list.currentItem())
+        # Loop to start if at end
+        new_row = (row + 1) % count
+        self.gallery_list.setCurrentRow(new_row)
 
     def toggle_mark(self):
         if not self.current_raw_path: return
@@ -1133,7 +1204,9 @@ class MainWindow(FluentWindow):
             try:
                 # Move to recycle bin using send2trash
                 import send2trash
-                send2trash.send2trash(self.current_raw_path)
+                # Normalize path to fix mixed slashes issue on Windows
+                normalized_path = os.path.normpath(self.current_raw_path)
+                send2trash.send2trash(normalized_path)
                 
                 # Remove from marked files if it was marked
                 if self.current_raw_path in self.marked_files:
@@ -1156,7 +1229,6 @@ class MainWindow(FluentWindow):
                     if current_row >= self.gallery_list.count():
                         current_row = self.gallery_list.count() - 1
                     self.gallery_list.setCurrentRow(current_row)
-                    self.on_gallery_item_clicked(self.gallery_list.currentItem())
                 else:
                     # No more images
                     self.current_raw_path = None
@@ -1174,7 +1246,7 @@ class MainWindow(FluentWindow):
         """Show original image when mouse is pressed or button is held"""
         if hasattr(self, 'original_pixmap_scaled') and self.original_pixmap_scaled:
             self.preview_lbl.setPixmap(self.original_pixmap_scaled)
-            InfoBar.info("Compare", "Showing Original (Auto Exposure)", duration=1000, parent=self)
+            InfoBar.info("Compare", "Showing Original", duration=1000, parent=self)
         else:
             # Debug: Image not ready yet
             if self.current_raw_path:
@@ -1208,40 +1280,70 @@ class MainWindow(FluentWindow):
         if not self.marked_files:
              InfoBar.warning("No Files Marked", "Please mark files using the tag button first.", parent=self)
              return
+        
+        # Ask for format
+        formats = ["JPEG", "HEIF", "TIFF"]
+        format_str, ok = QInputDialog.getItem(self, "Select Export Format", "Format:", formats, 0, False)
+        
+        if not ok:
+            return
              
         folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
         if folder:
              # Batch export marked files
-             # We create a temporary list to process
-             # Note: Orchestrator currently supports single file or full folder.
-             # We need to adapt it or loop here. Looping here with thread is safer for GUI.
-             
              self.batch_export_list = list(self.marked_files)
              self.batch_export_folder = folder
+             
+             # Map format string to extension
+             fmt_map = {"JPEG": "jpg", "HEIF": "heif", "TIFF": "tif"}
+             self.batch_export_ext = fmt_map.get(format_str, "jpg")
+             
+             # Initialize Progress UI
+             self.export_progress.setRange(0, len(self.batch_export_list))
+             self.export_progress.setValue(0)
+             self.export_progress.show()
+             self.btn_export_all.setEnabled(False) # Disable button during export
+             
              self.batch_export_idx = 0
              self.batch_export_next()
 
     def batch_export_next(self):
          if self.batch_export_idx >= len(self.batch_export_list):
              InfoBar.success("Batch Export", "All marked files exported successfully.", parent=self)
+             self.export_progress.hide()
+             self.btn_export_all.setEnabled(True)
              return
+         
+         # Update Progress
+         self.export_progress.setValue(self.batch_export_idx)
 
          input_path = self.batch_export_list[self.batch_export_idx]
          filename = os.path.basename(input_path)
-         # Default to jpg for batch for now, or allow user selection? User req said 'export marked', assume same settings
-         # Let's assume JPEG for simple batch
-         output_path = os.path.join(self.batch_export_folder, os.path.splitext(filename)[0] + ".jpg")
          
+         # Use selected extension
+         output_path = os.path.join(self.batch_export_folder, os.path.splitext(filename)[0] + "." + self.batch_export_ext)
+         
+         # Determine params for this file
+         if input_path == self.current_raw_path:
+             # Use current UI params
+             params = self.right_panel.get_params()
+         else:
+             # Use cached params
+             params = self.file_params_cache.get(input_path)
+             if not params:
+                 # Fallback to current if not found (should not happen for marked files)
+                 params = self.right_panel.get_params()
+
          self.batch_export_idx += 1
          
          # Trigger single export but chain the next one
          # We'll use a modified run_export that accepts a callback
-         self.run_export(input_path, output_path, callback=self.batch_export_next)
+         self.run_export(input_path, output_path, params=params, callback=self.batch_export_next)
 
 
-    def run_export(self, input_path, output_path, callback=None):
+    def run_export(self, input_path, output_path, params=None, callback=None):
         # Gather params
-        p = self.right_panel.get_params()
+        p = params if params else self.right_panel.get_params()
         
         # Determine format from extension
         ext = os.path.splitext(output_path)[1].lower().replace('.', '')
