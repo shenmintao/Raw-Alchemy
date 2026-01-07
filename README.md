@@ -1,8 +1,8 @@
-# 🧪 Raw Alchemy
+# 🧪 Raw Alchemy Studio
 
 [English](README.md) | [简体中文](README_zh-CN.md)
 
-> **Apply cinematic LUTs to RAW photos with mathematical precision.**
+> **A fast culling/grading tool that applies cinematic LUTs to RAW photos with mathematical precision.**
 
 ---
 
@@ -11,7 +11,7 @@
 ### V-Log Alchemy
 **[V-Log Alchemy](https://github.com/shenmintao/V-Log-Alchemy)** - A curated collection of `.cube` LUT files specifically designed for V-Log color space.
 
-These professional-grade LUTs (including Fujifilm film simulations, Leica looks, ARRI color science, and more) can be directly applied in Raw Alchemy to achieve various creative looks for your workflow. Perfect for photographers who want to bring cinematic color grading to their RAW images.
+These professional-grade LUTs (including Fujifilm film simulations, Leica looks, ARRI color science, and more) can be directly applied in Raw Alchemy Studio to achieve various creative looks for your workflow. Perfect for photographers who want to bring cinematic color grading to their RAW images.
 
 ---
 
@@ -21,29 +21,33 @@ Many photographers and videographers rely on creative LUTs (Look Up Tables) to a
 
 This issue stems from color space mismatches. Most creative LUTs are designed for specific Log color spaces (e.g., Sony S-Log3/S-Gamut3.Cine or Fujifilm F-Log2/F-Gamut). When you open a RAW photo in Photoshop or Lightroom and directly apply these LUTs, the software's default RAW decoding color space does not match the LUT's expected input space, leading to severe color and tonal deviations.
 
-**Raw Alchemy** was born to solve this problem. It builds a rigorous, automated color pipeline to ensure any LUT can be accurately applied to any RAW file:
+**Raw Alchemy Studio** was born to solve this problem. It builds a rigorous, automated color pipeline to ensure any LUT can be accurately applied to any RAW file:
 
 1.  **Standardized Decoding**: The project first decodes RAW files from any source into a standardized, wide-gamut intermediate space — ProPhoto RGB (Linear). This eliminates color science differences inherent in different camera brands, providing a unified starting point for all operations.
 2.  **Precise Log Signal Preparation**: Next, it precisely converts the linear image data into the Log format expected by the target LUT, such as `F-Log2` curve and `F-Gamut` color space. This step is critical for ensuring color consistency, perfectly simulating the process of generating Log video signals inside a camera.
 3.  **Correct LUT Application**: Applying your creative LUT on this accurately "disguised" Log image results in color and tonal performance identical to that in professional video software (like DaVinci Resolve).
-4.  **High-Bit Depth Output**: Finally, the processed image (keeping Log encoding or with LUT effects applied) is saved as a 16-bit TIFF file, maximizing dynamic range and color information retention for professional grading in Photoshop or DaVinci Resolve.
+4.  **High-Bit Depth Output**: Finally, the processed image (keeping Log encoding or with LUT effects applied) is saved as a 16-bit TIFF, HEIF, or JPEG file, maximizing dynamic range and color information retention for professional grading.
 
-Through this process, `Raw Alchemy` breaks down the barrier between RAW photography and professional video color grading, allowing photographers to enjoy cinema-level color management precision.
+Through this process, `Raw Alchemy Studio` breaks down the barrier between RAW photography and professional video color grading, allowing photographers to enjoy cinema-level color management precision.
 
 ## 🔄 Process Flow
 
 This tool follows these precise color conversion steps:
 
-`RAW (Camera Native)` -> `ProPhoto RGB (Linear)` -> `Target Log Gamut (Linear)` -> `Target Log Curve (e.g. F-Log2)` -> `(Optional) Creative LUT` -> `16-bit TIFF`
+`RAW (Camera Native)` -> `ProPhoto RGB (Linear)` -> `Lens Correction` -> `Exposure & WB` -> `Target Log Gamut (Linear)` -> `Target Log Curve (e.g. F-Log2)` -> `(Optional) Creative LUT` -> `Output (TIFF/HEIF/JPG)`
 
 ## ✨ Features
 
 -   **RAW to Linear**: Decodes RAW files directly into ProPhoto RGB (Linear) working color space.
 -   **Log Conversion**: Supports various camera-specific Log formats (F-Log2, S-Log3, LogC4, etc.).
 -   **LUT Application**: Supports applying `.cube` creative LUT files directly during conversion.
--   **Exposure Control**: Provides flexible exposure logic: Manual exposure override, or smart auto-metering (Hybrid, Average, Center-Weighted, Highlight-Safe/ETTR).
--   **High Quality Output**: Saves the final image as a 16-bit TIFF file.
--   **Tech Stack**: Uses `rawpy` for RAW decoding and utilizes `colour-science` for high-precision color transformations.
+-   **Advanced Exposure Control**:
+    -   **Auto Metering**: Matrix, Hybrid, Average, Center-Weighted, Highlight-Safe (ETTR).
+    -   **Manual Override**: Precise EV adjustment.
+-   **Basic Adjustments**: White Balance (Temp/Tint), Saturation, Contrast, Highlights, and Shadows.
+-   **Lens Correction**: Automatic lens distortion correction using Lensfun, with support for custom LCP-converted databases.
+-   **Batch Processing**: Efficiently process entire folders of RAW images.
+-   **Multi-Format Output**: Save as 16-bit TIFF, HEIF (10-bit), or JPEG.
 
 ## 📸 Samples
 
@@ -55,13 +59,13 @@ This tool follows these precise color conversion steps:
 
 Comparison with Panasonic Lumix Real-time LUT.
 
-| In-Camera Real-time LUT | Raw Alchemy Processing |
+| In-Camera Real-time LUT | Raw Alchemy Studio Processing |
 | :---: | :---: |
 | ![In-Camera](Samples/P1013122.jpg) | ![Raw Alchemy](Samples/Converted.jpg) |
 
 ## 🚀 Getting Started (Recommended)
 
-For most users, the easiest way to use Raw Alchemy is to download the pre-compiled executable. This does not require installing Python or any dependencies.
+For most users, the easiest way to use Raw Alchemy Studio is to download the pre-compiled executable. This does not require installing Python or any dependencies.
 
 1.  Go to the [**Releases**](https://github.com/shenmintao/raw-alchemy/releases) page.
 2.  Download the latest executable for your system (e.g., `RawAlchemy-vX.Y.Z-windows.exe` or `RawAlchemy-vX.Y.Z-linux`).
@@ -86,7 +90,7 @@ pip install .
 
 The executable provides both a Graphical User Interface (GUI) and a Command-Line Interface (CLI).
 
-*   **To launch the GUI**: Simply run the executable without any arguments. See the tutorial below.
+*   **To launch the GUI**: Simply run the executable without any arguments.
 *   **To use the CLI**: Run the executable with command-line arguments.
 
 ## 🖥️ GUI Tutorial
@@ -95,78 +99,43 @@ The graphical interface provides an intuitive way to process your images.
 
 ![Image of GUI](Samples/gui_screenshot.png)
 
-#### 1. Select Input and Output
+#### 1. Library & Preview
+*   **Import**: Click **Open Folder** to load a directory of RAW images.
+*   **Navigation**: Use the gallery on the left or arrow keys to navigate.
+*   **Compare**: Click and hold the image (or press Spacebar) to instantly compare the processed result with the original RAW.
+*   **Marking**: Use the "Tag" button to mark images for batch export.
 
-*   **Input Path**:
-    *   Click **Select File...** to process a single RAW file.
-    *   Click **Select Folder...** to process all RAW files within a directory (batch mode).
-*   **Output Path**:
-    *   If processing a single file, you can specify the exact output file path by clicking **Save As...**.
-    *   If processing a folder, you must select an output directory by clicking **Select Folder...**. All processed files will be saved there with a `.tif` extension.
+#### 2. Inspector Panel (Right Side)
 
-#### 2. Configure Processing Settings
+*   **Histogram**: Real-time RGB histogram to monitor exposure and color distribution.
+*   **Exposure**:
+    *   **Auto**: Choose from intelligent metering modes like `Matrix` (balanced), `Highlight-Safe` (protects highlights), or `Hybrid`.
+    *   **Manual**: Use the slider to adjust Exposure Value (EV).
+*   **Color Management**:
+    *   **Log Space**: Select the target Log space (e.g., `F-Log2`, `S-Log3`) to match your LUTs.
+    *   **LUT**: Load a `.cube` file to apply a creative look.
+*   **Lens Correction**: Toggle distortion correction or load a custom Lensfun database XML.
+*   **Adjustments**: Fine-tune White Balance (Temp/Tint), Saturation, Contrast, Highlights, and Shadows.
 
-*   **Log Space**: Choose the target Log color space from the dropdown menu (e.g., `F-Log2`, `S-Log3`). This is a required setting.
-*   **LUT File (.cube)**: (Optional) If you want to apply a creative look, click **Browse...** and select a `.cube` LUT file.
-*   **Custom Lensfun DB**: (Optional) To use a custom lens database (e.g., one generated from LCP files), click **Browse...** and select the `.xml` file.
-
-#### 3. Adjust Exposure
-
-You can choose between two modes:
-
-*   **Auto**: This is the default mode. You can select a **Metering** method from the dropdown (`hybrid`, `average`, etc.) to let the application determine the best exposure automatically.
-*   **Manual**: Select this mode to override auto-exposure. You can then enter a specific EV value in the **EV Stops** box or use the slider to adjust the exposure compensation manually.
-
-The **Metering** dropdown (available in `Auto` mode) lets you choose a strategy for automatic exposure adjustment:
-
-*   **`matrix` (Default)**: An advanced evaluative metering mode. It divides the image into a 7x7 grid, intelligently weighting each zone based on brightness and position. It actively suppresses highlights and boosts shadows, providing the most balanced and reliable exposure for complex scenes.
-*   **`hybrid`**: A simpler, faster intelligent mode. It aims for a balanced average exposure but will automatically reduce brightness to prevent highlights from blowing out.
-*   **`average`**: Calculates the average brightness of the entire scene and adjusts it to middle gray. Best for evenly lit scenes.
-*   **`center-weighted`**: Prioritizes the brightness of the center of the frame. Ideal for portraits or centered subjects.
-*   **`highlight-safe` (ETTR)**: Exposes the image as brightly as possible without clipping highlights. This captures maximum shadow detail but may require lowering exposure in post.
-
-#### 4. Start Processing
-
-*   Click the **Start Processing** button.
-*   The **Log** window at the bottom will display the real-time progress and status of the conversion.
-*   Once finished, a "processing complete" message will appear in the log.
+#### 3. Export
+*   **Export Current**: Save the currently selected image.
+*   **Export All Marked**: Batch process and save all marked images.
+*   **Formats**: Choose between JPEG, HEIF, or TIFF.
 
 ## 🔧 Advanced Usage: Importing Adobe Lens Profiles (LCP)
 
-Raw Alchemy now includes a powerful script to convert and import lens profiles from Adobe's LCP format, which is used by Adobe Camera Raw and DNG Converter. This gives you access to a much larger and more up-to-date lens database.
+Raw Alchemy Studio includes a script to convert and import Adobe LCP lens profiles.
 
-The conversion script, lensfun-convert-lcp-new, can be found at [**Lensfun**](https://github.com/shenmintao/lensfun/tree/master/apps).
+The conversion script, `lensfun-convert-lcp`, can be found in the `src/raw_alchemy/vendor/lensfun` directory after installation or in the source.
 
 **Steps:**
 
-1.  **Locate your LCP files.**
-    You can get them by installing the free [Adobe DNG Converter](https://helpx.adobe.com/camera-raw/using/adobe-dng-converter.html). The profiles are typically located in:
-    *   **Windows**: `C:\ProgramData\Adobe\CameraRaw\LensProfiles\1.0\`
-    *   **macOS**: `/Library/Application Support/Adobe/CameraRaw/LensProfiles/1.0/`
-
-2.  **Run the conversion script.**
-    The script is located in the apps/ directory of the lensfun project. You will need Python installed to run it.
-
-    Open your terminal, navigate to the Raw Alchemy project directory, and run the appropriate script for your OS:
-
+1.  **Locate your LCP files** (typically in Adobe's ProgramData or Library folders).
+2.  **Run the conversion script**:
     ```bash
-    # On Windows
-    python src/raw_alchemy/vendor/lensfun/win-x86_64/lensfun-convert-lcp "C:\ProgramData\Adobe\CameraRaw\LensProfiles\1.0"
-
-    # On Linux
-    python3 src/raw_alchemy/vendor/lensfun/linux-x86_64/lensfun-convert-lcp /path/to/your/lcp/files
+    python src/raw_alchemy/vendor/lensfun/win-x86_64/lensfun-convert-lcp "path/to/lcp/folder" --output "my_lenses.xml"
     ```
-
-    **Recommendation for De-duplication:** The script can check against an existing database to avoid creating duplicate entries. It is highly recommended to use the `--db-path` argument to point to the bundled database. This ensures that only new, unconverted lenses are added to your custom file.
-
-    ```bash
-    # Example with de-duplication on Windows
-    python src/raw_alchemy/vendor/lensfun/win-x86_64/lensfun-convert-lcp "C:\ProgramData\Adobe\CameraRaw\LensProfiles\1.0" --db-path "src/raw_alchemy/vendor/lensfun/db"
-    ```
-
-3.  The script will create an `.xml` file (e.g., `_lcps.xml`). You can now load this file into Raw Alchemy using the GUI or CLI, as explained in the sections below.
-
-    The conversion script saves to a default location, but you can use its `--output` argument to save the `.xml` file anywhere you like. For more details, run the script with `--help`.
+3.  **Load the XML**: In the GUI, use the "Custom Lensfun Database" browse button to load your generated XML file.
 
 ## ⌨️ CLI Usage
 
@@ -174,66 +143,40 @@ The conversion script, lensfun-convert-lcp-new, can be found at [**Lensfun**](ht
 
 #### CLI Basic Syntax
 
-The command structure is the same whether you are using the executable or installed from source.
-
 ```bash
-# Using the executable on Linux (replace with your actual file name)
-./RawAlchemy-v0.1.0-linux [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_TIFF_PATH>
-
-# Using the executable on Windows (replace with your actual file name)
-RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_TIFF_PATH>
-
-# If installed from source
-raw-alchemy [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_TIFF_PATH>
+# Using the executable
+RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_PATH>
 ```
 
-#### Example 1: Basic Log Conversion
+#### Examples
 
-This example converts a RAW file to linear space, then applies the F-Log2 curve, and saves the result as a TIFF file (keeping F-Log2/F-Gamut space, suitable for subsequent grading).
-
+**1. Basic Log Conversion**
 ```bash
-# Replace './RawAlchemy-linux' with your executable name or 'raw-alchemy' if installed from source
-./RawAlchemy-linux "path/to/your/image.CR3" "path/to/output/image.tiff" --log-space "F-Log2"
+./RawAlchemy-linux "image.CR3" "output.tiff" --log-space "F-Log2"
 ```
 
-#### Example 2: Conversion with Creative LUT
-
-This example converts a RAW file, applies the S-Log3 curve, then applies a creative LUT (`my_look.cube`), and saves the final result.
-
+**2. With Creative LUT and HEIF Output**
 ```bash
-# Replace './RawAlchemy-linux' with your executable name or 'raw-alchemy'
-./RawAlchemy-linux "input.ARW" "output.tiff" --log-space "S-Log3" --lut "looks/my_look.cube"
+./RawAlchemy-linux "input.ARW" "output.heif" --log-space "S-Log3" --lut "looks/my_look.cube" --format heif
 ```
 
-#### Example 3: Manual Exposure Adjustment
-
-This example manually applies a +1.5 stop exposure compensation, overriding any auto-exposure logic.
-
+**3. Batch Processing**
 ```bash
-# Replace './RawAlchemy-linux' with your executable name or 'raw-alchemy'
-./RawAlchemy-linux "input.CR3" "output_bright.tiff" --log-space "S-Log3" --exposure 1.5
-```
-
-#### Example 4: Using a Custom Lens Database
-
-This example uses a custom lens database file for more accurate lens corrections.
-
-```bash
-# Replace './RawAlchemy-linux' with your executable name or 'raw-alchemy'
-./RawAlchemy-linux "input.ARW" "output.tiff" --log-space "S-Log3" --custom-lensfun-db "path/to/your/_lcps.xml"
+./RawAlchemy-linux "C:/Photos/2024" "C:/Photos/Processed" --log-space "LogC4" --jobs 8
 ```
 
 ## ⚙️ Command Line Options
 
--   `<INPUT_RAW_PATH>`: (Required) Input RAW file path (e.g., .CR3, .ARW, .NEF).
--   `<OUTPUT_TIFF_PATH>`: (Required) Output 16-bit TIFF file save path.
-
+-   `<INPUT_RAW_PATH>`: (Required) Input RAW file or folder.
+-   `<OUTPUT_PATH>`: (Required) Output file or folder.
 -   `--log-space TEXT`: (Required) Target Log color space.
--   `--exposure FLOAT`: (Optional) Manual exposure adjustment in stops (e.g., -0.5, 1.0). Overrides all auto exposure logic.
--   `--lut TEXT`: (Optional) Path to a `.cube` LUT file to apply after Log conversion.
--   `--lens-correct / --no-lens-correct`: (Optional, Default: True) Enable or disable lens distortion correction.
--   `--custom-lensfun-db TEXT`: (Optional) Path to a custom Lensfun database XML file (e.g., one generated from LCP files).
--   `--metering TEXT`: (Optional, Default: `hybrid`) Auto exposure metering mode: `average` (geometric mean), `center-weighted`, `highlight-safe` (ETTR), or `hybrid` (default).
+-   `--lut TEXT`: (Optional) Path to a `.cube` LUT file.
+-   `--exposure FLOAT`: (Optional) Manual exposure adjustment in stops.
+-   `--metering TEXT`: (Optional) Auto exposure mode: `matrix`, `hybrid`, `average`, `center-weighted`, `highlight-safe`.
+-   `--format TEXT`: (Optional) Output format: `tif` (default), `heif`, `jpg`.
+-   `--jobs INTEGER`: (Optional) Number of concurrent jobs for batch processing.
+-   `--lens-correct / --no-lens-correct`: (Optional) Enable/disable lens correction.
+-   `--custom-lensfun-db TEXT`: (Optional) Path to custom Lensfun XML.
 
 ## 📋 Supported Log Spaces
 

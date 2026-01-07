@@ -26,7 +26,8 @@ from qfluentwidgets import (
     InfoBar, InfoBarPosition, Theme, setTheme, CheckBox, ProgressRing
 )
 
-from raw_alchemy import config, utils, orchestrator, metering, lensfun_wrapper
+from raw_alchemy import config, utils, orchestrator, metering, lensfun_wrapper, i18n
+from raw_alchemy.i18n import tr
 from raw_alchemy.orchestrator import SUPPORTED_RAW_EXTENSIONS
 
 # ==============================================================================
@@ -445,19 +446,19 @@ class InspectorPanel(ScrollArea):
         
         # --- Histogram ---
         self.hist_widget = HistogramWidget()
-        self.add_section("Histogram", self.hist_widget)
+        self.add_section(tr('histogram'), self.hist_widget)
 
         # --- Exposure ---
         self.exp_card = SimpleCardWidget()
         exp_layout = QVBoxLayout(self.exp_card)
         
-        self.auto_exp_radio = SwitchButton(text="Auto Exposure")
+        self.auto_exp_radio = SwitchButton(text=tr('auto_exposure'))
         self.auto_exp_radio.setChecked(True)  # Default to Auto Exposure
         self.auto_exp_radio.checkedChanged.connect(self._on_exposure_mode_changed)
         
-        self.metering_lbl = BodyLabel("Metering Mode")
+        self.metering_lbl = BodyLabel(tr('metering_mode'))
         self.metering_combo = ComboBox()
-        self.metering_combo.addItems(['Matrix', 'Average', 'Center-Weighted', 'Highlight-Safe', 'Hybrid'])
+        self.metering_combo.addItems([tr('matrix'), tr('average'), tr('center_weighted'), tr('highlight_safe'), tr('hybrid')])
         self.metering_combo.setCurrentText('Matrix')
         self.metering_combo.currentTextChanged.connect(self._on_param_change)
         
@@ -466,11 +467,11 @@ class InspectorPanel(ScrollArea):
         self.exp_slider.setValue(0)
         
         # Add exposure value label
-        self.exp_value_label = BodyLabel("Exposure EV: 0.0")
+        self.exp_value_label = BodyLabel(tr('exposure_ev') + ": 0.0")
         
         def update_exp_label(val):
             real_val = val / 10.0
-            self.exp_value_label.setText(f"Exposure EV: {real_val:+.1f}")
+            self.exp_value_label.setText(f"{tr('exposure_ev')}: {real_val:+.1f}")
             self._on_param_change()
         
         self.exp_slider.valueChanged.connect(update_exp_label)
@@ -483,27 +484,27 @@ class InspectorPanel(ScrollArea):
         
         self._update_exposure_ui_state()
         
-        self.add_section("Exposure", self.exp_card)
+        self.add_section(tr('exposure'), self.exp_card)
         
         # --- Color / Log ---
         self.color_card = SimpleCardWidget()
         color_layout = QVBoxLayout(self.color_card)
         
         # Log Space
-        color_layout.addWidget(BodyLabel("Log Space"))
+        color_layout.addWidget(BodyLabel(tr('log_space')))
         self.log_combo = ComboBox()
-        log_items = ['None'] + list(config.LOG_TO_WORKING_SPACE.keys())
+        log_items = [tr('none')] + list(config.LOG_TO_WORKING_SPACE.keys())
         self.log_combo.addItems(log_items)
         self.log_combo.setCurrentText('None')
         self.log_combo.currentTextChanged.connect(self._on_param_change)
         color_layout.addWidget(self.log_combo)
         
         # LUT
-        color_layout.addWidget(BodyLabel("LUT"))
+        color_layout.addWidget(BodyLabel(tr('lut')))
         lut_layout = QHBoxLayout()
         self.lut_combo = ComboBox()
         self.lut_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.lut_combo.addItem("None")
+        self.lut_combo.addItem(tr('none'))
         self.lut_combo.currentTextChanged.connect(self._on_param_change)
         
         self.lut_btn = ToolButton(FIF.FOLDER)
@@ -513,22 +514,22 @@ class InspectorPanel(ScrollArea):
         lut_layout.addWidget(self.lut_btn)
         color_layout.addLayout(lut_layout)
         
-        self.add_section("Color Management", self.color_card)
+        self.add_section(tr('color_management'), self.color_card)
         
         # --- Lens Correction ---
         self.lens_card = SimpleCardWidget()
         lens_layout = QVBoxLayout(self.lens_card)
         
-        self.lens_correct_switch = SwitchButton(text="Enable Lens Correction")
+        self.lens_correct_switch = SwitchButton(text=tr('enable_lens_correction'))
         self.lens_correct_switch.setChecked(True)  # Default enabled
         self.lens_correct_switch.checkedChanged.connect(self._on_param_change)
         lens_layout.addWidget(self.lens_correct_switch)
         
         # Custom Lensfun DB
-        lens_layout.addWidget(BodyLabel("Custom Lensfun Database"))
+        lens_layout.addWidget(BodyLabel(tr('custom_lensfun_db')))
         db_layout = QHBoxLayout()
         self.db_path_edit = LineEdit()
-        self.db_path_edit.setPlaceholderText("Optional: Path to custom XML database")
+        self.db_path_edit.setPlaceholderText(tr('optional_db_path'))
         self.db_path_edit.setReadOnly(True)
         self.db_path_edit.textChanged.connect(self._on_param_change)
         
@@ -543,7 +544,7 @@ class InspectorPanel(ScrollArea):
         db_layout.addWidget(self.db_clear_btn)
         lens_layout.addLayout(db_layout)
         
-        self.add_section("Lens Correction", self.lens_card)
+        self.add_section(tr('lens_correction'), self.lens_card)
         
         # --- Adjustments ---
         self.adj_card = SimpleCardWidget()
@@ -573,18 +574,18 @@ class InspectorPanel(ScrollArea):
             self.sliders[key] = (slider, scale, default_v, name)  # 添加 name 到元组
             self.slider_labels[key] = lbl  # 存储标签引用
 
-        add_slider('wb_temp', 'Temp', -100, 100, 0, 1)
-        add_slider('wb_tint', 'Tint', -100, 100, 0, 1)
-        add_slider('saturation', 'Saturation', 0, 3, 1.25, 100)
-        add_slider('contrast', 'Contrast', 0, 3, 1.1, 100)
-        add_slider('highlight', 'Highlights', -100, 100, 0, 1)
-        add_slider('shadow', 'Shadows', -100, 100, 0, 1)
+        add_slider('wb_temp', tr('temp'), -100, 100, 0, 1)
+        add_slider('wb_tint', tr('tint'), -100, 100, 0, 1)
+        add_slider('saturation', tr('saturation'), 0, 3, 1.25, 100)
+        add_slider('contrast', tr('contrast'), 0, 3, 1.1, 100)
+        add_slider('highlight', tr('highlights'), -100, 100, 0, 1)
+        add_slider('shadow', tr('shadows'), -100, 100, 0, 1)
         
-        self.reset_btn = PushButton("Reset All")
+        self.reset_btn = PushButton(tr('reset_all'))
         self.reset_btn.clicked.connect(self.reset_adjustments)
         adj_layout.addWidget(self.reset_btn)
         
-        self.add_section("Adjustments", self.adj_card)
+        self.add_section(tr('adjustments'), self.adj_card)
         
         # Filler
         self.v_layout.addStretch()
@@ -603,11 +604,11 @@ class InspectorPanel(ScrollArea):
         
         if 'metering_mode' in params:
             mode_map = {
-                'matrix': 'Matrix', 'average': 'Average',
-                'center-weighted': 'Center-Weighted',
-                'highlight-safe': 'Highlight-Safe', 'hybrid': 'Hybrid'
+                'matrix': tr('matrix'), 'average': tr('average'),
+                'center-weighted': tr('center_weighted'),
+                'highlight-safe': tr('highlight_safe'), 'hybrid': tr('hybrid')
             }
-            self.metering_combo.setCurrentText(mode_map.get(params['metering_mode'], 'Matrix'))
+            self.metering_combo.setCurrentText(mode_map.get(params['metering_mode'], tr('matrix')))
 
         self._update_exposure_ui_state()
 
@@ -615,7 +616,7 @@ class InspectorPanel(ScrollArea):
             exp_val = params['exposure']
             self.exp_slider.setValue(int(exp_val * 10))
             # Update the exposure value label
-            self.exp_value_label.setText(f"Exposure EV: {exp_val:+.1f}")
+            self.exp_value_label.setText(f"{tr('exposure_ev')}: {exp_val:+.1f}")
             
         # Color
         if 'log_space' in params:
@@ -661,7 +662,7 @@ class InspectorPanel(ScrollArea):
         self.v_layout.addWidget(widget)
 
     def _browse_lut_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select LUT Folder")
+        folder = QFileDialog.getExistingDirectory(self, tr('select_lut_folder'))
         if folder:
             self.lut_folder = folder
             self.refresh_lut_list()
@@ -669,14 +670,14 @@ class InspectorPanel(ScrollArea):
     def refresh_lut_list(self):
         if not self.lut_folder: return
         self.lut_combo.clear()
-        self.lut_combo.addItem("None")
+        self.lut_combo.addItem(tr('none'))
         files = sorted([f for f in os.listdir(self.lut_folder) if f.lower().endswith('.cube')])
         self.lut_combo.addItems(files)
     
     def _browse_lensfun_db(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Lensfun Database XML",
+            tr('select_lensfun_db'),
             "",
             "XML Files (*.xml);;All Files (*)"
         )
@@ -685,9 +686,9 @@ class InspectorPanel(ScrollArea):
             # 重新加载lensfun数据库
             try:
                 lensfun_wrapper.reload_lensfun_database(custom_db_path=file_path, logger=print)
-                InfoBar.success("Database Loaded", f"Using custom database: {os.path.basename(file_path)}", parent=self)
+                InfoBar.success(tr('db_loaded'), tr('using_custom_db', name=os.path.basename(file_path)), parent=self)
             except Exception as e:
-                InfoBar.error("Database Load Failed", f"Failed to load database: {str(e)}", parent=self)
+                InfoBar.error(tr('db_load_failed'), tr('failed_to_load_db', error=str(e)), parent=self)
                 self.db_path_edit.clear()
     
     def _clear_lensfun_db(self):
@@ -695,9 +696,9 @@ class InspectorPanel(ScrollArea):
         # 重新加载默认lensfun数据库
         try:
             lensfun_wrapper.reload_lensfun_database(custom_db_path=None, logger=print)
-            InfoBar.info("Database Cleared", "Using default Lensfun database", parent=self)
+            InfoBar.info(tr('db_cleared'), tr('using_default_db'), parent=self)
         except Exception as e:
-            InfoBar.warning("Database Reload", f"Warning: {str(e)}", parent=self)
+            InfoBar.warning(tr('db_cleared'), f"Warning: {str(e)}", parent=self)
 
     def _update_exposure_ui_state(self):
         is_auto = self.auto_exp_radio.isChecked()
@@ -722,7 +723,7 @@ class InspectorPanel(ScrollArea):
         self.metering_combo.setCurrentText('Matrix')
         self._update_exposure_ui_state()
         self.exp_slider.setValue(0)
-        self.exp_value_label.setText("Exposure EV: 0.0")
+        self.exp_value_label.setText(tr('exposure_ev') + ": 0.0")
         self.log_combo.setCurrentText('None')
         self.lut_combo.setCurrentIndex(0)
         self.lens_correct_switch.setChecked(True)  # Default enabled
@@ -755,7 +756,8 @@ class InspectorPanel(ScrollArea):
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Raw Alchemy Studio")
+        self.setWindowTitle("Raw Alchemy")
+        self.setWindowIcon(QIcon(self._get_icon_path()))
         self.resize(1900, 1200)
         
         # State
@@ -769,6 +771,7 @@ class MainWindow(FluentWindow):
         self._preload_lensfun_database()
         
         self.create_ui()
+        self.create_settings_interface()
         
         # Workers
         self.thumb_worker = None
@@ -784,6 +787,21 @@ class MainWindow(FluentWindow):
         self.update_timer.setInterval(100) # 100ms debounce
         self.update_timer.timeout.connect(self.trigger_processing)
     
+    def _get_icon_path(self):
+        """Get the path to the application icon."""
+        try:
+            # PyInstaller creates a temp folder and stores path in _MEIPASS
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.abspath(".")
+        
+        icon_path = os.path.join(base_path, "icon.png")
+        if not os.path.exists(icon_path):
+            # Fallback for development environment if running from src
+            icon_path = os.path.join(base_path, "icon.ico")
+            
+        return icon_path
+
     def _preload_lensfun_database(self):
         """在后台线程中预加载lensfun数据库，避免阻塞GUI启动"""
         def preload():
@@ -841,10 +859,10 @@ class MainWindow(FluentWindow):
             }
         """)
         
-        self.open_btn = PrimaryPushButton(FIF.FOLDER, "Open Folder")
+        self.open_btn = PrimaryPushButton(FIF.FOLDER, tr('open_folder'))
         self.open_btn.clicked.connect(self.browse_folder)
         
-        self.left_layout.addWidget(SubtitleLabel("Library"))
+        self.left_layout.addWidget(SubtitleLabel(tr('library')))
         self.left_layout.addWidget(self.gallery_list)
         self.left_layout.addWidget(self.open_btn)
         
@@ -854,7 +872,7 @@ class MainWindow(FluentWindow):
         self.center_layout.setContentsMargins(10, 10, 10, 10)
         
         # Preview Area
-        self.preview_lbl = QLabel("No Image Selected")
+        self.preview_lbl = QLabel(tr('no_image_selected'))
         self.preview_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_lbl.setStyleSheet("background-color: #202020; border-radius: 8px; color: white;")
         self.preview_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -872,11 +890,11 @@ class MainWindow(FluentWindow):
         self.btn_mark = ToolButton(FIF.TAG)
         self.btn_mark.setCheckable(True)  # Make it a toggle button
         self.btn_delete = ToolButton(FIF.DELETE)
-        self.btn_compare = PushButton("Hold to Compare") # Visual cue
-        self.btn_compare.setToolTip("Press and hold on the image to see the original")
+        self.btn_compare = PushButton(tr('hold_to_compare')) # Visual cue
+        self.btn_compare.setToolTip(tr('hold_to_compare'))
         
-        self.btn_export_curr = PushButton("Export Current")
-        self.btn_export_all = PrimaryPushButton("Export All Marked")
+        self.btn_export_curr = PushButton(tr('export_current'))
+        self.btn_export_all = PrimaryPushButton(tr('export_all_marked'))
         
         self.btn_prev.clicked.connect(self.prev_image)
         self.btn_next.clicked.connect(self.next_image)
@@ -919,13 +937,69 @@ class MainWindow(FluentWindow):
         self.h_layout.addWidget(self.center_panel, 1) # Expand
         self.h_layout.addWidget(self.right_panel)
         
-        self.addSubInterface(self.main_widget, FIF.PHOTO, "Editor")
+        self.addSubInterface(self.main_widget, FIF.PHOTO, tr('editor'))
         
         # Apply Dark Theme
         setTheme(Theme.DARK)
 
         # Install event filter to capture keys globally
         QApplication.instance().installEventFilter(self)
+    
+    def create_settings_interface(self):
+        """Create settings interface with language selection"""
+        self.settings_widget = QWidget()
+        self.settings_widget.setObjectName("settingsWidget")
+        settings_layout = QVBoxLayout(self.settings_widget)
+        settings_layout.setContentsMargins(40, 40, 40, 40)
+        settings_layout.setSpacing(20)
+        
+        # Title
+        title = SubtitleLabel(tr('settings'))
+        settings_layout.addWidget(title)
+        
+        # Language Card
+        lang_card = SimpleCardWidget()
+        lang_layout = QVBoxLayout(lang_card)
+        lang_layout.setSpacing(10)
+        
+        lang_label = StrongBodyLabel(tr('language'))
+        lang_layout.addWidget(lang_label)
+        
+        # Language ComboBox
+        self.lang_combo = ComboBox()
+        self.lang_combo.addItems([tr('english'), tr('chinese')])
+        
+        # Set current language
+        current_lang = i18n.get_current_language()
+        if current_lang == 'zh':
+            self.lang_combo.setCurrentIndex(1)
+        else:
+            self.lang_combo.setCurrentIndex(0)
+        
+        self.lang_combo.currentIndexChanged.connect(self.on_language_changed)
+        lang_layout.addWidget(self.lang_combo)
+        
+        settings_layout.addWidget(lang_card)
+        settings_layout.addStretch()
+        
+        # Add settings interface to navigation
+        self.addSubInterface(self.settings_widget, FIF.SETTING, tr('settings'))
+    
+    def on_language_changed(self, index):
+        """Handle language change"""
+        # Map index to language code
+        lang_code = 'en' if index == 0 else 'zh'
+        
+        # Set language
+        i18n.set_language(lang_code)
+        
+        # Show restart message
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.information(
+            self,
+            tr('restart_required'),
+            tr('restart_message')
+        )
 
     def eventFilter(self, obj, event):
         if isinstance(obj, QWidget) and obj.window() == self:
@@ -955,7 +1029,7 @@ class MainWindow(FluentWindow):
     # --- Actions ---
 
     def browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
+        folder = QFileDialog.getExistingDirectory(self, tr('select_folder'))
         if folder:
             self.current_folder = folder
             self.gallery_list.clear()
@@ -1121,8 +1195,8 @@ class MainWindow(FluentWindow):
         self.preview_lbl.repaint()
 
     def on_error(self, msg):
-        self.preview_lbl.setText(f"Error: {msg}")
-        InfoBar.error("Error", msg, parent=self)
+        self.preview_lbl.setText(f"{tr('error')}: {msg}")
+        InfoBar.error(tr('error'), msg, parent=self)
 
 
     # --- Toolbar Actions ---
@@ -1150,10 +1224,10 @@ class MainWindow(FluentWindow):
         
         if self.current_raw_path in self.marked_files:
             self.marked_files.remove(self.current_raw_path)
-            InfoBar.info("Unmarked", os.path.basename(self.current_raw_path), parent=self)
+            InfoBar.info(tr('unmarked'), os.path.basename(self.current_raw_path), parent=self)
         else:
             self.marked_files.add(self.current_raw_path)
-            InfoBar.success("Marked", os.path.basename(self.current_raw_path), parent=self)
+            InfoBar.success(tr('marked'), os.path.basename(self.current_raw_path), parent=self)
         
         # Update button state and gallery item indicator
         self.update_mark_button_state()
@@ -1194,8 +1268,8 @@ class MainWindow(FluentWindow):
         # Ask for confirmation
         reply = QMessageBox.question(
             self,
-            "Delete Image",
-            f"Are you sure you want to delete {os.path.basename(self.current_raw_path)}?\n\nThis will move the file to the recycle bin.",
+            tr('delete_image'),
+            tr('confirm_delete', filename=os.path.basename(self.current_raw_path)),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -1234,23 +1308,23 @@ class MainWindow(FluentWindow):
                     self.current_raw_path = None
                     self.preview_lbl.setText("No Image Selected")
                 
-                InfoBar.success("Deleted", "Image moved to recycle bin", parent=self)
+                InfoBar.success(tr('delete_image'), tr('delete_image'), parent=self)
                 
             except ImportError:
                 # Fallback if send2trash is not installed
-                InfoBar.error("Error", "send2trash module not installed. Cannot delete file safely.", parent=self)
+                InfoBar.error(tr('error'), tr('send2trash_error'), parent=self)
             except Exception as e:
-                InfoBar.error("Delete Failed", str(e), parent=self)
+                InfoBar.error(tr('delete_failed'), str(e), parent=self)
 
     def show_original(self, event):
         """Show original image when mouse is pressed or button is held"""
         if hasattr(self, 'original_pixmap_scaled') and self.original_pixmap_scaled:
             self.preview_lbl.setPixmap(self.original_pixmap_scaled)
-            InfoBar.info("Compare", "Showing Original", duration=1000, parent=self)
+            InfoBar.info(tr('hold_to_compare'), tr('compare_showing_original'), duration=1000, parent=self)
         else:
             # Debug: Image not ready yet
             if self.current_raw_path:
-                InfoBar.warning("Compare", "Original image is still loading, please wait...", duration=1500, parent=self)
+                InfoBar.warning(tr('hold_to_compare'), tr('compare_loading'), duration=1500, parent=self)
 
     def show_processed(self, event):
         """Show processed image when mouse is released or button is released"""
@@ -1266,7 +1340,7 @@ class MainWindow(FluentWindow):
         # Save Dialog with HEIF support
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export Image",
+            tr('export_image'),
             os.path.basename(self.current_raw_path),
             "JPEG (*.jpg);;HEIF (*.heif);;TIFF (*.tif)"
         )
@@ -1278,17 +1352,17 @@ class MainWindow(FluentWindow):
 
     def export_all(self):
         if not self.marked_files:
-             InfoBar.warning("No Files Marked", "Please mark files using the tag button first.", parent=self)
+             InfoBar.warning(tr('no_files_marked'), tr('please_mark_files'), parent=self)
              return
         
         # Ask for format
         formats = ["JPEG", "HEIF", "TIFF"]
-        format_str, ok = QInputDialog.getItem(self, "Select Export Format", "Format:", formats, 0, False)
+        format_str, ok = QInputDialog.getItem(self, tr('select_export_format'), "Format:", formats, 0, False)
         
         if not ok:
             return
              
-        folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
+        folder = QFileDialog.getExistingDirectory(self, tr('select_export_folder'))
         if folder:
              # Batch export marked files
              self.batch_export_list = list(self.marked_files)
@@ -1309,7 +1383,7 @@ class MainWindow(FluentWindow):
 
     def batch_export_next(self):
          if self.batch_export_idx >= len(self.batch_export_list):
-             InfoBar.success("Batch Export", "All marked files exported successfully.", parent=self)
+             InfoBar.success(tr('batch_export'), tr('all_exported'), parent=self)
              self.export_progress.hide()
              self.btn_export_all.setEnabled(True)
              return
@@ -1385,10 +1459,10 @@ class MainWindow(FluentWindow):
         def on_finish(success, msg):
             if success:
                 if not callback:
-                    InfoBar.success("Export Success", f"Saved to {os.path.basename(output_path)}", parent=self)
+                    InfoBar.success(tr('export_success'), tr('saved_to', path=os.path.basename(output_path)), parent=self)
                 if callback: callback()
             else:
-                InfoBar.error("Export Failed", msg, parent=self)
+                InfoBar.error(tr('export_failed'), msg, parent=self)
         
         self.export_thread.finished_sig.connect(on_finish)
         self.export_thread.start()
