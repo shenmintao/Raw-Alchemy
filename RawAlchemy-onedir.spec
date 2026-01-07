@@ -28,7 +28,7 @@ if sys.platform == 'darwin' or sys.platform.startswith('linux'):
 a = Analysis(
     ['src/raw_alchemy/gui.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries_list,
     datas=[('src/raw_alchemy/vendor', 'vendor'), ('icon.ico', '.'), ('icon.png', '.')],
     hiddenimports=['tkinter'],
     hookspath=[],

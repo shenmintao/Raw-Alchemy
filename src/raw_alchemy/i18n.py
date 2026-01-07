@@ -77,6 +77,7 @@ This will move the file to the recycle bin.''',
                 'chinese': 'Chinese',
                 'restart_required': 'Restart Required',
                 'restart_message': 'Please restart the application to apply language changes.',
+                'loading': 'Loading...',
             },
             'zh': {
                 'library': '图库',
@@ -148,6 +149,7 @@ This will move the file to the recycle bin.''',
                 'chinese': '中文',
                 'restart_required': '需要重启',
                 'restart_message': '请重启应用程序以应用语言更改。',
+                'loading': '加载中...',
             }
         }
 

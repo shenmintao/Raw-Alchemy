@@ -458,8 +458,19 @@ class InspectorPanel(ScrollArea):
         
         self.metering_lbl = BodyLabel(tr('metering_mode'))
         self.metering_combo = ComboBox()
+        # Store metering mode mapping: display text -> internal key
+        self.metering_mode_map = {
+            tr('matrix'): 'matrix',
+            tr('average'): 'average',
+            tr('center_weighted'): 'center-weighted',
+            tr('highlight_safe'): 'highlight-safe',
+            tr('hybrid'): 'hybrid'
+        }
+        # Reverse mapping: internal key -> display text
+        self.metering_mode_reverse_map = {v: k for k, v in self.metering_mode_map.items()}
+        
         self.metering_combo.addItems([tr('matrix'), tr('average'), tr('center_weighted'), tr('highlight_safe'), tr('hybrid')])
-        self.metering_combo.setCurrentText('Matrix')
+        self.metering_combo.setCurrentText(tr('matrix'))
         self.metering_combo.currentTextChanged.connect(self._on_param_change)
         
         self.exp_slider = Slider(Qt.Orientation.Horizontal)
@@ -603,12 +614,9 @@ class InspectorPanel(ScrollArea):
             self.auto_exp_radio.setChecked(params['exposure_mode'] == 'Auto')
         
         if 'metering_mode' in params:
-            mode_map = {
-                'matrix': tr('matrix'), 'average': tr('average'),
-                'center-weighted': tr('center_weighted'),
-                'highlight-safe': tr('highlight_safe'), 'hybrid': tr('hybrid')
-            }
-            self.metering_combo.setCurrentText(mode_map.get(params['metering_mode'], tr('matrix')))
+            # Use reverse map to convert internal key to display text
+            display_text = self.metering_mode_reverse_map.get(params['metering_mode'], tr('matrix'))
+            self.metering_combo.setCurrentText(display_text)
 
         self._update_exposure_ui_state()
 
@@ -737,9 +745,13 @@ class InspectorPanel(ScrollArea):
         self._on_param_change()
 
     def get_params(self):
+        # Get internal metering mode key from display text
+        metering_display_text = self.metering_combo.currentText()
+        metering_internal_key = self.metering_mode_map.get(metering_display_text, 'matrix')
+        
         p = {
             'exposure_mode': 'Auto' if self.auto_exp_radio.isChecked() else 'Manual',
-            'metering_mode': self.metering_combo.currentText().lower(),
+            'metering_mode': metering_internal_key,
             'exposure': self.exp_slider.value() / 10.0, # Scale factor for EV
             'log_space': self.log_combo.currentText(),
             'lut_path': os.path.join(self.lut_folder, self.lut_combo.currentText()) if self.lut_folder and self.lut_combo.currentIndex() > 0 else None,
@@ -1102,7 +1114,7 @@ class MainWindow(FluentWindow):
         self.load_image(path)
 
     def load_image(self, path):
-        self.preview_lbl.setText("Loading...")
+        self.preview_lbl.setText(tr('loading'))
         self.processor.load_image(path)
         
     def on_processor_finished(self):
@@ -1306,7 +1318,7 @@ class MainWindow(FluentWindow):
                 else:
                     # No more images
                     self.current_raw_path = None
-                    self.preview_lbl.setText("No Image Selected")
+                    self.preview_lbl.setText(tr('no_image_selected'))
                 
                 InfoBar.success(tr('delete_image'), tr('delete_image'), parent=self)
                 
