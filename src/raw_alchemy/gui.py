@@ -1101,6 +1101,9 @@ class MainWindow(FluentWindow):
                 elif key == Qt.Key.Key_Delete:
                     self.delete_image()
                     return True
+                elif key == Qt.Key.Key_T:
+                    self.toggle_mark()
+                    return True
             elif event.type() == QEvent.Type.KeyRelease:
                 if event.key() == Qt.Key.Key_Space:
                     if not event.isAutoRepeat():
