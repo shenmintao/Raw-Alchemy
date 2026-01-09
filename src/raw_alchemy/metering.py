@@ -286,7 +286,7 @@ def apply_auto_exposure(
     metering_mode: str = 'hybrid',
     target_gray: float = 0.18,
     logger: Optional[Logger] = None
-) -> np.ndarray:
+) -> tuple[np.ndarray, float]:
     """
     应用自动曝光
     
@@ -298,11 +298,11 @@ def apply_auto_exposure(
         logger: 日志处理器
     
     Returns:
-        np.ndarray: 调整后的图像
+        tuple: (调整后的图像, 应用的增益)
     """
 
     strategy = get_metering_strategy(metering_mode)
     gain = strategy.calculate_gain(img_linear, source_colorspace, target_gray, logger)
     utils.apply_gain_inplace(img_linear, float(gain))
     
-    return img_linear
+    return img_linear, float(gain)

@@ -33,6 +33,60 @@ from raw_alchemy.i18n import tr
 from raw_alchemy.orchestrator import SUPPORTED_RAW_EXTENSIONS
 
 # ==============================================================================
+#                               Data Structures
+# ==============================================================================
+
+class ImageState:
+    """
+    Unified state for a single image. 
+    Replaces the mess of: original_pixmap_raw, original_pixmap_scaled, 
+    last_processed_pixmap, _last_processed_pixmap_full, etc.
+    
+    Three states total:
+    - original: RAW decoded image
+    - current: processed with current params
+    - baseline: saved baseline (optional)
+    """
+    def __init__(self):
+        self.full: Optional[QPixmap] = None
+        self.display: Optional[QPixmap] = None
+        self.float_data: Optional[np.ndarray] = None  # For histogram
+    
+    def update_full(self, pixmap: QPixmap, float_data: Optional[np.ndarray] = None):
+        """Update the full-size image and clear cached display version"""
+        self.full = pixmap
+        self.float_data = float_data
+        self.display = None  # Invalidate cached display
+    
+    def get_display(self, size: QSize) -> Optional[QPixmap]:
+        """Get display-sized version, caching the result"""
+        if not self.full:
+            return None
+        
+        if self.display is None:
+            self.display = self.full.scaled(
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+        return self.display
+    
+    def clear(self):
+        """Clear all cached data"""
+        self.full = None
+        self.display = None
+        self.float_data = None
+
+
+class ProcessRequest:
+    """Immutable processing request. Eliminates race conditions."""
+    def __init__(self, path: str, params: dict, request_id: int):
+        self.path = path
+        self.params = params.copy()  # Defensive copy
+        self.request_id = request_id
+
+
+# ==============================================================================
 #                               Worker Threads
 # ==============================================================================
 
@@ -104,67 +158,92 @@ class ThumbnailWorker(QThread):
 
 class ImageProcessor(QThread):
     """
-    Handles the heavy lifting of the image pipeline.
-    Modes:
-    1. 'load': Load RAW -> Demosaic -> Lens Correction (Cache this stage)
-    2. 'process': Cached Linear -> Exp/WB/Effects -> Log/LUT -> Display
+    Image processing worker. Uses request queue pattern to eliminate race conditions.
+    No more params_dirty, no more mode/running_mode confusion.
     """
-    result_ready = pyqtSignal(np.ndarray, np.ndarray, str) # display_image, histogram_data, image_path
-    original_ready = pyqtSignal(np.ndarray, str) # original_image, image_path
-    load_finished = pyqtSignal()
+    result_ready = pyqtSignal(np.ndarray, np.ndarray, str, int, float)  # img_uint8, img_float, path, request_id, applied_ev
+    original_ready = pyqtSignal(np.ndarray, str, int, float)  # original_img, path, request_id, applied_ev
     error_occurred = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self.mode = 'idle'
-        self.running_mode = 'idle'
-        self.params = {}
-        self.params_dirty = False
-        self.raw_path = None
-        self.processing_path = None  # Track which image is being processed
+        self.lock = threading.Lock()
         
-        # Caches
-        self.cached_linear = None # After demosaic
-        self.cached_corrected = None # After lens correction
-        self.cached_lens_key = None # (enable, db_path)
+        # Request management
+        self.pending_request: Optional[ProcessRequest] = None
+        self.current_request_id = 0
+        
+        # Caches (shared across loads)
+        self.cached_linear = None
+        self.cached_corrected = None
+        self.cached_lens_key = None
         self.exif_data = None
+        self.current_path = None
 
-    def load_image(self, path):
-        self.raw_path = path
-        self.processing_path = path  # Mark which image we're processing
-        self.mode = 'load'
+    def load_image(self, path: str):
+        """Load RAW image - creates a special load request"""
+        with self.lock:
+            self.current_request_id += 1
+            self.pending_request = ProcessRequest(path, {'_load': True}, self.current_request_id)
+        
         if not self.isRunning():
             self.start()
 
-    def update_preview(self, params):
-        self.params = params
-        self.params_dirty = True
-        self.mode = 'process'
+    def update_preview(self, path: str, params: dict):
+        """Process image with parameters"""
+        with self.lock:
+            self.current_request_id += 1
+            self.pending_request = ProcessRequest(path, params, self.current_request_id)
+        
         if not self.isRunning():
-            self.params_dirty = False
             self.start()
 
     def run(self):
-        self.running_mode = self.mode
-        try:
-            if self.mode == 'load':
-                self._do_load()
-            elif self.mode == 'process':
-                self._do_process()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error_occurred.emit(str(e))
+        """Keep thread alive to process requests without restart overhead"""
+        idle_count = 0
+        max_idle = 10  # Exit after 10 empty checks (1 second)
+        
+        while True:
+            # Atomically get pending request
+            with self.lock:
+                request = self.pending_request
+                if request:
+                    self.pending_request = None
+                    idle_count = 0
+                else:
+                    idle_count += 1
+            
+            if not request:
+                if idle_count >= max_idle:
+                    break  # Exit after idle timeout
+                time.sleep(0.1)  # Sleep 100ms, check again
+                continue
+            
+            try:
+                if '_load' in request.params:
+                    self._do_load(request)
+                else:
+                    self._do_process(request)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.error_occurred.emit(str(e))
 
-    def _do_load(self):
-        if not self.raw_path: return
+    def _do_load(self, request: ProcessRequest):
+        """Load and decode RAW file"""
+        path = request.path
         
-        # Store the path we're processing
-        current_path = self.raw_path
+        # Invalidate caches if switching images
+        if path != self.current_path:
+            self.cached_linear = None
+            self.cached_corrected = None
+            self.cached_lens_key = None
+            self.exif_data = None
+            self.current_path = path
         
-        with rawpy.imread(self.raw_path) as raw:
+        with rawpy.imread(path) as raw:
             self.exif_data = utils.extract_lens_exif(raw)
-            # Use half_size for faster preview
+            
             raw_post = raw.postprocess(
                 gamma=(1, 1),
                 no_auto_bright=True,
@@ -176,165 +255,145 @@ class ImageProcessor(QThread):
                 demosaic_algorithm=rawpy.DemosaicAlgorithm.AAHD,
                 half_size=True
             )
-            # 直接使用float32避免额外转换
+            
             img = (raw_post / 65535.0).astype(np.float32)
             
-            # 优化: 使用更快的下采样方法
+            # Downsample if needed
             h, w = img.shape[:2]
             max_dim = 2048
             if max(h, w) > max_dim:
-                # 使用简单的切片下采样,比zoom快得多
                 scale = max_dim / max(h, w)
                 step = int(1.0 / scale)
                 if step > 1:
                     img = img[::step, ::step, :]
-                
-            self.cached_linear = img
-            self.cached_corrected = None
-            self.cached_lens_key = None
             
-            # Generate Original Preview with Auto Exposure, Lens Correction, and Camera Boost
-            # This represents what the camera would show with auto settings
+            self.cached_linear = img
+            
+            # Generate original preview (auto-exposed, lens-corrected)
             orig_preview = img.copy()
             
-            # 1. Apply Lens Correction (if EXIF data available)
             if self.exif_data:
                 orig_preview = utils.apply_lens_correction(
-                    orig_preview,
-                    self.exif_data,
-                    custom_db_path=None
+                    orig_preview, self.exif_data, custom_db_path=None
                 )
             
-            # 2. Apply Auto Exposure (Matrix metering by default)
             source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
+            
             class DummyLogger:
                 def info(self, *args, **kwargs):
                     pass
-            metering.apply_auto_exposure(orig_preview, source_cs, 'matrix', logger=DummyLogger())
             
-            # 3. Apply Camera Boost (Saturation and Contrast)
+            # Capture the applied EV from auto exposure
+            _, gain = metering.apply_auto_exposure(orig_preview, source_cs, 'matrix', logger=DummyLogger())
+            applied_ev = np.log2(gain)  # Convert gain to EV
+            
             utils.apply_saturation_and_contrast(orig_preview, saturation=1.25, contrast=1.1)
-            
-            # 4. Convert to sRGB for display
             utils.bt709_to_srgb_inplace(orig_preview)
             orig_preview = np.clip(orig_preview, 0, 1)
             orig_uint8 = (orig_preview * 255).astype(np.uint8)
-            self.original_ready.emit(orig_uint8, current_path)
             
-            self.load_finished.emit()
+            self.original_ready.emit(orig_uint8, path, request.request_id, applied_ev)
 
-    def _do_process(self):
-        # Fallback: If we are in process mode but haven't loaded data yet (race condition fix)
+    def _do_process(self, request: ProcessRequest):
+        """Process image with parameters"""
+        # Ensure image is loaded
         if self.cached_linear is None:
-            if self.raw_path:
-                self._do_load()
-            
+            # Need to load first
+            self._do_load(ProcessRequest(request.path, {'_load': True}, request.request_id))
             if self.cached_linear is None:
                 return
         
-        # Make a local copy of params to avoid race conditions
-        params = self.params.copy()
+        params = request.params
         
-        # 1. Lens Correction Check
+        # Lens correction check
         current_lens_key = (params.get('lens_correct'), params.get('custom_db_path'))
         
-        img = None
         if current_lens_key != self.cached_lens_key or self.cached_corrected is None:
-            # Re-run lens correction
             temp = self.cached_linear.copy()
             if params.get('lens_correct') and self.exif_data:
                 temp = utils.apply_lens_correction(
-                    temp,
-                    self.exif_data,
-                    custom_db_path=params.get('custom_db_path')
+                    temp, self.exif_data, custom_db_path=params.get('custom_db_path')
                 )
             self.cached_corrected = temp
             self.cached_lens_key = current_lens_key
         
-        # Start from corrected base
         img = self.cached_corrected.copy()
         
-        # 2. Exposure
+        # Exposure
         if params.get('exposure_mode') == 'Manual':
             gain = 2.0 ** params.get('exposure', 0.0)
             utils.apply_gain_inplace(img, gain)
+            applied_ev = params.get('exposure', 0.0)
         else:
-             # Auto exposure
-             source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
-             mode = params.get('metering_mode', 'matrix')
-             # Create a dummy logger object with info method
-             class DummyLogger:
-                 def info(self, *args, **kwargs):
-                     pass
-             metering.apply_auto_exposure(img, source_cs, mode, logger=DummyLogger())
-
-        # 3. White Balance
+            source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
+            mode = params.get('metering_mode', 'matrix')
+            
+            class DummyLogger:
+                def info(self, *args, **kwargs):
+                    pass
+            
+            _, gain = metering.apply_auto_exposure(img, source_cs, mode, logger=DummyLogger())
+            applied_ev = np.log2(gain)  # Convert gain to EV
+        
+        # White Balance
         temp_val = params.get('wb_temp', 0.0)
         tint = params.get('wb_tint', 0.0)
         utils.apply_white_balance(img, temp_val, tint)
-
-        # 4. Highlight / Shadow
+        
+        # Highlight / Shadow
         hl = params.get('highlight', 0.0)
         sh = params.get('shadow', 0.0)
         utils.apply_highlight_shadow(img, hl, sh)
-
-        # 5. Saturation / Contrast
+        
+        # Saturation / Contrast
         sat = params.get('saturation', 1.0)
         con = params.get('contrast', 1.0)
         utils.apply_saturation_and_contrast(img, saturation=sat, contrast=con)
-
-        # 6. Log Transform
+        
+        # Log Transform
         log_space = params.get('log_space')
         if log_space and log_space != 'None':
-             log_color_space = config.LOG_TO_WORKING_SPACE.get(log_space)
-             log_curve = config.LOG_ENCODING_MAP.get(log_space, log_space)
-             
-             if log_color_space:
-                 M = colour.matrix_RGB_to_RGB(
-                     colour.RGB_COLOURSPACES['ProPhoto RGB'],
-                     colour.RGB_COLOURSPACES[log_color_space]
-                 )
-                 if not img.flags['C_CONTIGUOUS']: img = np.ascontiguousarray(img)
-                 utils.apply_matrix_inplace(img, M)
-                 np.maximum(img, 1e-6, out=img)
-                 img = colour.cctf_encoding(img, function=log_curve)
+            log_color_space = config.LOG_TO_WORKING_SPACE.get(log_space)
+            log_curve = config.LOG_ENCODING_MAP.get(log_space, log_space)
+            
+            if log_color_space:
+                M = colour.matrix_RGB_to_RGB(
+                    colour.RGB_COLOURSPACES['ProPhoto RGB'],
+                    colour.RGB_COLOURSPACES[log_color_space]
+                )
+                if not img.flags['C_CONTIGUOUS']:
+                    img = np.ascontiguousarray(img)
+                utils.apply_matrix_inplace(img, M)
+                np.maximum(img, 1e-6, out=img)
+                img = colour.cctf_encoding(img, function=log_curve)
         
-        # 7. LUT
+        # LUT
         lut_path = params.get('lut_path')
         if lut_path and os.path.exists(lut_path):
             try:
                 lut = colour.read_LUT(lut_path)
                 if isinstance(lut, colour.LUT3D):
-                    if not img.flags['C_CONTIGUOUS']: img = np.ascontiguousarray(img)
-                    if img.dtype != np.float32: img = img.astype(np.float32)
-                    if lut.table.dtype != np.float32: lut.table = lut.table.astype(np.float32)
+                    if not img.flags['C_CONTIGUOUS']:
+                        img = np.ascontiguousarray(img)
+                    if img.dtype != np.float32:
+                        img = img.astype(np.float32)
+                    if lut.table.dtype != np.float32:
+                        lut.table = lut.table.astype(np.float32)
                     utils.apply_lut_inplace(img, lut.table, lut.domain[0], lut.domain[1])
                 else:
                     img = lut.apply(img)
             except:
                 pass
-
-        # 8. Display Transform (to sRGB)
-        # We need sRGB for display. If we are in Log space, we just display as is (Log looks flat)
-        # If user selected "None" log space, we are in ProPhoto Linear. We need to convert to sRGB for display.
-        # However, usually Log/LUT pipeline outputs display referred or Log.
-        # For this preview:
-        # If Log is applied -> Display as is (or if LUT applied, it handles it)
-        # If Log is None -> Convert ProPhoto Linear -> sRGB
         
+        # Display transform
         if not log_space or log_space == 'None':
-             utils.bt709_to_srgb_inplace(img)
+            utils.bt709_to_srgb_inplace(img)
         
         img = np.clip(img, 0, 1)
-        
-        # Store float version for histogram before converting to uint8
         img_float = img.copy()
-        
-        # Convert to uint8 for QImage
         img_uint8 = (img * 255).astype(np.uint8)
         
-        # Emit with the path being processed
-        self.result_ready.emit(img_uint8, img_float, self.processing_path)
+        self.result_ready.emit(img_uint8, img_float, request.path, request.request_id, applied_ev)
 
 
 # ==============================================================================
@@ -471,6 +530,10 @@ class InspectorPanel(ScrollArea):
         # 保存的基准参数
         self.saved_baseline_params = None
         
+        # 保存各模式的EV值
+        self.manual_ev_value = 0.0  # 手动模式的EV
+        self.auto_ev_value = 0.0    # 自动模式计算的EV（只读）
+        
         # --- Histogram ---
         self.hist_widget = HistogramWidget()
         self.add_section(tr('histogram'), self.hist_widget)
@@ -504,13 +567,16 @@ class InspectorPanel(ScrollArea):
         self.exp_slider = Slider(Qt.Orientation.Horizontal)
         self.exp_slider.setRange(-100, 100) # -10.0 to 10.0
         self.exp_slider.setValue(0)
+        self.exp_slider.repaint()
         
         # Add exposure value label
         self.exp_value_label = BodyLabel(tr('exposure_ev') + ": 0.0")
         
         def update_exp_label(val):
+            """Update label and trigger debounced parameter change"""
             real_val = val / 10.0
             self.exp_value_label.setText(f"{tr('exposure_ev')}: {real_val:+.1f}")
+            # Trigger parameter change - will be debounced by 100ms timer in on_param_changed
             self._on_param_change()
         
         self.exp_slider.valueChanged.connect(update_exp_label)
@@ -601,12 +667,14 @@ class InspectorPanel(ScrollArea):
             slider.setValue(int(default_v*scale))
             
             def update_lbl(val):
+                """Update label and trigger debounced parameter change"""
                 real_val = val / scale
                 lbl.setText(f"{name}: {real_val:.2f}")
+                # Trigger parameter change - will be debounced by 100ms timer in on_param_changed
                 self._on_param_change()
-                
-            slider.valueChanged.connect(update_lbl)
             
+            slider.valueChanged.connect(update_lbl)
+                
             layout.addWidget(lbl)
             layout.addWidget(slider)
             adj_layout.addLayout(layout)
@@ -657,6 +725,7 @@ class InspectorPanel(ScrollArea):
         if 'exposure' in params:
             exp_val = params['exposure']
             self.exp_slider.setValue(int(exp_val * 10))
+            self.exp_slider.repaint()
             # Update the exposure value label
             self.exp_value_label.setText(f"{tr('exposure_ev')}: {exp_val:+.1f}")
             
@@ -757,7 +826,31 @@ class InspectorPanel(ScrollArea):
         self._update_exposure_switch_text()
 
     def _on_exposure_mode_changed(self):
+        is_auto = self.auto_exp_radio.isChecked()
+        
+        # Update UI state FIRST (enable/disable controls)
         self._update_exposure_ui_state()
+        
+        if is_auto:
+            # Switching to auto mode: save current manual value
+            self.manual_ev_value = self.exp_slider.value() / 10.0
+            # Display auto mode EV
+            # self.exp_slider.blockSignals(True)
+            self.exp_slider.setValue(int(self.auto_ev_value * 10))
+            self.exp_slider.repaint()  # Force immediate visual refresh
+            # self.exp_slider.blockSignals(False)
+            # Update label manually
+            self.exp_value_label.setText(f"{tr('exposure_ev')}: {self.auto_ev_value:+.1f}")
+        else:
+            # Switching to manual mode: save current auto value, restore manual value
+            self.auto_ev_value = self.exp_slider.value() / 10.0
+            # self.exp_slider.blockSignals(True)
+            self.exp_slider.setValue(int(self.manual_ev_value * 10))
+            self.exp_slider.repaint()  # Force immediate visual refresh
+            # self.exp_slider.blockSignals(False)
+            # Update label manually
+            self.exp_value_label.setText(f"{tr('exposure_ev')}: {self.manual_ev_value:+.1f}")
+        
         self._on_param_change()
 
     def _on_param_change(self):
@@ -785,6 +878,7 @@ class InspectorPanel(ScrollArea):
         self.metering_combo.setCurrentText('Matrix')
         self._update_exposure_ui_state()
         self.exp_slider.setValue(0)
+        self.exp_slider.repaint()
         self.exp_value_label.setText(tr('exposure_ev') + ": 0.0")
         self.log_combo.setCurrentText('None')
         self.lut_combo.setCurrentIndex(0)
@@ -830,15 +924,17 @@ class MainWindow(FluentWindow):
         self.current_folder = None
         self.current_raw_path = None
         self.marked_files = set()
-        self.file_params_cache = {} # path -> params dict
-        self.thumbnail_cache = {} # path -> original QPixmap (without green dot)
-        
-        # 基准点参数缓存 - 每张图像都有自己的基准点参数
+        self.file_params_cache = {}  # path -> params dict
+        self.thumbnail_cache = {}  # path -> original QPixmap
         self.file_baseline_params_cache = {}  # path -> baseline params dict
         
-        # 优化: 添加缩放图像缓存,避免重复缩放
-        self._scaled_pixmap_cache = {}  # (pixmap_id, size) -> scaled_pixmap
-        self._max_cache_size = 10  # 最多缓存10个缩放图像
+        # Image states - clean replacement for scattered pixmap variables
+        self.original = ImageState()  # RAW decoded
+        self.current = ImageState()   # Processed with current params
+        self.baseline = ImageState()  # Saved baseline (optional)
+        
+        # Request tracking
+        self.current_request_id = 0
         
         # 预加载lensfun数据库（在后台线程中）
         self._preload_lensfun_database()
@@ -851,15 +947,11 @@ class MainWindow(FluentWindow):
         self.processor = ImageProcessor()
         self.processor.result_ready.connect(self.on_process_result)
         self.processor.original_ready.connect(self.on_original_ready)
-        self.processor.finished.connect(self.on_processor_finished)
         self.processor.error_occurred.connect(self.on_error)
         
-        # 基准点图像处理器 - 用于生成基准点对比图像
+        # Baseline processor
         self.baseline_processor = ImageProcessor()
         self.baseline_processor.result_ready.connect(self.on_baseline_result)
-        
-        # 当前基准点图像缓存（临时，用于对比显示）
-        self.current_baseline_pixmap = None
         
         # Processing Debounce
         self.update_timer = QTimer()
@@ -1154,30 +1246,32 @@ class MainWindow(FluentWindow):
         self.gallery_list.addItem(item)
 
     def on_gallery_item_clicked(self, item):
-        if not item: return
+        if not item:
+            return
         path = item.data(Qt.ItemDataRole.UserRole)
-        if path == self.current_raw_path: return
+        if path == self.current_raw_path:
+            return
 
-        # 1. Save current params before switching
+        # Save current params before switching
         if self.current_raw_path:
             self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
 
-        # 2. Switch path
+        # Switch path
         self.current_raw_path = path
         
-        # 3. 优化: 清理旧图像并触发垃圾回收
-        if hasattr(self, 'original_pixmap_scaled'):
-            self.original_pixmap_scaled = None
-        if hasattr(self, 'last_processed_pixmap'):
-            self.last_processed_pixmap = None
-        if hasattr(self, '_last_processed_pixmap_full'):
-            self._last_processed_pixmap_full = None
-        if hasattr(self, 'original_pixmap_raw'):
-            self.original_pixmap_raw = None
-        # 清除当前基准点图像缓存
-        self.current_baseline_pixmap = None
-        # 清理缩放缓存
-        self._scaled_pixmap_cache.clear()
+        # Clear images for new selection
+        self.original.clear()
+        self.current.clear()
+        self.baseline.clear()
+        
+        # Reset auto EV display if in auto mode (will be updated after processing)
+        if self.right_panel.auto_exp_radio.isChecked():
+            self.right_panel.auto_ev_value = 0.0
+            # self.right_panel.exp_slider.blockSignals(True)
+            self.right_panel.exp_slider.setValue(0)
+            self.right_panel.exp_slider.repaint()  # Force visual refresh
+            # self.right_panel.exp_slider.blockSignals(False)
+            self.right_panel.exp_value_label.setText(f"{tr('exposure_ev')}: 0.0")
         
         # 4. Restore params or Reset
         if path in self.file_params_cache:
@@ -1202,153 +1296,161 @@ class MainWindow(FluentWindow):
 
     def load_image(self, path):
         self.preview_lbl.setText(tr('loading'))
+        self.current_request_id = self.processor.current_request_id + 1
         self.processor.load_image(path)
         
-    def on_processor_finished(self):
-        # Determine if we need to restart processing based on pending tasks
-        
-        # Case 1: We wanted to load, but just finished processing (or something else)
-        if self.processor.mode == 'load' and self.processor.running_mode != 'load':
-            self.processor.start()
-            return
-
-        # Case 2: We finished loading, now we need to trigger initial processing
-        if self.processor.mode == 'load':
-            # Finished loading, start processing
-            QTimer.singleShot(0, self.trigger_processing)
-            return
-            
-        # Case 3: We are in process mode
-        if self.processor.mode == 'process':
-            # If we just finished load, or params are dirty, restart
-            if self.processor.running_mode != 'process' or self.processor.params_dirty:
-                self.processor.params_dirty = False
-                self.processor.start()
-                return
-
     def on_param_changed(self, params):
-        # Debounce
+        # Debounce - trigger processing after brief delay
         self.update_timer.start()
     
-    def save_baseline_image(self):
-        """保存当前参数作为基准点"""
+    def trigger_processing(self):
         if not self.current_raw_path:
             return
-            
-        # 保存当前参数到基准点缓存
+        params = self.right_panel.get_params()
+        self.current_request_id += 1
+        self.processor.update_preview(self.current_raw_path, params)
+    
+    def save_baseline_image(self):
+        """Save current params as baseline"""
+        if not self.current_raw_path:
+            return
+        
         current_params = self.right_panel.get_params()
         self.file_baseline_params_cache[self.current_raw_path] = current_params.copy()
         
-        # 立即生成基准点图像用于对比
+        # Generate baseline image immediately
         if self.processor.cached_linear is not None:
+            # Copy cache state to baseline processor
             self.baseline_processor.cached_linear = self.processor.cached_linear
             self.baseline_processor.cached_corrected = self.processor.cached_corrected
             self.baseline_processor.cached_lens_key = self.processor.cached_lens_key
             self.baseline_processor.exif_data = self.processor.exif_data
-            self.baseline_processor.processing_path = self.current_raw_path
-            self.baseline_processor.update_preview(current_params)
+            self.baseline_processor.current_path = self.current_raw_path
+            self.baseline_processor.update_preview(self.current_raw_path, current_params)
+        
+        InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
     
-    def on_baseline_result(self, img_uint8, img_float, image_path):
-        """处理基准点图像生成结果"""
-        # 只在图像路径匹配时更新
+    def on_baseline_result(self, img_uint8, img_float, image_path, request_id):
+        """Handle baseline image generation result"""
         if image_path != self.current_raw_path:
             return
-            
+        
         h, w, c = img_uint8.shape
         bytes_per_line = w * 3
         qimg = QImage(img_uint8.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg.copy())
         
-        # 优化: 使用缓存的缩放
-        scaled = self._get_scaled_pixmap(pixmap, self.preview_lbl.size())
-        self.current_baseline_pixmap = scaled
+        # Update baseline state
+        self.baseline.update_full(pixmap, img_float)
     
     def regenerate_baseline_for_current_image(self):
-        """为当前图像重新生成基准点图像"""
+        """Regenerate baseline image for current image when switching"""
         if not self.current_raw_path:
             return
         
         if self.current_raw_path not in self.file_baseline_params_cache:
             return
-            
-        # 确保主处理器已经加载了图像
+        
         if self.processor.cached_linear is None:
             return
         
-        # 使用保存的基准点参数生成图像
         baseline_params = self.file_baseline_params_cache[self.current_raw_path]
         self.baseline_processor.cached_linear = self.processor.cached_linear
         self.baseline_processor.cached_corrected = self.processor.cached_corrected
         self.baseline_processor.cached_lens_key = self.processor.cached_lens_key
         self.baseline_processor.exif_data = self.processor.exif_data
-        self.baseline_processor.processing_path = self.current_raw_path
-        self.baseline_processor.update_preview(baseline_params)
-        
-    def trigger_processing(self):
-        if not self.current_raw_path: return
-        params = self.right_panel.get_params()
-        self.processor.update_preview(params)
+        self.baseline_processor.current_path = self.current_raw_path
+        self.baseline_processor.update_preview(self.current_raw_path, baseline_params)
 
-    def on_process_result(self, img_uint8, img_float, image_path):
-        # Verify this result is for the currently selected image
-        if image_path != self.current_raw_path:
-            # Ignore results from previous image selections
-            return
-            
+    def on_process_result(self, img_uint8, img_float, image_path, request_id, applied_ev):
+        """Handle processed image result"""
         h, w, c = img_uint8.shape
-        # 优化: 使用QImage的构造函数直接从numpy数组创建,避免tobytes()拷贝
-        # 注意: 需要确保img_uint8在QImage生命周期内有效
         bytes_per_line = w * 3
         qimg = QImage(img_uint8.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        # 立即转换为QPixmap并拷贝数据,之后img_uint8可以被释放
         pixmap = QPixmap.fromImage(qimg.copy())
         
-        # 优化: 使用缓存的缩放图像
-        scaled = self._get_scaled_pixmap(pixmap, self.preview_lbl.size())
-        self.preview_lbl.setPixmap(scaled)
-        # 使用update()而非repaint(),让Qt优化重绘时机
-        self.preview_lbl.update()
+        # Always update thumbnail for the processed image, regardless of current selection
+        for i in range(self.gallery_list.count()):
+            item = self.gallery_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == image_path:
+                thumb_pixmap = pixmap.scaled(
+                    200, 200,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation
+                )
+                item.setIcon(QIcon(thumb_pixmap))
+                break
         
-        # Store for compare
-        self.last_processed_pixmap = scaled
-        self._last_processed_pixmap_full = pixmap  # 保存完整尺寸用于重新缩放
+        # Only update display and histogram if this is the current image
+        if request_id != self.current_request_id or image_path != self.current_raw_path:
+            return
         
-        # 优化: 更新缩略图 - 使用FastTransformation提速
-        current_item = self.gallery_list.currentItem()
-        if current_item and current_item.data(Qt.ItemDataRole.UserRole) == image_path:
-            thumb_pixmap = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
-                                        Qt.TransformationMode.FastTransformation)
-            current_item.setIcon(QIcon(thumb_pixmap))
-        else:
-            # Fallback: search for item
-            for i in range(self.gallery_list.count()):
-                item = self.gallery_list.item(i)
-                if item.data(Qt.ItemDataRole.UserRole) == image_path:
-                    thumb_pixmap = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
-                                                Qt.TransformationMode.FastTransformation)
-                    item.setIcon(QIcon(thumb_pixmap))
-                    break
-
-        # Update Histogram
+        # Update current state
+        self.current.update_full(pixmap, img_float)
+        
+        # Update auto EV value if in auto mode
+        if self.right_panel.auto_exp_radio.isChecked():
+            self.right_panel.auto_ev_value = applied_ev
+            # Update display without triggering param change
+            # self.right_panel.exp_slider.blockSignals(True)
+            self.right_panel.exp_slider.setValue(int(applied_ev * 10))
+            self.right_panel.exp_slider.repaint()  # Force immediate visual refresh
+            # self.right_panel.exp_slider.blockSignals(False)
+            # Manually update label since blockSignals prevented valueChanged
+            self.right_panel.exp_value_label.setText(f"{tr('exposure_ev')}: {applied_ev:+.1f}")
+        
+        # Display
+        display_pixmap = self.current.get_display(self.preview_lbl.size())
+        if display_pixmap:
+            self.preview_lbl.setPixmap(display_pixmap)
+            self.preview_lbl.update()
+        
+        # Update histogram
         self.right_panel.hist_widget.update_data(img_float)
 
-    def on_original_ready(self, img_uint8, image_path):
-        # Verify this result is for the currently selected image
-        if image_path != self.current_raw_path:
-            # Ignore results from previous image selections
+    def on_original_ready(self, img_uint8, image_path, request_id, applied_ev):
+        # Ignore stale results
+        if request_id != self.current_request_id or image_path != self.current_raw_path:
             return
-            
+        
         h, w, c = img_uint8.shape
         bytes_per_line = w * 3
         qimg = QImage(img_uint8.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg.copy())
-        self.original_pixmap_raw = pixmap
         
-        # 优化: 使用缓存的缩放
-        scaled = self._get_scaled_pixmap(pixmap, self.preview_lbl.size())
-        self.original_pixmap_scaled = scaled
-        self.preview_lbl.setPixmap(scaled)
-        self.preview_lbl.update()
+        # Update original state
+        self.original.update_full(pixmap)
+        
+        # Update auto EV value and slider if in auto mode
+        if self.right_panel.auto_exp_radio.isChecked():
+            self.right_panel.auto_ev_value = applied_ev
+            # Update display without triggering param change
+            # self.right_panel.exp_slider.blockSignals(True)
+            self.right_panel.exp_slider.setValue(int(applied_ev * 10))
+            self.right_panel.exp_slider.repaint()  # Force immediate visual refresh
+            # self.right_panel.exp_slider.blockSignals(False)
+            # Manually update label since blockSignals prevented valueChanged
+            self.right_panel.exp_value_label.setText(f"{tr('exposure_ev')}: {applied_ev:+.1f}")
+        
+        # Display original first
+        display_pixmap = self.original.get_display(self.preview_lbl.size())
+        if display_pixmap:
+            self.preview_lbl.setPixmap(display_pixmap)
+            self.preview_lbl.update()
+        
+        # Trigger processing - but only if still the current image
+        # Capture path to avoid race condition with fast image switching
+        if image_path == self.current_raw_path:
+            QTimer.singleShot(0, lambda: self._trigger_processing_for_path(image_path))
+    
+    def _trigger_processing_for_path(self, path):
+        """Trigger processing for specific path - prevents race conditions"""
+        if path != self.current_raw_path:
+            return  # User switched away, don't process
+        
+        params = self.right_panel.get_params()
+        self.current_request_id += 1
+        self.processor.update_preview(path, params)
 
     def on_error(self, msg):
         self.preview_lbl.setText(f"{tr('error')}: {msg}")
@@ -1478,27 +1580,30 @@ class MainWindow(FluentWindow):
                 InfoBar.error(tr('delete_failed'), str(e), parent=self)
 
     def show_original(self, event):
-        """Show baseline image when mouse is pressed or button is held"""
-        # 优先显示保存的基准点图像
-        if self.current_baseline_pixmap:
-            self.preview_lbl.setPixmap(self.current_baseline_pixmap)
-            InfoBar.info(tr('hold_to_compare'), tr('compare_showing_baseline'), duration=1000, parent=self)
-        elif hasattr(self, 'original_pixmap_scaled') and self.original_pixmap_scaled:
-            # 如果没有保存基准点，则显示原始图像
-            self.preview_lbl.setPixmap(self.original_pixmap_scaled)
-            InfoBar.info(tr('hold_to_compare'), tr('compare_showing_original'), duration=1000, parent=self)
-        else:
-            # Debug: Image not ready yet
-            if self.current_raw_path:
-                InfoBar.warning(tr('hold_to_compare'), tr('compare_loading'), duration=1500, parent=self)
+        """Show baseline or original when comparing"""
+        # Priority: baseline > original
+        img_to_show = self.baseline if self.baseline.full else self.original
+        
+        if not img_to_show.full:
+            return  # Image not loaded yet
+        
+        display_pixmap = img_to_show.get_display(self.preview_lbl.size())
+        if display_pixmap:
+            self.preview_lbl.setPixmap(display_pixmap)
 
     def show_processed(self, event):
-        """Show processed image when mouse is released or button is released"""
-        if hasattr(self, 'last_processed_pixmap') and self.last_processed_pixmap:
-            self.preview_lbl.setPixmap(self.last_processed_pixmap)
-        elif hasattr(self, 'original_pixmap_scaled') and self.original_pixmap_scaled:
-            # Fallback to original if processed not ready yet
-            self.preview_lbl.setPixmap(self.original_pixmap_scaled)
+        """Show current processed image"""
+        if not self.current.full:
+            # Fallback to original if current not ready
+            if self.original.full:
+                display_pixmap = self.original.get_display(self.preview_lbl.size())
+                if display_pixmap:
+                    self.preview_lbl.setPixmap(display_pixmap)
+            return
+        
+        display_pixmap = self.current.get_display(self.preview_lbl.size())
+        if display_pixmap:
+            self.preview_lbl.setPixmap(display_pixmap)
 
     def export_current(self):
         if not self.current_raw_path: return
@@ -1636,40 +1741,31 @@ class MainWindow(FluentWindow):
         self.export_thread.finished_sig.connect(on_finish)
         self.export_thread.start()
     
-    def _get_scaled_pixmap(self, pixmap, target_size):
-        """优化的缩放方法 - 使用缓存避免重复缩放"""
-        # 生成缓存键
-        pixmap_id = id(pixmap)
-        size_key = (target_size.width(), target_size.height())
-        cache_key = (pixmap_id, size_key)
-        
-        # 检查缓存
-        if cache_key in self._scaled_pixmap_cache:
-            return self._scaled_pixmap_cache[cache_key]
-        
-        # 执行缩放
-        scaled = pixmap.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio,
-                              Qt.TransformationMode.SmoothTransformation)
-        
-        # 更新缓存 (LRU策略)
-        if len(self._scaled_pixmap_cache) >= self._max_cache_size:
-            # 移除最旧的条目
-            self._scaled_pixmap_cache.pop(next(iter(self._scaled_pixmap_cache)))
-        
-        self._scaled_pixmap_cache[cache_key] = scaled
-        return scaled
     
     def resizeEvent(self, event):
-        """窗口大小改变时清理缩放缓存"""
+        """Clear display caches on resize, let ImageState handle re-scaling"""
         super().resizeEvent(event)
-        # 清理缩放缓存,因为目标尺寸已改变
-        self._scaled_pixmap_cache.clear()
         
-        # 如果有当前图像,重新缩放显示
-        if hasattr(self, '_last_processed_pixmap_full') and self._last_processed_pixmap_full:
-            scaled = self._get_scaled_pixmap(self._last_processed_pixmap_full, self.preview_lbl.size())
-            self.preview_lbl.setPixmap(scaled)
-            self.last_processed_pixmap = scaled
+        # Clear display caches - full pixmaps remain
+        self.original.display = None
+        self.current.display = None
+        self.baseline.display = None
+        
+        # Debounce re-display
+        if not hasattr(self, 'resize_timer'):
+            self.resize_timer = QTimer()
+            self.resize_timer.setSingleShot(True)
+            self.resize_timer.setInterval(100)
+            self.resize_timer.timeout.connect(self._on_resize_complete)
+        
+        self.resize_timer.start()
+    
+    def _on_resize_complete(self):
+        """Re-display current image after resize"""
+        if self.current.full:
+            display_pixmap = self.current.get_display(self.preview_lbl.size())
+            if display_pixmap:
+                self.preview_lbl.setPixmap(display_pixmap)
 
 
 def launch_gui():
