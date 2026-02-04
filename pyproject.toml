@@ -32,7 +32,8 @@ dependencies = [
     "Send2Trash",
     "packaging",
     "loguru",
-    "pyexiv2"
+    "pyexiv2",
+    "onnxruntime",
 ]
 
 [project.urls]

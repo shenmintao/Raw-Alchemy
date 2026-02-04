@@ -28,6 +28,8 @@ def process_path(
     flip_horizontal: bool = False,
     flip_vertical: bool = False,
     crop: tuple = (0.0, 0.0, 1.0, 1.0),
+    # Denoising
+    denoise_strength: float = 0.0,
 ):
     """
     Orchestrates the processing of a single file or a directory of files.
@@ -95,6 +97,7 @@ def process_path(
                     rotation=rotation,
                     flip_horizontal=flip_horizontal,
                     flip_vertical=flip_vertical,
+                    denoise_strength=denoise_strength,
                 ): filename for filename in raw_files
             }
             
@@ -149,6 +152,7 @@ def process_path(
                 flip_horizontal=flip_horizontal,
                 flip_vertical=flip_vertical,
                 crop=crop,
+                denoise_strength=denoise_strength,
             )
         finally:
             # 发送完成信号

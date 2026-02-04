@@ -11,6 +11,7 @@ from loguru import logger
 from raw_alchemy import utils, metering, config
 from raw_alchemy.pipeline.request import ProcessRequest
 from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
+from raw_alchemy.onnx import denoiser
 
 class ImageProcessor(QThread):
     """
@@ -20,6 +21,9 @@ class ImageProcessor(QThread):
     result_ready = Signal(np.ndarray, np.ndarray, str, int, float)  # img_uint8, img_float, path, request_id, applied_ev
     load_complete = Signal(str, int)  # path, request_id - signals RAW loading is done
     error_occurred = Signal(str)
+    denoise_progress = Signal(int, int)  # current, total - for progress bar
+    denoise_started = Signal()  # signals denoising has started
+    denoise_finished = Signal()  # signals denoising has finished
 
     def __init__(self):
         super().__init__()
@@ -37,20 +41,26 @@ class ImageProcessor(QThread):
         self.cached_corrected = None
         self.cached_lens_key = None
         
-        # New Caching Layers
-        self.cached_geometry = None     # Layer 0.5: After Geometry
+        # Caching Layers (in processing order)
+        
+        # Layer 1: After Geometry (Rotation/Flip)
+        self.cached_geometry = None
         self.last_geometry_key = None
 
-        self.cached_perspective = None  # Layer 0.55: After Perspective Correction
+        # Layer 3: After Perspective Correction
+        self.cached_perspective = None
         self.last_perspective_key = None
 
-        self.cached_cropped = None      # Layer 0.6: After Crop
+        # Layer 4: After Crop
+        self.cached_cropped = None
         self.last_crop_key = None
 
-        self.cached_exposed = None      # Layer 1: After Exposure Gain
+        # Layer 5: After Exposure Gain
+        self.cached_exposed = None
         self.last_exposure_key = None
         
-        self.cached_adjusted = None     # Layer 2: After WB/HS/Sat/Con
+        # Layer 6: After WB/HS/Sat/Con
+        self.cached_adjusted = None
         self.last_adjustment_key = None
         
         # Metering Cache (Logic)
@@ -67,6 +77,12 @@ class ImageProcessor(QThread):
         self.cached_lut_domain_min = None
         self.cached_lut_domain_max = None
         self.cached_lut_is_3d = False
+        
+        # Denoising Cache (at the end, after LUT/sRGB)
+        # Cache the fully denoised image (strength=1.0) and original for blending
+        self.cached_denoise_original = None  # Original sRGB image before denoising
+        self.cached_denoise_full = None      # Fully denoised image (strength=1.0)
+        self.last_denoise_key = None         # Key based on all params affecting sRGB output
 
     def load_image(self, path: str):
         """Load RAW image - creates a special load request"""
@@ -200,7 +216,6 @@ class ImageProcessor(QThread):
             self.cached_corrected = cached_item.corrected_data
             
             # Reset pipeline caches for new image context
-            # Reset pipeline caches for new image context
             self.cached_geometry = None
             self.last_geometry_key = None
             self.cached_perspective = None
@@ -211,6 +226,8 @@ class ImageProcessor(QThread):
             self.last_exposure_key = None
             self.cached_adjusted = None
             self.last_adjustment_key = None
+            self.cached_denoised = None
+            self.last_denoise_key = None
             self.cached_auto_ev = 0.0
             self.last_metering_key = None
             
@@ -237,6 +254,8 @@ class ImageProcessor(QThread):
             self.last_exposure_key = None
             self.cached_adjusted = None
             self.last_adjustment_key = None
+            self.cached_denoised = None
+            self.last_denoise_key = None
             self.cached_auto_ev = 0.0
             self.last_metering_key = None
             
@@ -364,7 +383,8 @@ class ImageProcessor(QThread):
                          self.cache_manager._evict_if_needed()
              
             
-            # --- Stage 2.5: Geometry (Rotation/Flip) ---
+            # --- Stage 3: Geometry (Rotation/Flip) ---
+            # Note: Denoising is now done at the end (after LUT/sRGB) for JPG-style denoising
             geometry_key = (
                 self.cached_lens_key,
                 params.get('rotation', 0),
@@ -373,14 +393,13 @@ class ImageProcessor(QThread):
             )
 
             if geometry_key == self.last_geometry_key and self.cached_geometry is not None:
-                # logger.debug(f"[Worker] Layer 2.5 (Geometry) Cache Hit")
+                # Cache hit
                 pass
             else:
-                logger.debug(f"[Worker] Layer 2.5 (Geometry) Computing...")
-                # Apply geometry to corrected image
-                # Since utils.apply_geometry returns a copy (usually), we are safe
+                logger.debug(f"[Worker] Layer 3 (Geometry) Computing...")
+                # Apply geometry to corrected image (denoising is now at the end)
                 self.cached_geometry = utils.apply_geometry(
-                    self.cached_corrected, 
+                    self.cached_corrected,
                     rotation=params.get('rotation', 0),
                     flip_h=params.get('flip_horizontal', False),
                     flip_v=params.get('flip_vertical', False)
@@ -545,7 +564,7 @@ class ImageProcessor(QThread):
             # Prepare image for Grading (COPY!)
             img = self.cached_adjusted.copy()
             
-            # --- Stage 3.5: Viewport Resize (Before Grading for speed) ---
+            # --- Stage 5: Viewport Resize (Before Grading for speed) ---
             # Resize to viewport size BEFORE Log/LUT for 8x speedup
             viewport_size = params.get('viewport_size')  # (width, height) tuple
             if viewport_size and viewport_size[0] > 0 and viewport_size[1] > 0:
@@ -654,7 +673,70 @@ class ImageProcessor(QThread):
                 img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
             
             img = np.clip(img, 0, 1)
-            img_float = img # Shared buffer
+            
+            # --- Stage 6: Denoising (After LUT/sRGB, JPG-style denoising) ---
+            # Cache key includes all parameters that affect the sRGB image
+            # (excluding denoise_strength since we cache full denoising and blend)
+            denoise_cache_key = (
+                self.last_adjustment_key,  # All dev params up to adjustment
+                params.get('viewport_size'),  # Viewport resize
+                log_space,  # Log transform
+                lut_path,  # LUT
+            )
+            
+            denoise_strength = params.get('denoise_strength', 0.0)
+            if denoise_strength > 0:
+                # Check if we need to recompute denoising
+                if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
+                    # Cache miss - need to compute full denoising
+                    try:
+                        self.denoise_started.emit()
+                        logger.info(f"[Worker] Computing full denoising (cache miss)...")
+                        
+                        # Save original for blending
+                        self.cached_denoise_original = img.copy()
+                        
+                        # Progress callback for UI
+                        def progress_callback(current, total):
+                            self.denoise_progress.emit(current, total)
+                        
+                        # Apply full denoising (strength=1.0)
+                        self.cached_denoise_full = denoiser.denoise(
+                            img,
+                            strength=1.0,  # Always compute full denoising
+                            tile_size=768,  # Optimized for 4GB VRAM (~3-3.5GB usage)
+                            tile_overlap=64,  # Increased from 32 for better blending
+                            progress_callback=progress_callback
+                        )
+                        
+                        self.last_denoise_key = denoise_cache_key
+                        self.denoise_finished.emit()
+                        logger.info(f"[Worker] Full denoising cached")
+                    except Exception as e:
+                        logger.error(f"[Worker] Denoising failed: {e}")
+                        self.denoise_finished.emit()
+                        # Clear cache on error
+                        self.cached_denoise_original = None
+                        self.cached_denoise_full = None
+                        self.last_denoise_key = None
+                
+                # Apply strength blending from cache
+                if self.cached_denoise_full is not None and self.cached_denoise_original is not None:
+                    if denoise_strength >= 1.0:
+                        img = self.cached_denoise_full.copy()
+                    else:
+                        # Blend: result = original * (1 - strength) + denoised * strength
+                        img = self.cached_denoise_original * (1.0 - denoise_strength) + \
+                              self.cached_denoise_full * denoise_strength
+                    logger.debug(f"[Worker] Applied denoise strength={denoise_strength:.2f} from cache")
+            else:
+                # Denoising disabled - invalidate cache if params changed
+                if denoise_cache_key != self.last_denoise_key:
+                    self.cached_denoise_original = None
+                    self.cached_denoise_full = None
+                    self.last_denoise_key = None
+            
+            img_float = img  # Shared buffer
             img_uint8 = (img * 255).astype(np.uint8)
             
             self.result_ready.emit(img_uint8, img_float, request.path, request.request_id, applied_ev)
