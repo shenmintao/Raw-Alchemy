@@ -83,6 +83,10 @@ class ImageProcessor(QThread):
         self.cached_denoise_original = None  # Original sRGB image before denoising
         self.cached_denoise_full = None      # Fully denoised image (strength=1.0)
         self.last_denoise_key = None         # Key based on all params affecting sRGB output
+        
+        # Sharpening Cache
+        self.cached_sharpened = None
+        self.last_sharpen_key = None
 
     def load_image(self, path: str):
         """Load RAW image - creates a special load request"""
@@ -226,8 +230,18 @@ class ImageProcessor(QThread):
             self.last_exposure_key = None
             self.cached_adjusted = None
             self.last_adjustment_key = None
-            self.cached_denoised = None
-            self.last_denoise_key = None
+            self.cached_adjusted = None
+            self.last_adjustment_key = None
+            
+            # Restore Denoise Cache
+            self.cached_denoise_full = cached_item.denoise_full
+            self.cached_denoise_original = cached_item.denoise_original
+            self.last_denoise_key = cached_item.denoise_key
+            
+            # Restore Sharpen Cache
+            self.cached_sharpened = cached_item.sharpened_data
+            self.last_sharpen_key = cached_item.sharpen_key
+
             self.cached_auto_ev = 0.0
             self.last_metering_key = None
             
@@ -256,6 +270,8 @@ class ImageProcessor(QThread):
             self.last_adjustment_key = None
             self.cached_denoised = None
             self.last_denoise_key = None
+            self.cached_sharpened = None
+            self.last_sharpen_key = None
             self.cached_auto_ev = 0.0
             self.last_metering_key = None
             
@@ -505,6 +521,10 @@ class ImageProcessor(QThread):
                     applied_ev = self.cached_auto_ev
                     final_exposure_gain = gain
 
+            # Round gain to avoid float mismatch in cache keys
+            # Reduced precision to 4 decimal places to prevent cache misses due to micro-variations
+            final_exposure_gain = round(float(final_exposure_gain), 4)
+            
             # Exposure Key for Pixel Cache
             exposure_key = (
                 self.cached_lens_key,
@@ -688,6 +708,21 @@ class ImageProcessor(QThread):
             if denoise_strength > 0:
                 # Check if we need to recompute denoising
                 if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
+                    logger.info(f"[Worker] Denoise Cache Miss!")
+                    if self.cached_denoise_full is None:
+                        logger.info(f"[Worker] Reason: cached_denoise_full is None")
+                    if denoise_cache_key != self.last_denoise_key:
+                        logger.info(f"[Worker] Reason: Key Mismatch")
+                        # logger.debug(f"  Current: {denoise_cache_key}")
+                        # logger.debug(f"  Last:    {self.last_denoise_key}")
+                        if self.last_denoise_key:
+                            logger.info(f"  Differences:")
+                            # Compare elements
+                            names = ["AdjustmentKey", "Viewport", "Log", "LUT"]
+                            for i, (v1, v2) in enumerate(zip(denoise_cache_key, self.last_denoise_key)):
+                                if v1 != v2:
+                                    logger.info(f"    {names[i]}: {v1} != {v2}")
+                    
                     # Cache miss - need to compute full denoising
                     try:
                         self.denoise_started.emit()
@@ -712,6 +747,26 @@ class ImageProcessor(QThread):
                         self.last_denoise_key = denoise_cache_key
                         self.denoise_finished.emit()
                         logger.info(f"[Worker] Full denoising cached")
+                        
+                        # Update Cache Manager
+                        cached_item = self.cache_manager.get(request.path)
+                        if cached_item:
+                            # Remove old size if exists
+                            if cached_item.denoise_full is not None:
+                                old_size = cached_item.denoise_full.nbytes / (1024 * 1024)
+                                cached_item.size_mb -= old_size
+                                self.cache_manager.current_memory_mb -= old_size
+
+                            cached_item.denoise_full = self.cached_denoise_full
+                            cached_item.denoise_original = self.cached_denoise_original
+                            cached_item.denoise_key = denoise_cache_key
+                            
+                            # Add new size
+                            new_size = self.cached_denoise_full.nbytes / (1024 * 1024)
+                            cached_item.size_mb += new_size
+                            self.cache_manager.current_memory_mb += new_size
+                            
+                            self.cache_manager._evict_if_needed()
                     except Exception as e:
                         logger.error(f"[Worker] Denoising failed: {e}")
                         self.denoise_finished.emit()
@@ -738,17 +793,47 @@ class ImageProcessor(QThread):
             
             # --- Stage 7: Sharpening (Richardson-Lucy, after denoise) ---
             sharpen_strength = params.get('sharpen_strength', 0.0)
-            logger.debug(f"[Worker] Sharpen strength from params: {sharpen_strength}")
+            
+            # Cache Key
+            current_img_state_key = (denoise_cache_key, denoise_strength)
+            sharpen_key = (current_img_state_key, sharpen_strength)
+            
             if sharpen_strength > 0:
-                try:
-                    from raw_alchemy.math_ops import sharpen
-                    logger.info(f"[Worker] Applying RL sharpening (strength={sharpen_strength:.2f})...")
-                    img = sharpen(img, strength=sharpen_strength, sigma=1.0)
-                    logger.info(f"[Worker] Sharpening complete")
-                except Exception as e:
-                    import traceback
-                    logger.error(f"[Worker] Sharpening failed: {e}")
-                    traceback.print_exc()
+                if sharpen_key == self.last_sharpen_key and self.cached_sharpened is not None:
+                     logger.debug(f"[Worker] Sharpen Cache Hit")
+                     img = self.cached_sharpened
+                else:
+                    try:
+                        from raw_alchemy.math_ops import sharpen
+                        logger.info(f"[Worker] Applying RL sharpening (strength={sharpen_strength:.2f})...")
+                        img = sharpen(img, strength=sharpen_strength, sigma=1.0)
+                        logger.info(f"[Worker] Sharpening complete")
+                        
+                        # Update Local Cache
+                        self.cached_sharpened = img
+                        self.last_sharpen_key = sharpen_key
+                        
+                        # Update Global Cache (Persistence)
+                        cached_item = self.cache_manager.get(request.path)
+                        if cached_item:
+                            if cached_item.sharpened_data is not None:
+                                old_size = cached_item.sharpened_data.nbytes / (1024 * 1024)
+                                cached_item.size_mb -= old_size
+                                self.cache_manager.current_memory_mb -= old_size
+                            
+                            cached_item.sharpened_data = self.cached_sharpened
+                            cached_item.sharpen_key = self.last_sharpen_key
+                            
+                            new_size = self.cached_sharpened.nbytes / (1024 * 1024)
+                            cached_item.size_mb += new_size
+                            self.cache_manager.current_memory_mb += new_size
+                            
+                            self.cache_manager._evict_if_needed()
+                            
+                    except Exception as e:
+                        import traceback
+                        logger.error(f"[Worker] Sharpening failed: {e}")
+                        traceback.print_exc()
             
             img_float = img  # Shared buffer
             img_uint8 = (img * 255).astype(np.uint8)
