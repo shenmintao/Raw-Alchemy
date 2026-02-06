@@ -16,7 +16,7 @@ from qfluentwidgets import (
     CaptionLabel, StrongBodyLabel, BodyLabel, 
     SimpleCardWidget, ScrollArea, InfoBar, Theme, setTheme, 
     FluentIcon as FIF, ProgressRing, ComboBox,
-    ToolButton, PushButton
+    ToolButton, PushButton, MessageBoxBase, CheckBox
 )
 
 from raw_alchemy import config, utils, orchestrator, lensfun_wrapper, i18n
@@ -39,6 +39,36 @@ from raw_alchemy.ui.widgets.help_panel import HelpPanel
 from raw_alchemy.ui.widgets.about_panel import AboutPanel
 from raw_alchemy.ui.widgets.settings_panel import SettingsPanel
 from PySide6.QtWidgets import QStackedWidget
+
+class BatchExportDialog(MessageBoxBase):
+    """Dialog for batch export settings"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(tr("batch_export_settings"), self)
+        
+        # Format Selection
+        self.formatLabel = BodyLabel(tr("select_format"), self)
+        self.formatComboBox = ComboBox(self)
+        self.formatComboBox.addItems(["JPEG", "HEIF", "TIFF", "DNG"])
+        self.formatComboBox.setCurrentIndex(0)
+        
+        # Disable LUT Option
+        self.disableLutCheckBox = CheckBox(tr("disable_lut_globally"), self)
+        self.disableLutCheckBox.setChecked(False)
+        
+        # Layout
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.formatLabel)
+        self.viewLayout.addWidget(self.formatComboBox)
+        self.viewLayout.addWidget(self.disableLutCheckBox)
+        
+        self.widget.setMinimumWidth(350)
+        
+    def get_settings(self):
+        return {
+            "format": self.formatComboBox.currentText(),
+            "ignore_lut": self.disableLutCheckBox.isChecked()
+        }
 
 class MainWindow(FluentWindow):
     def __init__(self):
@@ -1024,9 +1054,13 @@ class MainWindow(FluentWindow):
             InfoBar.warning(tr('no_files_marked'), tr('please_mark_files'), parent=self)
             return
         
-        formats = ["JPEG", "HEIF", "TIFF", "DNG"]
-        format_str, ok = QInputDialog.getItem(self, tr('select_export_format'), "Format:", formats, 0, False)
-        if not ok: return
+        dialog = BatchExportDialog(self)
+        if dialog.exec():
+            settings = dialog.get_settings()
+            format_str = settings["format"]
+            self.batch_export_ignore_lut = settings["ignore_lut"]
+        else:
+            return
         
         start_dir = self.last_export_path if self.last_export_path else (self.last_folder_path if self.last_folder_path else "")
         folder = QFileDialog.getExistingDirectory(self, tr('select_export_folder'), start_dir)
@@ -1066,11 +1100,14 @@ class MainWindow(FluentWindow):
         
         params = None
         if input_path == self.current_raw_path:
-            params = self.right_panel.get_params()
+            params = self.right_panel.get_params().copy()
         else:
             params = self.file_params_cache.get(input_path)
-            if not params:
-                pass
+            if params:
+                params = params.copy()
+        
+        if params and hasattr(self, 'batch_export_ignore_lut') and self.batch_export_ignore_lut:
+            params['lut_path'] = None
         
         self.batch_export_idx += 1
         self.run_export(input_path, output_path, params=params, callback=self.batch_export_next)

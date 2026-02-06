@@ -156,5 +156,8 @@
     "denoise_info": "Smart denoising using NIND UtNet neural network.",
     "denoising": "Denoising...",
     "denoise_progress": "Denoise progress: {current}/{total}",
-    "sharpen_strength": "Sharpen Strength"
+    "sharpen_strength": "Sharpen Strength",
+    "disable_lut_globally": "Disable LUT globally (Keep other adjustments)",
+    "batch_export_settings": "Batch Export Settings",
+    "select_format": "Select Format"
 }

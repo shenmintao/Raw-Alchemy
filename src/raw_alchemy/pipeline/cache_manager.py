@@ -15,6 +15,15 @@ class CachedImage:
         self.lens_key = lens_key
         self.corrected_data = corrected_data
         
+        # Denoise Cache
+        self.denoise_full = None
+        self.denoise_original = None
+        self.denoise_key = None
+        
+        # Sharpen Cache
+        self.sharpened_data = None
+        self.sharpen_key = None
+        
         # Calculate approximate size in MB
         self.size_mb = linear_data.nbytes / (1024 * 1024)
         if corrected_data is not None:

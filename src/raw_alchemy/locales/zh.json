@@ -156,5 +156,8 @@
     "denoise_info": "使用 NIND UtNet 神经网络进行智能降噪。",
     "denoising": "正在降噪...",
     "denoise_progress": "降噪进度: {current}/{total}",
-    "sharpen_strength": "锐化强度"
+    "sharpen_strength": "锐化强度",
+    "disable_lut_globally": "全局禁用 LUT (保留其他调整)",
+    "batch_export_settings": "批量导出设置",
+    "select_format": "选择格式"
 }
