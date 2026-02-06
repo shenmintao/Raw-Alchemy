@@ -36,6 +36,12 @@ class ProcessorParams(TypedDict, total=False):
     # Internal system flags
     _load: bool
     _preload: bool
+    
+    # New Features
+    denoise_strength: float
+    sharpen_strength: float
+    viewport_size: Tuple[int, int]
+    perspective_corners: Optional[list]
 
 @dataclass
 class ProcessRequest:
