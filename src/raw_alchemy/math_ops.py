@@ -530,6 +530,178 @@ def compute_perspective_matrix(src_corners, dst_width, dst_height):
     return H, H_inv
 
 
+# =========================================================
+# Richardson-Lucy Deconvolution Sharpening
+# =========================================================
+
+def _gaussian_kernel(sigma: float, size: int = None) -> np.ndarray:
+    """Create a 2D Gaussian kernel for PSF."""
+    if size is None:
+        size = int(6 * sigma + 1)
+        if size % 2 == 0:
+            size += 1
+    
+    x = np.arange(size) - size // 2
+    kernel_1d = np.exp(-0.5 * (x / sigma) ** 2)
+    kernel_2d = np.outer(kernel_1d, kernel_1d)
+    kernel_2d /= kernel_2d.sum()
+    
+    return kernel_2d.astype(np.float32)
+
+
+@njit(**JIT_CONFIG)
+def _convolve_2d_reflect(channel, kernel, output):
+    """JIT-compiled 2D convolution with reflect boundary."""
+    h, w = channel.shape
+    kh, kw = kernel.shape
+    kh2, kw2 = kh // 2, kw // 2
+    
+    for y in prange(h):
+        for x in range(w):
+            val = 0.0
+            for ky in range(kh):
+                for kx in range(kw):
+                    # Reflect boundary
+                    sy = y + ky - kh2
+                    sx = x + kx - kw2
+                    
+                    # Reflect at boundaries
+                    if sy < 0:
+                        sy = -sy
+                    elif sy >= h:
+                        sy = 2 * h - sy - 2
+                    
+                    if sx < 0:
+                        sx = -sx
+                    elif sx >= w:
+                        sx = 2 * w - sx - 2
+                    
+                    # Clamp to valid range
+                    if sy < 0: sy = 0
+                    if sy >= h: sy = h - 1
+                    if sx < 0: sx = 0
+                    if sx >= w: sx = w - 1
+                    
+                    val += channel[sy, sx] * kernel[ky, kx]
+            
+            output[y, x] = val
+
+
+@njit(**JIT_CONFIG)
+def _richardson_lucy_iteration(estimate, channel, psf, psf_mirror, blurred, ratio, correction):
+    """Single RL iteration with JIT acceleration."""
+    h, w = channel.shape
+    eps = 1e-8
+    
+    # Forward convolution: blurred = estimate * psf
+    _convolve_2d_reflect(estimate, psf, blurred)
+    
+    # Compute ratio and clip blurred to avoid division by zero
+    for y in prange(h):
+        for x in range(w):
+            b = blurred[y, x]
+            if b < eps:
+                b = eps
+            ratio[y, x] = channel[y, x] / b
+    
+    # Backward convolution: correction = ratio * psf_mirror
+    _convolve_2d_reflect(ratio, psf_mirror, correction)
+    
+    # Update estimate
+    for y in prange(h):
+        for x in range(w):
+            val = estimate[y, x] * correction[y, x]
+            # Clip to prevent extreme values
+            if val < 0.0:
+                val = 0.0
+            elif val > 2.0:
+                val = 2.0
+            estimate[y, x] = val
+
+
+def richardson_lucy_channel(
+    channel: np.ndarray,
+    psf: np.ndarray,
+    iterations: int = 10,
+    clip: bool = True
+) -> np.ndarray:
+    """
+    Apply Richardson-Lucy deconvolution to a single channel.
+    """
+    h, w = channel.shape
+    estimate = channel.copy().astype(np.float32)
+    psf = np.ascontiguousarray(psf.astype(np.float32))
+    psf_mirror = np.ascontiguousarray(psf[::-1, ::-1].copy())
+    
+    # Pre-allocate work buffers
+    blurred = np.empty_like(estimate)
+    ratio = np.empty_like(estimate)
+    correction = np.empty_like(estimate)
+    
+    for _ in range(iterations):
+        _richardson_lucy_iteration(estimate, channel, psf, psf_mirror, blurred, ratio, correction)
+    
+    if clip:
+        estimate = np.clip(estimate, 0, 1)
+    
+    return estimate
+
+
+def richardson_lucy(
+    image: np.ndarray,
+    sigma: float = 1.0,
+    iterations: int = 10,
+    strength: float = 1.0
+) -> np.ndarray:
+    """
+    Apply Richardson-Lucy deconvolution sharpening to an RGB image.
+    """
+    if strength <= 0 or iterations <= 0:
+        return image
+    
+    logger.debug(f"RL sharpening: sigma={sigma}, iterations={iterations}, strength={strength}")
+    
+    psf = _gaussian_kernel(sigma)
+    h, w, c = image.shape
+    result = np.empty_like(image)
+    
+    for i in range(c):
+        result[:, :, i] = richardson_lucy_channel(
+            np.ascontiguousarray(image[:, :, i].astype(np.float32)),
+            psf,
+            iterations
+        )
+    
+    if strength < 1.0:
+        result = image * (1 - strength) + result * strength
+    
+    return result.astype(np.float32)
+
+
+def sharpen(
+    image: np.ndarray,
+    strength: float = 0.5,
+    sigma: float = 1.0
+) -> np.ndarray:
+    """
+    Simplified sharpening interface.
+    
+    Args:
+        image: RGB image in HWC format, float32, range [0, 1]
+        strength: Sharpening strength (0 = off, 1 = max)
+                  Maps to 1-10 RL iterations
+        sigma: PSF sigma (default 1.0, same as NIND)
+    
+    Returns:
+        Sharpened image
+    """
+    if strength <= 0:
+        return image
+    
+    iterations = max(1, int(strength * 10))
+    return richardson_lucy(image, sigma=sigma, iterations=iterations, strength=1.0)
+
+
 def warmup():
     """Compiles all JIT functions with dummy data"""
     logger.info("  ♨️ Warming up JIT kernels...")

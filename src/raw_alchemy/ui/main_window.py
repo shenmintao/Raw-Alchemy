@@ -87,6 +87,12 @@ class MainWindow(FluentWindow):
         self.processor.result_ready.connect(self.on_process_result)
         self.processor.load_complete.connect(self.on_load_complete)
         self.processor.error_occurred.connect(self.on_error)
+        self.processor.denoise_started.connect(self.on_denoise_started)
+        self.processor.denoise_progress.connect(self.on_denoise_progress)
+        self.processor.denoise_finished.connect(self.on_denoise_finished)
+        
+        # Denoise progress dialog
+        self.denoise_progress_dialog = None
         
         # Baseline processor
         self.baseline_processor = ImageProcessor()
@@ -1101,7 +1107,11 @@ class MainWindow(FluentWindow):
                         rotation=p.get('rotation', 0),
                         flip_horizontal=p.get('flip_horizontal', False),
                         flip_vertical=p.get('flip_vertical', False),
-                        crop=p.get('crop', (0.0, 0.0, 1.0, 1.0))
+                        crop=p.get('crop', (0.0, 0.0, 1.0, 1.0)),
+                        # Denoising
+                        denoise_strength=p.get('denoise_strength', 0.0),
+                        # Sharpening
+                        sharpen_strength=p.get('sharpen_strength', 0.0),
                     )
                     self.finished_sig.emit(True, "")
                 except Exception as e:
@@ -1144,6 +1154,36 @@ class MainWindow(FluentWindow):
         if self.current.full:
             display_pixmap = self.current.get_display(self.preview_lbl.size())
             if display_pixmap: self.preview_lbl.setPixmap(display_pixmap)
+
+    def on_denoise_started(self):
+        """Called when denoising starts - show progress dialog"""
+        from qfluentwidgets import StateToolTip
+        
+        if self.denoise_progress_dialog is None:
+            self.denoise_progress_dialog = StateToolTip(
+                tr('denoising'),
+                tr('denoise_progress').format(current=0, total=0),
+                self
+            )
+            self.denoise_progress_dialog.move(
+                self.width() - self.denoise_progress_dialog.width() - 20,
+                self.height() - self.denoise_progress_dialog.height() - 20
+            )
+            self.denoise_progress_dialog.show()
+    
+    def on_denoise_progress(self, current: int, total: int):
+        """Called to update denoising progress"""
+        if self.denoise_progress_dialog:
+            self.denoise_progress_dialog.setContent(
+                tr('denoise_progress').format(current=current, total=total)
+            )
+    
+    def on_denoise_finished(self):
+        """Called when denoising finishes - hide progress dialog"""
+        if self.denoise_progress_dialog:
+            self.denoise_progress_dialog.setContent(tr('done'))
+            self.denoise_progress_dialog.setState(True)
+            self.denoise_progress_dialog = None
 
     def closeEvent(self, event):
         self.save_settings()

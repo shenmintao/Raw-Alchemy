@@ -150,5 +150,11 @@
     "perspective_correction": "透视矫正",
     "perspective_hint": "拖动四个角点来矫正透视",
     "loading_perspective_view": "正在加载透视矫正视图...",
-    "revert_to_baseline_or_default": "撤回到基准值或默认值"
+    "revert_to_baseline_or_default": "撤回到基准值或默认值",
+    "ai_denoise": "AI 降噪",
+    "denoise_strength": "降噪强度",
+    "denoise_info": "使用 NIND UtNet 神经网络进行智能降噪。",
+    "denoising": "正在降噪...",
+    "denoise_progress": "降噪进度: {current}/{total}",
+    "sharpen_strength": "锐化强度"
 }

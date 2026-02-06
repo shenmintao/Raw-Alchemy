@@ -7,12 +7,6 @@ from raw_alchemy import i18n
 from raw_alchemy.ui.main_window import MainWindow
 
 def main():
-    # Initialize high DPI scaling
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
     # --- Fix Numba Cache for Frozen Apps ---
     if getattr(sys, 'frozen', False):
         cache_dir = os.path.expanduser('~/.raw_alchemy/numba_cache')

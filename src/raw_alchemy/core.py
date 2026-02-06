@@ -11,6 +11,7 @@ from raw_alchemy.config import LOG_TO_WORKING_SPACE, LOG_ENCODING_MAP
 from raw_alchemy.logger import create_logger
 from raw_alchemy.metering import apply_auto_exposure
 from raw_alchemy.file_io import save_image
+from raw_alchemy.onnx import denoiser
 
 
 # ==========================================
@@ -39,6 +40,10 @@ def process_image(
     flip_horizontal: bool = False,
     flip_vertical: bool = False,
     crop: Optional[tuple] = None,
+    # Denoising
+    denoise_strength: float = 0.0,
+    # Sharpening (Richardson-Lucy)
+    sharpen_strength: float = 0.0,
 ):
     filename = os.path.basename(raw_path)
     
@@ -189,7 +194,36 @@ def process_image(
         except Exception as e:
             logger.error(f"  ❌ applying LUT: {e}")
 
-    # --- Step 5.5: DNG 线性化处理 ---
+    # --- Step 5.5: Denoising (After LUT/sRGB, JPG-style denoising) ---
+    if denoise_strength > 0:
+        logger.info(f"  🔹 [Step 5.5] Applying denoising (strength={denoise_strength:.2f})...")
+        try:
+            # Clip to [0, 1] before denoising
+            img = np.clip(img, 0, 1)
+            
+            # Apply denoising (model works on sRGB images)
+            img = denoiser.denoise(
+                img,
+                strength=denoise_strength,
+                tile_size=504,  # Optimized for 4GB VRAM (~3-3.5GB usage)
+                tile_overlap=64,  # Increased for better blending in low-contrast areas
+                progress_callback=None  # No progress callback for export
+            )
+            logger.info("  ✅ Denoising complete")
+        except Exception as e:
+            logger.error(f"  ❌ Denoising failed: {e}")
+
+    # --- Step 5.6: Sharpening (Richardson-Lucy, after denoise) ---
+    if sharpen_strength > 0:
+        logger.info(f"  🔹 [Step 5.6] Applying RL sharpening (strength={sharpen_strength:.2f})...")
+        try:
+            from raw_alchemy.math_ops import sharpen
+            img = sharpen(img, strength=sharpen_strength, sigma=1.0)
+            logger.info("  ✅ Sharpening complete")
+        except Exception as e:
+            logger.error(f"  ❌ Sharpening failed: {e}")
+
+    # --- Step 5.6: DNG 线性化处理 ---
     # 如果保存为 DNG，必须确保数据是线性的 (Linear Raw)。
     # 前面的 Log 变换或 sRGB 转换可能已经应用了 Gamma/Log 曲线，需要逆转。
     color_matrix = None
