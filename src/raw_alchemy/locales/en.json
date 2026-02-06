@@ -153,7 +153,8 @@
     "revert_to_baseline_or_default": "Revert to baseline or default",
     "ai_denoise": "AI Denoise",
     "denoise_strength": "Denoise Strength",
-    "denoise_info": "Smart denoising using SCUNet neural network. First processing may take a few minutes.",
+    "denoise_info": "Smart denoising using NIND UtNet neural network.",
     "denoising": "Denoising...",
-    "denoise_progress": "Denoise progress: {current}/{total}"
+    "denoise_progress": "Denoise progress: {current}/{total}",
+    "sharpen_strength": "Sharpen Strength"
 }

@@ -1109,7 +1109,9 @@ class MainWindow(FluentWindow):
                         flip_vertical=p.get('flip_vertical', False),
                         crop=p.get('crop', (0.0, 0.0, 1.0, 1.0)),
                         # Denoising
-                        denoise_strength=p.get('denoise_strength', 0.0)
+                        denoise_strength=p.get('denoise_strength', 0.0),
+                        # Sharpening
+                        sharpen_strength=p.get('sharpen_strength', 0.0),
                     )
                     self.finished_sig.emit(True, "")
                 except Exception as e:

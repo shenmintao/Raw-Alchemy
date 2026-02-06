@@ -329,6 +329,35 @@ class InspectorPanel(ScrollArea):
         self.denoise_info_label.setStyleSheet("color: gray; font-size: 11px;")
         denoise_layout.addWidget(self.denoise_info_label)
         
+        # Sharpen strength slider (Richardson-Lucy deconvolution)
+        sharpen_header_layout = QHBoxLayout()
+        self.sharpen_label = BodyLabel(f"{tr('sharpen_strength')}: 0.00")
+        
+        # Revert button for sharpen
+        self.sharpen_revert_btn = ToolButton(FIF.HISTORY)
+        self.sharpen_revert_btn.setFixedSize(24, 24)
+        self.sharpen_revert_btn.setToolTip(tr('revert_to_baseline_or_default'))
+        self.sharpen_revert_btn.clicked.connect(self._revert_sharpen)
+        
+        sharpen_header_layout.addWidget(self.sharpen_label)
+        sharpen_header_layout.addStretch()
+        sharpen_header_layout.addWidget(self.sharpen_revert_btn)
+        
+        self.sharpen_slider = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.sharpen_slider.setRange(0, 100)  # 0.0 to 1.0
+        self.sharpen_slider.setValue(0)
+        
+        def update_sharpen_label(val):
+            """Update label and trigger debounced parameter change"""
+            real_val = val / 100.0
+            self.sharpen_label.setText(f"{tr('sharpen_strength')}: {real_val:.2f}")
+            self._on_param_change()
+        
+        self.sharpen_slider.valueChanged.connect(update_sharpen_label)
+        
+        denoise_layout.addLayout(sharpen_header_layout)
+        denoise_layout.addWidget(self.sharpen_slider)
+        
         self.add_section(tr('ai_denoise'), self.denoise_card)
         
         # Filler
@@ -432,6 +461,12 @@ class InspectorPanel(ScrollArea):
             denoise_val = params['denoise_strength']
             self.denoise_slider.setValue(int(denoise_val * 100))
             self.denoise_label.setText(f"{tr('denoise_strength')}: {denoise_val:.2f}")
+        
+        # Sharpen
+        if 'sharpen_strength' in params:
+            sharpen_val = params['sharpen_strength']
+            self.sharpen_slider.setValue(int(sharpen_val * 100))
+            self.sharpen_label.setText(f"{tr('sharpen_strength')}: {sharpen_val:.2f}")
                 
         self.blockSignals(False)
 
@@ -661,6 +696,9 @@ class InspectorPanel(ScrollArea):
         
         # Add denoise strength
         params['denoise_strength'] = self.denoise_slider.value() / 100.0
+        
+        # Add sharpen strength
+        params['sharpen_strength'] = self.sharpen_slider.value() / 100.0
             
         return params
 
@@ -727,4 +765,17 @@ class InspectorPanel(ScrollArea):
             # Revert to default (0)
             self.denoise_slider.setValue(0)
             self.denoise_label.setText(f"{tr('denoise_strength')}: 0.00")
+        self._on_param_change()
+
+    def _revert_sharpen(self):
+        """Revert sharpen slider to baseline or default"""
+        if self.saved_baseline_params and 'sharpen_strength' in self.saved_baseline_params:
+            # Revert to baseline
+            val = self.saved_baseline_params['sharpen_strength']
+            self.sharpen_slider.setValue(int(val * 100))
+            self.sharpen_label.setText(f"{tr('sharpen_strength')}: {val:.2f}")
+        else:
+            # Revert to default (0)
+            self.sharpen_slider.setValue(0)
+            self.sharpen_label.setText(f"{tr('sharpen_strength')}: 0.00")
         self._on_param_change()

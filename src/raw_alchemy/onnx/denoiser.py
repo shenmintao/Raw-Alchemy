@@ -68,9 +68,9 @@ _setup_cuda_paths()
 _session = None
 _session_provider = None
 
-# Model filename - using FP16 dynamic batch model for best performance
-# This model uses FP16 input and supports dynamic batch sizes
-MODEL_FILENAME = "scunet_color_real_gan_fp16_dynamic.onnx"
+# Model filename - using NIND UtNet FP16 model
+# This model uses FP16 input/output with fixed 504x504 tile size
+MODEL_FILENAME = "nind_utnet_fp16.onnx"
 
 
 def _get_base_path() -> str:
@@ -220,8 +220,8 @@ def _get_session():
         raise
 
 
-# Minimum tile size required by the model (due to relative position encoding)
-MIN_TILE_SIZE = 256
+# Tile size for the UtNet model (504 required by U-Net architecture)
+MIN_TILE_SIZE = 504
 
 
 def _pad_to_min_size(image: np.ndarray, min_size: int = MIN_TILE_SIZE, multiple: int = 8) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -229,8 +229,7 @@ def _pad_to_min_size(image: np.ndarray, min_size: int = MIN_TILE_SIZE, multiple:
     Pad image to at least min_size and ensure dimensions are multiples of the given value.
     Returns padded image and original dimensions.
     
-    The SCUNet model requires input dimensions to be at least 256 due to the
-    relative position encoding being precomputed for that resolution.
+    UtNet requires fixed 512x512 input to match the ONNX model export dimensions.
     """
     h, w = image.shape[:2]
     orig_h, orig_w = h, w
@@ -314,7 +313,7 @@ def _process_tiles_batch(session, tiles: list) -> list:
 def denoise(
     image: np.ndarray,
     strength: float = 1.0,
-    tile_size: int = 512,  # 512x512 tiles
+    tile_size: int = 504,  # UtNet requires 504 (U-Net skip connections)
     tile_overlap: int = 64,  # Increased from 32 for better blending
     batch_size: int = 4,  # Process 4 tiles at once for best GPU utilization
     progress_callback: Optional[Callable[[int, int], None]] = None

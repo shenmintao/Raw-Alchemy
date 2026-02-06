@@ -704,7 +704,7 @@ class ImageProcessor(QThread):
                         self.cached_denoise_full = denoiser.denoise(
                             img,
                             strength=1.0,  # Always compute full denoising
-                            tile_size=768,  # Optimized for 4GB VRAM (~3-3.5GB usage)
+                            tile_size=504,  # Optimized for 4GB VRAM (~3-3.5GB usage)
                             tile_overlap=64,  # Increased from 32 for better blending
                             progress_callback=progress_callback
                         )
@@ -735,6 +735,20 @@ class ImageProcessor(QThread):
                     self.cached_denoise_original = None
                     self.cached_denoise_full = None
                     self.last_denoise_key = None
+            
+            # --- Stage 7: Sharpening (Richardson-Lucy, after denoise) ---
+            sharpen_strength = params.get('sharpen_strength', 0.0)
+            logger.debug(f"[Worker] Sharpen strength from params: {sharpen_strength}")
+            if sharpen_strength > 0:
+                try:
+                    from raw_alchemy.math_ops import sharpen
+                    logger.info(f"[Worker] Applying RL sharpening (strength={sharpen_strength:.2f})...")
+                    img = sharpen(img, strength=sharpen_strength, sigma=1.0)
+                    logger.info(f"[Worker] Sharpening complete")
+                except Exception as e:
+                    import traceback
+                    logger.error(f"[Worker] Sharpening failed: {e}")
+                    traceback.print_exc()
             
             img_float = img  # Shared buffer
             img_uint8 = (img * 255).astype(np.uint8)
