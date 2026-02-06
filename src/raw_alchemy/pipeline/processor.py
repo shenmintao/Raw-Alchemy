@@ -707,26 +707,26 @@ class ImageProcessor(QThread):
             denoise_strength = params.get('denoise_strength', 0.0)
             if denoise_strength > 0:
                 # Check if we need to recompute denoising
-                    if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
-                        logger.debug(f"[Worker] Denoise Cache Miss!")
-                        if self.cached_denoise_full is None:
-                            logger.debug(f"[Worker] Reason: cached_denoise_full is None")
-                        if denoise_cache_key != self.last_denoise_key:
-                            logger.debug(f"[Worker] Reason: Key Mismatch")
-                            if self.last_denoise_key:
-                                logger.debug(f"  Differences:")
-                                # Compare elements
-                                names = ["AdjustmentKey", "Viewport", "Log", "LUT"]
-                                for i, (v1, v2) in enumerate(zip(denoise_cache_key, self.last_denoise_key)):
-                                    if v1 != v2:
-                                        logger.debug(f"    {names[i]}: {v1} != {v2}")
-                        
-                        # Cache miss - need to compute full denoising
-                        try:
-                            self.denoise_started.emit()
-                            logger.info(f"[Worker] Computing full denoising (cache miss)...")
-                        
-                        # Save original for blending
+                if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
+                    logger.debug(f"[Worker] Denoise Cache Miss!")
+                    if self.cached_denoise_full is None:
+                        logger.debug(f"[Worker] Reason: cached_denoise_full is None")
+                    if denoise_cache_key != self.last_denoise_key:
+                        logger.debug(f"[Worker] Reason: Key Mismatch")
+                        if self.last_denoise_key:
+                            logger.debug(f"  Differences:")
+                            # Compare elements
+                            names = ["AdjustmentKey", "Viewport", "Log", "LUT"]
+                            for i, (v1, v2) in enumerate(zip(denoise_cache_key, self.last_denoise_key)):
+                                if v1 != v2:
+                                    logger.debug(f"    {names[i]}: {v1} != {v2}")
+                    
+                    # Cache miss - need to compute full denoising
+                    try:
+                        self.denoise_started.emit()
+                        logger.info(f"[Worker] Computing full denoising (cache miss)...")
+                    
+                    # Save original for blending
                         self.cached_denoise_original = img.copy()
                         
                         # Progress callback for UI
@@ -780,7 +780,7 @@ class ImageProcessor(QThread):
                     else:
                         # Blend: result = original * (1 - strength) + denoised * strength
                         img = self.cached_denoise_original * (1.0 - denoise_strength) + \
-                              self.cached_denoise_full * denoise_strength
+                                self.cached_denoise_full * denoise_strength
                     logger.debug(f"[Worker] Applied denoise strength={denoise_strength:.2f} from cache")
             else:
                 # Denoising disabled - invalidate cache if params changed
