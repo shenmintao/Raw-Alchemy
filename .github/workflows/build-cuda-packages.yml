@@ -28,7 +28,7 @@ jobs:
       
       - name: Install NVIDIA packages
         run: |
-          pip install nvidia-cudnn-cu12 cuda-toolkit==12.9.1
+          pip install nvidia-cudnn-cu12 cuda-toolkit[all]==12.9.1
       
       - name: Create CUDA package
         run: python scripts/create_cuda_package.py
