@@ -92,7 +92,7 @@ ort_package = 'onnxruntime' # Default fallback
 if sys.platform == 'win32' or sys.platform.startswith('linux'):
     ort_package = 'onnxruntime-gpu'
 elif sys.platform == 'darwin':
-    ort_package = 'onnxruntime-coreml'
+    ort_package = 'onnxruntime'
 
 print(f"Using ONNX Runtime package: {ort_package}")
 

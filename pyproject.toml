@@ -33,7 +33,8 @@ dependencies = [
     "packaging",
     "loguru",
     "pyexiv2",
-    "onnxruntime-gpu",
+    "onnxruntime-gpu; sys_platform != 'darwin'",
+    "onnxruntime; sys_platform == 'darwin'",
 ]
 
 [project.urls]
