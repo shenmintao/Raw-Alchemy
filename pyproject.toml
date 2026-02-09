@@ -33,7 +33,7 @@ dependencies = [
     "packaging",
     "loguru",
     "pyexiv2",
-    "onnxruntime",
+    "onnxruntime-gpu",
 ]
 
 [project.urls]
