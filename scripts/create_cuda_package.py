@@ -27,7 +27,6 @@ INCLUDE_PATTERNS_WINDOWS = [
     'cudnn_adv64_9',
     'cufft64_11',
     'nvJitLink',
-    'zlibwapi',
 ]
 
 INCLUDE_PATTERNS_LINUX = [
