@@ -116,18 +116,22 @@ def _get_model_path() -> str:
     
     # 可能的模型路径
     possible_paths = [
-        # 直接在 base_path 下的 onnx 目录（开发环境）
-        os.path.join(base_path, MODEL_FILENAME),
+        # vendor 目录（模型现在存放在 vendor 中）
+        os.path.join(base_path, "vendor", MODEL_FILENAME),
         # PyInstaller/Nuitka 打包后的路径
+        os.path.join(base_path, "raw_alchemy", "vendor", MODEL_FILENAME),
+        # 开发环境：相对于 onnx 目录向上一级
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vendor", MODEL_FILENAME),
+        # 旧路径（兼容）
+        os.path.join(base_path, MODEL_FILENAME),
         os.path.join(base_path, "raw_alchemy", "onnx", MODEL_FILENAME),
-        # 相对于当前文件的路径（备用）
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), MODEL_FILENAME),
     ]
     
     for path in possible_paths:
-        if os.path.exists(path):
-            logger.debug(f"Found ONNX model at: {path}")
-            return path
+        normalized_path = os.path.normpath(path)
+        if os.path.exists(normalized_path):
+            logger.debug(f"Found ONNX model at: {normalized_path}")
+            return normalized_path
     
     raise FileNotFoundError(
         f"ONNX model '{MODEL_FILENAME}' not found. "

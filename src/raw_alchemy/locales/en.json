@@ -167,7 +167,7 @@
     "cuda_downloading": "Downloading...",
     "download_cuda": "Download CUDA Runtime",
     "remove_cuda": "Remove CUDA Runtime",
-    "cuda_download_size": "Download size ~500MB",
+    "cuda_download_size": "Download size ~1GB",
     "gpu_detected": "GPU Detected",
     "nvidia_gpu": "NVIDIA GPU",
     "amd_gpu": "AMD GPU (CUDA not supported)",

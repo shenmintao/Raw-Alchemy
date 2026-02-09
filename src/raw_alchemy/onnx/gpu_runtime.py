@@ -70,25 +70,51 @@ def detect_gpu_vendor() -> dict:
         try:
             import subprocess
             # Use WMIC to get GPU info
+            # Use CREATE_NO_WINDOW flag to prevent console popup in PyInstaller
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            
             output = subprocess.check_output(
                 ['wmic', 'path', 'win32_VideoController', 'get', 'name'],
-                text=True, stderr=subprocess.DEVNULL, timeout=5
+                text=True, stderr=subprocess.DEVNULL, timeout=5,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             lines = [l.strip() for l in output.strip().split('\n') if l.strip() and l.strip() != 'Name']
-            if lines:
-                gpu_name = lines[0]
-                result['name'] = gpu_name
+            
+            # Check ALL GPUs, prioritize NVIDIA for laptops with dual graphics
+            all_gpus = []
+            for gpu_name in lines:
                 gpu_lower = gpu_name.lower()
-                
                 if 'nvidia' in gpu_lower or 'geforce' in gpu_lower or 'quadro' in gpu_lower or 'rtx' in gpu_lower or 'gtx' in gpu_lower:
+                    # Found NVIDIA, use it immediately
                     result['vendor'] = 'nvidia'
                     result['cuda_compatible'] = True
-                elif 'amd' in gpu_lower or 'radeon' in gpu_lower:
-                    result['vendor'] = 'amd'
-                elif 'intel' in gpu_lower:
-                    result['vendor'] = 'intel'
+                    result['name'] = gpu_name
+                    break
+                all_gpus.append(gpu_name)
+            else:
+                # No NVIDIA found, check other vendors
+                if all_gpus:
+                    gpu_name = all_gpus[0]
+                    result['name'] = gpu_name
+                    gpu_lower = gpu_name.lower()
+                    if 'amd' in gpu_lower or 'radeon' in gpu_lower:
+                        result['vendor'] = 'amd'
+                    elif 'intel' in gpu_lower:
+                        result['vendor'] = 'intel'
         except Exception as e:
             logger.debug(f"Failed to detect GPU via WMIC: {e}")
+            # Fallback: try to check if nvidia-smi exists
+            try:
+                nvidia_smi = shutil.which('nvidia-smi')
+                if nvidia_smi:
+                    result['vendor'] = 'nvidia'
+                    result['cuda_compatible'] = True
+                    result['name'] = 'NVIDIA GPU (detected via nvidia-smi)'
+            except Exception:
+                pass
     
     elif system == 'Linux':
         try:

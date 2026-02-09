@@ -84,19 +84,14 @@ pyexiv2_hiddenimports = pyexiv2_ret[2]
 binaries_list.extend(pyexiv2_binaries)
 
 
-# Ensure ONNX Runtime providers are collected
-# Specifically look for onnxruntime_providers_*.dll
-try:
-    import onnxruntime
-    ort_path = os.path.dirname(onnxruntime.__file__)
-    print(f"Checking onnxruntime at {ort_path}")
-    if sys.platform == 'win32':
-        ort_providers = glob.glob(os.path.join(ort_path, 'onnxruntime_providers_*.dll'))
-        for provider in ort_providers:
-            print(f"  Found provider: {os.path.basename(provider)}")
-            binaries_list.append((provider, '.'))
-except ImportError:
-    print("onnxruntime not installed, skipping provider collection.")
+# Determine ONNX Runtime package based on platform
+ort_package = 'onnxruntime' # Default fallback
+if sys.platform == 'win32' or sys.platform.startswith('linux'):
+    ort_package = 'onnxruntime-gpu'
+elif sys.platform == 'darwin':
+    ort_package = 'onnxruntime-coreml'
+
+print(f"Using ONNX Runtime package: {ort_package}")
 
 
 
@@ -106,7 +101,7 @@ a = Analysis(
     pathex=[],
     binaries=binaries_list,
     datas=[('src/raw_alchemy/vendor', 'vendor'),('src/raw_alchemy/locales', 'locales'), ('icon.ico', '.'), ('icon.png', '.')],
-    hiddenimports=['tkinter', 'loguru', 'pyexiv2'],
+    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

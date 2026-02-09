@@ -167,7 +167,7 @@
     "cuda_downloading": "下载中...",
     "download_cuda": "下载 CUDA 运行时",
     "remove_cuda": "删除 CUDA 运行时",
-    "cuda_download_size": "下载大小约 500MB",
+    "cuda_download_size": "下载大小约 1GB",
     "gpu_detected": "检测到 GPU",
     "nvidia_gpu": "NVIDIA 显卡",
     "amd_gpu": "AMD 显卡（不支持 CUDA）",

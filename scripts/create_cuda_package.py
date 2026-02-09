@@ -27,6 +27,7 @@ INCLUDE_PATTERNS_WINDOWS = [
     'cudnn_adv64_9',
     'cufft64_11',
     'nvJitLink',
+    'zlibwapi',
 ]
 
 INCLUDE_PATTERNS_LINUX = [
@@ -38,7 +39,7 @@ INCLUDE_PATTERNS_LINUX = [
     'libnvJitLink',
 ]
 
-# Large optional DLLs to EXCLUDE (reduces size by ~500MB)
+# Large optional DLLs to EXCLUDE (reduces size by ~1GB)
 EXCLUDE_PATTERNS = [
     'cudnn_engines_precompiled',
     'cudnn_heuristic',
@@ -69,24 +70,47 @@ def collect_dlls(nvidia_base: Path) -> list:
         pattern = '*.so*'
         include_patterns = INCLUDE_PATTERNS_LINUX
     
+    # Recursive search for ALL DLLs in nvidia package
+    print(f"Searching for DLLs in {nvidia_base}...")
+    
+    # Also look for zlibwapi.dll which is sometimes needed by cuDNN on Windows
+    # It might be in a different location or not present in nvidia-* packages
+    # For now we assume the user has a working environment and we try to find it
+    
     for dll_path in nvidia_base.rglob(pattern):
-        dll_name = dll_path.name.lower()
+        dll_name = dll_path.name
+        dll_lower = dll_name.lower()
         
         # Skip excluded patterns
-        if any(excl in dll_name for excl in EXCLUDE_PATTERNS):
-            print(f"  Skipping (excluded): {dll_path.name}")
+        is_excluded = False
+        for excl in EXCLUDE_PATTERNS:
+            if excl.lower() in dll_lower:
+                is_excluded = True
+                break
+        if is_excluded:
             continue
-        
+            
         # Check if this file matches any include pattern
-        if any(inc.lower() in dll_name for inc in include_patterns):
+        is_included = False
+        for inc in include_patterns:
+            if inc.lower() in dll_lower:
+                is_included = True
+                break
+        
+        if is_included:
             dlls.append(dll_path)
-            print(f"  Including: {dll_path.name} ({dll_path.stat().st_size / 1024 / 1024:.1f} MB)")
-    
+            size_mb = dll_path.stat().st_size / 1024 / 1024
+            print(f"  Including: {dll_name} ({size_mb:.1f} MB)")
+
     return dlls
 
 
 def create_package(dlls: list, output_name: str):
-    """Create the compressed package."""
+    """Create the compressed package flattening directory structure."""
+    if not dlls:
+        print("No DLLs found to package!")
+        return
+
     total_size = sum(d.stat().st_size for d in dlls)
     print(f"\nTotal uncompressed size: {total_size / 1024 / 1024:.1f} MB")
     
@@ -94,8 +118,9 @@ def create_package(dlls: list, output_name: str):
         output_file = f"{output_name}.zip"
         print(f"Creating {output_file}...")
         with zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for dll in dlls:
-                zf.write(dll, dll.name)
+            for dll_path in dlls:
+                # Flatten: put all DLLs in root of zip
+                zf.write(dll_path, dll_path.name)
     else:
         output_file = f"{output_name}.tar.gz"
         print(f"Creating {output_file}...")
