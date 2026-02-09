@@ -159,5 +159,22 @@
     "sharpen_strength": "锐化强度",
     "disable_lut_globally": "全局禁用 LUT (保留其他调整)",
     "batch_export_settings": "批量导出设置",
-    "select_format": "选择格式"
+    "select_format": "选择格式",
+    "gpu_acceleration": "GPU 加速",
+    "cuda_status": "CUDA 状态",
+    "cuda_not_installed": "未安装",
+    "cuda_installed": "已安装",
+    "cuda_downloading": "下载中...",
+    "download_cuda": "下载 CUDA 运行时",
+    "remove_cuda": "删除 CUDA 运行时",
+    "cuda_download_size": "下载大小约 500MB",
+    "gpu_detected": "检测到 GPU",
+    "nvidia_gpu": "NVIDIA 显卡",
+    "amd_gpu": "AMD 显卡（不支持 CUDA）",
+    "intel_gpu": "Intel 显卡（不支持 CUDA）",
+    "no_gpu_detected": "未检测到 GPU",
+    "cuda_download_success": "CUDA 下载成功",
+    "cuda_download_failed": "CUDA 下载失败",
+    "cuda_removed": "CUDA 已删除",
+    "cuda_not_supported": "您的显卡不支持 CUDA"
 }

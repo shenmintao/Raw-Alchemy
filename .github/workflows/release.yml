@@ -30,6 +30,8 @@ jobs:
           CMAKE_PREFIX_PATH: ''
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # CUDA is now downloaded on-demand by users, not bundled in executable
+
       - name: Build executable with PyInstaller
         run: pyinstaller RawAlchemy.spec
 
@@ -57,6 +59,8 @@ jobs:
           pip install .
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # CUDA is now downloaded on-demand by users, not bundled in executable
 
       - name: Build executable with PyInstaller
         run: pyinstaller RawAlchemy.spec

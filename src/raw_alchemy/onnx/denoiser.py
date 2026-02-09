@@ -19,12 +19,26 @@ from loguru import logger
 def _setup_cuda_paths():
     """
     Setup CUDA library paths for onnxruntime-gpu.
-    This is needed when CUDA libraries are installed via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12).
+    
+    Checks two locations:
+    1. Local downloaded CUDA runtime (~/.raw_alchemy/cuda_runtime/)
+    2. nvidia packages in site-packages (pip install nvidia-cublas-cu12 etc.)
     """
     if platform.system() != 'Windows':
         return
     
-    # Find nvidia packages in site-packages
+    # First, try to use locally downloaded CUDA runtime
+    try:
+        from . import gpu_runtime
+        if gpu_runtime.setup_cuda_dll_paths():
+            logger.debug("Using locally installed CUDA runtime")
+            return
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug(f"Failed to setup local CUDA runtime: {e}")
+    
+    # Fallback: Check for nvidia packages in site-packages
     try:
         import site
         site_packages = site.getsitepackages()

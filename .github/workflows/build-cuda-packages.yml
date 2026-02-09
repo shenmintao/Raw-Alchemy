@@ -1,0 +1,69 @@
+name: Create CUDA Runtime Packages
+
+on:
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  build-cuda-packages:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            ext: zip
+          - os: ubuntu-latest
+            platform: linux
+            ext: tar.gz
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install NVIDIA packages
+        run: |
+          pip install nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cuda-runtime-cu12 nvidia-cufft-cu12 nvidia-nvjitlink-cu12
+      
+      - name: Create CUDA package
+        run: python scripts/create_cuda_package.py
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-runtime-${{ matrix.platform }}-x64
+          path: cuda-runtime-${{ matrix.platform }}-x64.${{ matrix.ext }}
+
+  create-release:
+    needs: build-cuda-packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: packages
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cuda-runtime-v1.0.0
+          name: CUDA Runtime v1.0.0
+          body: |
+            CUDA/cuDNN runtime libraries for GPU acceleration.
+            
+            - Windows: cuda-runtime-windows-x64.zip
+            - Linux: cuda-runtime-linux-x64.tar.gz
+            
+            Download size: ~500MB
+            Required for GPU acceleration in Raw Alchemy Studio.
+          files: |
+            packages/cuda-runtime-windows-x64/cuda-runtime-windows-x64.zip
+            packages/cuda-runtime-linux-x64/cuda-runtime-linux-x64.tar.gz

@@ -159,5 +159,22 @@
     "sharpen_strength": "Sharpen Strength",
     "disable_lut_globally": "Disable LUT globally (Keep other adjustments)",
     "batch_export_settings": "Batch Export Settings",
-    "select_format": "Select Format"
+    "select_format": "Select Format",
+    "gpu_acceleration": "GPU Acceleration",
+    "cuda_status": "CUDA Status",
+    "cuda_not_installed": "Not Installed",
+    "cuda_installed": "Installed",
+    "cuda_downloading": "Downloading...",
+    "download_cuda": "Download CUDA Runtime",
+    "remove_cuda": "Remove CUDA Runtime",
+    "cuda_download_size": "Download size ~500MB",
+    "gpu_detected": "GPU Detected",
+    "nvidia_gpu": "NVIDIA GPU",
+    "amd_gpu": "AMD GPU (CUDA not supported)",
+    "intel_gpu": "Intel GPU (CUDA not supported)",
+    "no_gpu_detected": "No GPU Detected",
+    "cuda_download_success": "CUDA download successful",
+    "cuda_download_failed": "CUDA download failed",
+    "cuda_removed": "CUDA Removed",
+    "cuda_not_supported": "Your GPU does not support CUDA"
 }
