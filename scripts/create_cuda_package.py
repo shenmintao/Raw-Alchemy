@@ -14,7 +14,9 @@ import tarfile
 from pathlib import Path
 
 # DLLs to include (essential for ONNX Runtime CUDA)
-INCLUDE_DLLS = [
+# Windows uses names like cudart64_12.dll
+# Linux uses names like libcudart.so.12
+INCLUDE_PATTERNS_WINDOWS = [
     'cudart64_12',
     'cublas64_12',
     'cublasLt64_12', 
@@ -22,9 +24,18 @@ INCLUDE_DLLS = [
     'cudnn_ops64_9',
     'cudnn_cnn64_9',
     'cudnn_graph64_9',
-    'cudnn_adv64_9',  # May be needed for some models
+    'cudnn_adv64_9',
     'cufft64_11',
     'nvJitLink',
+]
+
+INCLUDE_PATTERNS_LINUX = [
+    'libcudart',
+    'libcublas',
+    'libcublasLt',
+    'libcudnn',
+    'libcufft',
+    'libnvJitLink',
 ]
 
 # Large optional DLLs to EXCLUDE (reduces size by ~500MB)
@@ -50,18 +61,24 @@ def find_nvidia_base():
 def collect_dlls(nvidia_base: Path) -> list:
     """Collect required DLLs from nvidia package."""
     dlls = []
-    pattern = '*.dll' if sys.platform == 'win32' else '*.so*'
+    
+    if sys.platform == 'win32':
+        pattern = '*.dll'
+        include_patterns = INCLUDE_PATTERNS_WINDOWS
+    else:
+        pattern = '*.so*'
+        include_patterns = INCLUDE_PATTERNS_LINUX
     
     for dll_path in nvidia_base.rglob(pattern):
-        dll_name = dll_path.stem.lower()
+        dll_name = dll_path.name.lower()
         
         # Skip excluded patterns
         if any(excl in dll_name for excl in EXCLUDE_PATTERNS):
             print(f"  Skipping (excluded): {dll_path.name}")
             continue
         
-        # Check if this DLL is in our include list
-        if any(inc.lower() in dll_name for inc in INCLUDE_DLLS):
+        # Check if this file matches any include pattern
+        if any(inc.lower() in dll_name for inc in include_patterns):
             dlls.append(dll_path)
             print(f"  Including: {dll_path.name} ({dll_path.stat().st_size / 1024 / 1024:.1f} MB)")
     
