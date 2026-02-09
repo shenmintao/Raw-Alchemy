@@ -62,7 +62,6 @@ jobs:
             - Windows: cuda-runtime-windows-x64.zip
             - Linux: cuda-runtime-linux-x64.tar.gz
             
-            Download size: ~500MB
             Required for GPU acceleration in Raw Alchemy Studio.
           files: |
             packages/cuda-runtime-windows-x64/cuda-runtime-windows-x64.zip
