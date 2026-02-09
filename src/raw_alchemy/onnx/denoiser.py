@@ -23,10 +23,10 @@ def _setup_cuda_paths():
     Checks two locations:
     1. Local downloaded CUDA runtime (~/.raw_alchemy/cuda_runtime/)
     2. nvidia packages in site-packages (pip install nvidia-cublas-cu12 etc.)
-    """
-    if platform.system() != 'Windows':
-        return
     
+    CRITICAL: This must be called before importing onnxruntime.
+    The gpu_runtime module handles preloading DLLs to ensure they're in memory.
+    """
     # First, try to use locally downloaded CUDA runtime
     try:
         from . import gpu_runtime
@@ -37,6 +37,10 @@ def _setup_cuda_paths():
         pass
     except Exception as e:
         logger.debug(f"Failed to setup local CUDA runtime: {e}")
+    
+    # Windows-only fallback: Check for nvidia packages in site-packages
+    if platform.system() != 'Windows':
+        return
     
     # Fallback: Check for nvidia packages in site-packages
     try:

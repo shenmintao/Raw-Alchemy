@@ -32,19 +32,36 @@ CUDA_PACKAGE_NAMES = {
     'Linux': 'cuda-runtime-linux-x64.tar.gz',
 }
 
-# Required DLLs that must exist for CUDA to work
-REQUIRED_DLLS = {
+# CUDA libraries configuration
+# Format: (library_name, is_required) - order matters for loading dependencies
+CUDA_LIBS = {
     'Windows': [
-        'cudart64_12.dll',
-        'cublas64_12.dll',
-        'cublasLt64_12.dll', 
-        'cudnn64_9.dll',
+        ('cudart64_12.dll', True),                      # CUDA Runtime (base)
+        ('cublas64_12.dll', True),                      # cuBLAS
+        ('cublasLt64_12.dll', True),                    # cuBLAS Lt (required by ORT)
+        ('cufft64_11.dll', False),                      # cuFFT (optional)
+        ('cudnn64_9.dll', True),                        # cuDNN main
+        ('cudnn_ops64_9.dll', True),                    # cuDNN ops
+        ('cudnn_cnn64_9.dll', True),                    # cuDNN CNN
+        ('cudnn_engines_runtime_compiled64_9.dll', True),  # cuDNN JIT engines
+        ('cudnn_engines_precompiled64_9.dll', True),   # cuDNN precompiled engines
+        ('cudnn_adv64_9.dll', False),                   # cuDNN advanced (optional)
+        ('cudnn_graph64_9.dll', False),                 # cuDNN graph (optional)
+        ('cudnn_heuristic64_9.dll', True),              # cuDNN heuristic (algorithm selection)
     ],
     'Linux': [
-        'libcudart.so.12',
-        'libcublas.so.12',
-        'libcublasLt.so.12',
-        'libcudnn.so.9',
+        ('libcudart.so.12', True),
+        ('libcublas.so.12', True),
+        ('libcublasLt.so.12', True),
+        ('libcufft.so.11', False),
+        ('libcudnn.so.9', True),
+        ('libcudnn_ops.so.9', True),
+        ('libcudnn_cnn.so.9', True),
+        ('libcudnn_engines_runtime_compiled.so.9', True),
+        ('libcudnn_engines_precompiled.so.9', True),
+        ('libcudnn_adv.so.9', False),
+        ('libcudnn_graph.so.9', False),
+        ('libcudnn_heuristic.so.9', True),
     ],
 }
 
@@ -172,20 +189,20 @@ def get_cuda_version_file() -> Path:
 def is_cuda_runtime_installed() -> bool:
     """Check if CUDA runtime libraries are installed locally."""
     system = platform.system()
-    if system not in REQUIRED_DLLS:
+    if system not in CUDA_LIBS:
         return False
     
     cuda_dir = get_cuda_runtime_dir()
     if not cuda_dir.exists():
         return False
     
-    # Check if all required DLLs exist
-    required = REQUIRED_DLLS[system]
-    for dll_name in required:
-        dll_path = cuda_dir / dll_name
-        if not dll_path.exists():
-            logger.debug(f"Missing CUDA library: {dll_name}")
-            return False
+    # Check if all required libraries exist
+    for lib_name, is_required in CUDA_LIBS[system]:
+        if is_required:
+            lib_path = cuda_dir / lib_name
+            if not lib_path.exists():
+                logger.debug(f"Missing CUDA library: {lib_name}")
+                return False
     
     return True
 
@@ -319,6 +336,8 @@ def setup_cuda_dll_paths() -> bool:
     Setup DLL search paths to include locally installed CUDA runtime.
     
     This should be called before importing onnxruntime.
+    On Windows, this also pre-loads the DLLs using ctypes to ensure they're
+    available when onnxruntime_providers_cuda.dll loads.
     
     Returns:
         True if CUDA paths were set up, False if CUDA is not available
@@ -331,6 +350,8 @@ def setup_cuda_dll_paths() -> bool:
             current_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
             if str(cuda_dir) not in current_ld_path:
                 os.environ['LD_LIBRARY_PATH'] = f"{cuda_dir}:{current_ld_path}"
+            # Pre-load shared objects to ensure they're in memory
+            preload_cuda_dlls(cuda_dir)
             return True
         return False
     
@@ -352,11 +373,64 @@ def setup_cuda_dll_paths() -> bool:
         if str(cuda_dir) not in current_path:
             os.environ['PATH'] = f"{cuda_dir}{os.pathsep}{current_path}"
         
+        # Pre-load DLLs using ctypes to ensure they're in memory
+        # This is critical: when onnxruntime loads onnxruntime_providers_cuda.dll,
+        # it immediately tries to resolve cublasLt64_12.dll etc. If they're not
+        # already loaded, Windows DLL loader may fail to find them.
+        preload_cuda_dlls(cuda_dir)
+        
         return True
         
     except Exception as e:
         logger.error(f"Failed to setup CUDA DLL paths: {e}")
         return False
+
+
+def preload_cuda_dlls(cuda_dir: Path) -> int:
+    """
+    Pre-load CUDA libraries using ctypes before onnxruntime imports them.
+    
+    This is necessary because when Python imports onnxruntime, it loads
+    the CUDA provider which immediately tries to resolve its dependencies.
+    By pre-loading with ctypes, they become available for subsequent loads.
+    
+    Args:
+        cuda_dir: Path to the CUDA runtime directory
+        
+    Returns:
+        Number of libraries successfully loaded
+    """
+    import ctypes
+    
+    system = platform.system()
+    lib_list = CUDA_LIBS.get(system, [])
+    
+    if not lib_list:
+        logger.debug(f"No CUDA library list for platform: {system}")
+        return 0
+    
+    loaded_count = 0
+    
+    for lib_name, is_required in lib_list:
+        lib_path = cuda_dir / lib_name
+        if lib_path.exists():
+            try:
+                if system == 'Windows':
+                    ctypes.WinDLL(str(lib_path))
+                else:
+                    ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+                logger.debug(f"Pre-loaded: {lib_name}")
+                loaded_count += 1
+            except OSError as e:
+                logger.warning(f"Failed to pre-load {lib_name}: {e}")
+        else:
+            if is_required:
+                logger.warning(f"Required CUDA library not found: {lib_path}")
+            else:
+                logger.debug(f"Optional library not found: {lib_name}")
+    
+    logger.debug(f"Pre-loaded {loaded_count} CUDA libraries from {cuda_dir}")
+    return loaded_count
 
 
 def get_cuda_status() -> dict:

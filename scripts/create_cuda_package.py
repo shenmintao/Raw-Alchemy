@@ -23,6 +23,9 @@ INCLUDE_PATTERNS_WINDOWS = [
     'cudnn64_9',
     'cudnn_ops64_9',
     'cudnn_cnn64_9',
+    'cudnn_engines_runtime_compiled64_9',  # Required for JIT convolution
+    'cudnn_engines_precompiled64_9',       # Required for precompiled kernels
+    'cudnn_heuristic64_9',                 # Required for algorithm selection
     'cudnn_graph64_9',
     'cudnn_adv64_9',
     'cufft64_11',
@@ -33,16 +36,13 @@ INCLUDE_PATTERNS_LINUX = [
     'libcudart',
     'libcublas',
     'libcublasLt',
-    'libcudnn',
+    'libcudnn',              # Matches all libcudnn*.so.9 including engines/heuristic
     'libcufft',
     'libnvJitLink',
 ]
 
-# Large optional DLLs to EXCLUDE (reduces size by ~1GB)
-EXCLUDE_PATTERNS = [
-    'cudnn_engines_precompiled',
-    'cudnn_heuristic',
-]
+# No exclusions - include all cuDNN components for full compatibility
+EXCLUDE_PATTERNS = []
 
 
 def find_nvidia_base():
