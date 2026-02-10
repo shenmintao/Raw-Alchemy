@@ -399,9 +399,6 @@ def denoise(
         if strength < 1.0:
             denoised = image * (1 - strength) + denoised * strength
         
-        # Release GPU memory after processing
-        clear_session()
-        
         return np.clip(denoised, 0.0, 1.0)
     
     # Tiled processing for large images
@@ -511,9 +508,6 @@ def denoise(
     # Blend with original based on strength
     if strength < 1.0:
         output = image * (1 - strength) + output * strength
-    
-    # Release GPU memory after processing
-    clear_session()
     
     return np.clip(output, 0.0, 1.0)
 

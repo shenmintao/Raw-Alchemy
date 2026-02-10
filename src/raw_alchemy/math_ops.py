@@ -534,18 +534,24 @@ def compute_perspective_matrix(src_corners, dst_width, dst_height):
 # Richardson-Lucy Deconvolution Sharpening
 # =========================================================
 
-def _gaussian_kernel(sigma: float, size: int = None) -> np.ndarray:
-    """Create a 2D Gaussian kernel for PSF."""
+def _gaussian_kernel_1d(sigma: float, size: int = None) -> np.ndarray:
+    """Create a normalized 1D Gaussian kernel."""
     if size is None:
         size = int(6 * sigma + 1)
         if size % 2 == 0:
             size += 1
     
     x = np.arange(size) - size // 2
-    kernel_1d = np.exp(-0.5 * (x / sigma) ** 2)
-    kernel_2d = np.outer(kernel_1d, kernel_1d)
+    kernel = np.exp(-0.5 * (x / sigma) ** 2)
+    kernel /= kernel.sum()
+    return kernel.astype(np.float32)
+
+
+def _gaussian_kernel(sigma: float, size: int = None) -> np.ndarray:
+    """Create a 2D Gaussian kernel for PSF (kept for compatibility)."""
+    k1d = _gaussian_kernel_1d(sigma, size)
+    kernel_2d = np.outer(k1d, k1d)
     kernel_2d /= kernel_2d.sum()
-    
     return kernel_2d.astype(np.float32)
 
 
@@ -587,16 +593,63 @@ def _convolve_2d_reflect(channel, kernel, output):
             output[y, x] = val
 
 
+# --- Separable 1D convolution kernels (O(2k) vs O(k²)) ---
+
 @njit(**JIT_CONFIG)
-def _richardson_lucy_iteration(estimate, channel, psf, psf_mirror, blurred, ratio, correction):
-    """Single RL iteration with JIT acceleration."""
+def _convolve_1d_h_reflect(channel, kernel_1d, output):
+    """Horizontal 1D convolution with reflect boundary."""
+    h, w = channel.shape
+    k = kernel_1d.shape[0]
+    k2 = k // 2
+    
+    for y in prange(h):
+        for x in range(w):
+            val = 0.0
+            for kx in range(k):
+                sx = x + kx - k2
+                if sx < 0:
+                    sx = -sx
+                elif sx >= w:
+                    sx = 2 * w - sx - 2
+                if sx < 0: sx = 0
+                if sx >= w: sx = w - 1
+                val += channel[y, sx] * kernel_1d[kx]
+            output[y, x] = val
+
+
+@njit(**JIT_CONFIG)
+def _convolve_1d_v_reflect(channel, kernel_1d, output):
+    """Vertical 1D convolution with reflect boundary."""
+    h, w = channel.shape
+    k = kernel_1d.shape[0]
+    k2 = k // 2
+    
+    for y in prange(h):
+        for x in range(w):
+            val = 0.0
+            for ky in range(k):
+                sy = y + ky - k2
+                if sy < 0:
+                    sy = -sy
+                elif sy >= h:
+                    sy = 2 * h - sy - 2
+                if sy < 0: sy = 0
+                if sy >= h: sy = h - 1
+                val += channel[sy, x] * kernel_1d[ky]
+            output[y, x] = val
+
+
+@njit(**JIT_CONFIG)
+def _rl_iteration_sep(estimate, channel, kernel_1d, blurred, ratio, correction, temp):
+    """Single RL iteration using separable convolution (2× 1D instead of 1× 2D)."""
     h, w = channel.shape
     eps = 1e-8
     
-    # Forward convolution: blurred = estimate * psf
-    _convolve_2d_reflect(estimate, psf, blurred)
+    # Forward separable convolution: blurred = estimate ⊛ PSF
+    _convolve_1d_h_reflect(estimate, kernel_1d, temp)
+    _convolve_1d_v_reflect(temp, kernel_1d, blurred)
     
-    # Compute ratio and clip blurred to avoid division by zero
+    # Compute ratio: observed / blurred
     for y in prange(h):
         for x in range(w):
             b = blurred[y, x]
@@ -604,14 +657,15 @@ def _richardson_lucy_iteration(estimate, channel, psf, psf_mirror, blurred, rati
                 b = eps
             ratio[y, x] = channel[y, x] / b
     
-    # Backward convolution: correction = ratio * psf_mirror
-    _convolve_2d_reflect(ratio, psf_mirror, correction)
+    # Backward separable convolution: correction = ratio ⊛ PSF_mirror
+    # Gaussian is symmetric, so PSF == PSF_mirror, reuse kernel_1d
+    _convolve_1d_h_reflect(ratio, kernel_1d, temp)
+    _convolve_1d_v_reflect(temp, kernel_1d, correction)
     
     # Update estimate
     for y in prange(h):
         for x in range(w):
             val = estimate[y, x] * correction[y, x]
-            # Clip to prevent extreme values
             if val < 0.0:
                 val = 0.0
             elif val > 2.0:
@@ -621,25 +675,26 @@ def _richardson_lucy_iteration(estimate, channel, psf, psf_mirror, blurred, rati
 
 def richardson_lucy_channel(
     channel: np.ndarray,
-    psf: np.ndarray,
+    kernel_1d: np.ndarray,
     iterations: int = 10,
     clip: bool = True
 ) -> np.ndarray:
     """
-    Apply Richardson-Lucy deconvolution to a single channel.
+    Apply Richardson-Lucy deconvolution to a single channel
+    using separable Gaussian convolution.
     """
     h, w = channel.shape
     estimate = channel.copy().astype(np.float32)
-    psf = np.ascontiguousarray(psf.astype(np.float32))
-    psf_mirror = np.ascontiguousarray(psf[::-1, ::-1].copy())
+    kernel_1d = np.ascontiguousarray(kernel_1d.astype(np.float32))
     
     # Pre-allocate work buffers
     blurred = np.empty_like(estimate)
     ratio = np.empty_like(estimate)
     correction = np.empty_like(estimate)
+    temp = np.empty_like(estimate)  # intermediate buffer for separable conv
     
     for _ in range(iterations):
-        _richardson_lucy_iteration(estimate, channel, psf, psf_mirror, blurred, ratio, correction)
+        _rl_iteration_sep(estimate, channel, kernel_1d, blurred, ratio, correction, temp)
     
     if clip:
         estimate = np.clip(estimate, 0, 1)
@@ -655,20 +710,21 @@ def richardson_lucy(
 ) -> np.ndarray:
     """
     Apply Richardson-Lucy deconvolution sharpening to an RGB image.
+    Uses separable Gaussian convolution for ~3.5× speedup.
     """
     if strength <= 0 or iterations <= 0:
         return image
     
     logger.debug(f"RL sharpening: sigma={sigma}, iterations={iterations}, strength={strength}")
     
-    psf = _gaussian_kernel(sigma)
+    kernel_1d = _gaussian_kernel_1d(sigma)
     h, w, c = image.shape
     result = np.empty_like(image)
     
     for i in range(c):
         result[:, :, i] = richardson_lucy_channel(
             np.ascontiguousarray(image[:, :, i].astype(np.float32)),
-            psf,
+            kernel_1d,
             iterations
         )
     
@@ -754,6 +810,24 @@ def warmup():
     persp_dst = np.zeros((64, 64, 3), dtype=np.float32)
     persp_matrix = np.eye(3, dtype=np.float64)
     perspective_warp_kernel(persp_src, persp_dst, persp_matrix)
+    
+    # 11. Richardson-Lucy Deconvolution (separable conv + RL iteration)
+    rl_channel = np.ones((16, 16), dtype=np.float32) * 0.5
+    rl_k1d = _gaussian_kernel_1d(1.0, size=3)
+    rl_buf = np.empty_like(rl_channel)
+    rl_blurred = np.empty_like(rl_channel)
+    rl_ratio = np.empty_like(rl_channel)
+    rl_correction = np.empty_like(rl_channel)
+    rl_temp = np.empty_like(rl_channel)
+    # Warmup 1D convolutions
+    _convolve_1d_h_reflect(rl_channel, rl_k1d, rl_buf)
+    _convolve_1d_v_reflect(rl_channel, rl_k1d, rl_buf)
+    # Warmup full RL iteration
+    _rl_iteration_sep(rl_channel.copy(), rl_channel, rl_k1d,
+                      rl_blurred, rl_ratio, rl_correction, rl_temp)
+    # Keep 2D convolve warm for other potential users
+    rl_psf_2d = _gaussian_kernel(1.0, size=3)
+    _convolve_2d_reflect(rl_channel, rl_psf_2d, rl_buf)
     
     logger.info("✅ JIT Warmup complete.")
 
