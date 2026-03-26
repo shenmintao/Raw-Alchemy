@@ -1,9 +1,11 @@
 /.venv/
 /build/
 /src/raw_alchemy.egg-info/
+/src/raw_alchemy_studio.egg-info/
 /dist/
 /src/raw_alchemy/vendor/lensfun
 /src/raw_alchemy/__pycache__
 *.pyd
+*.pyc
 *.so
 *.dylib
