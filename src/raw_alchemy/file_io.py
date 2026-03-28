@@ -332,18 +332,100 @@ def _write_exif_from_dict(output_path: str, exif_dict: dict, logger: Logger):
             if isinstance(et, (float, int)):
                 # Convert float seconds to fractional string approx
                 if et >= 1:
-                     basic_exif['Exif.Photo.ExposureTime'] = f"{int(et)}/1"
+                    basic_exif["Exif.Photo.ExposureTime"] = f"{int(et)}/1"
                 else:
-                     # e.g. 0.01 -> 1/100
-                     denom = int(1.0 / et + 0.5)
-                     basic_exif['Exif.Photo.ExposureTime'] = f"1/{denom}"
+                    # e.g. 0.01 -> 1/100
+                    denom = int(1.0 / et + 0.5)
+                    basic_exif["Exif.Photo.ExposureTime"] = f"1/{denom}"
             else:
                 basic_exif['Exif.Photo.ExposureTime'] = str(et)
 
         # 拍摄时间 "YYYY:MM:DD HH:MM:SS"
         if exif_dict.get('datetime'):
-             basic_exif['Exif.Photo.DateTimeOriginal'] = str(exif_dict['datetime'])
-             basic_exif['Exif.Image.DateTime'] = str(exif_dict['datetime'])
+            basic_exif["Exif.Photo.DateTimeOriginal"] = str(exif_dict["datetime"])
+            basic_exif["Exif.Image.DateTime"] = str(exif_dict["datetime"])
+
+        # 数字化时间
+        if exif_dict.get("datetime_digitized"):
+            basic_exif["Exif.Photo.DateTimeDigitized"] = str(
+                exif_dict["datetime_digitized"]
+            )
+
+        # 亚秒精度 (SubSec 标签与对应日期时间配对)
+        if exif_dict.get("subsec_time_original"):
+            basic_exif["Exif.Photo.SubSecTimeOriginal"] = str(
+                exif_dict["subsec_time_original"]
+            )
+        if exif_dict.get("subsec_time"):
+            basic_exif["Exif.Photo.SubSecTime"] = str(exif_dict["subsec_time"])
+        if exif_dict.get("subsec_time_digitized"):
+            basic_exif["Exif.Photo.SubSecTimeDigitized"] = str(
+                exif_dict["subsec_time_digitized"]
+            )
+
+        # 35mm 等效焦距
+        if exif_dict.get("focal_length_35mm"):
+            basic_exif["Exif.Photo.FocalLengthIn35mmFilm"] = str(
+                int(round(exif_dict["focal_length_35mm"]))
+            )
+
+        # 亮度值 (APEX SRATIONAL)
+        if exif_dict.get("brightness_value") is not None:
+            bv = exif_dict["brightness_value"]
+            basic_exif["Exif.Photo.BrightnessValue"] = f"{int(bv * 100)}/100"
+
+        # 曝光补偿 (APEX SRATIONAL)
+        if exif_dict.get("exposure_bias") is not None:
+            eb = exif_dict["exposure_bias"]
+            basic_exif["Exif.Photo.ExposureBiasValue"] = f"{int(eb * 100)}/100"
+
+        # 闪光灯
+        if exif_dict.get("flash") is not None and exif_dict["flash"] != "":
+            basic_exif["Exif.Photo.Flash"] = str(exif_dict["flash"])
+
+        # 曝光程序
+        if (
+            exif_dict.get("exposure_program") is not None
+            and exif_dict["exposure_program"] != ""
+        ):
+            basic_exif["Exif.Photo.ExposureProgram"] = str(
+                exif_dict["exposure_program"]
+            )
+
+        # 测光模式
+        if (
+            exif_dict.get("metering_mode") is not None
+            and exif_dict["metering_mode"] != ""
+        ):
+            basic_exif["Exif.Photo.MeteringMode"] = str(exif_dict["metering_mode"])
+
+        # GPS 信息
+        if (
+            exif_dict.get("gps_latitude") is not None
+            and exif_dict.get("gps_longitude") is not None
+        ):
+
+            def _decimal_to_dms_rational(decimal_degrees):
+                """Convert decimal degrees to DMS rational string for pyexiv2."""
+                d = abs(decimal_degrees)
+                deg = int(d)
+                mins_f = (d - deg) * 60
+                mins = int(mins_f)
+                secs_f = (mins_f - mins) * 60
+                secs_num = int(round(secs_f * 1000))
+                return f"{deg}/1 {mins}/1 {secs_num}/1000"
+
+            lat = exif_dict["gps_latitude"]
+            lon = exif_dict["gps_longitude"]
+            basic_exif["Exif.GPSInfo.GPSLatitudeRef"] = "N" if lat >= 0 else "S"
+            basic_exif["Exif.GPSInfo.GPSLatitude"] = _decimal_to_dms_rational(lat)
+            basic_exif["Exif.GPSInfo.GPSLongitudeRef"] = "E" if lon >= 0 else "W"
+            basic_exif["Exif.GPSInfo.GPSLongitude"] = _decimal_to_dms_rational(lon)
+
+            if exif_dict.get("gps_altitude") is not None:
+                alt = exif_dict["gps_altitude"]
+                basic_exif["Exif.GPSInfo.GPSAltitudeRef"] = "1" if alt < 0 else "0"
+                basic_exif["Exif.GPSInfo.GPSAltitude"] = f"{int(abs(alt) * 100)}/100"
 
         # 写入 EXIF 数据
         if basic_exif:
