@@ -156,6 +156,11 @@ def process_image(
         # 应用 sRGB 标准转换：线性 RGB -> sRGB 编码
         if not img.flags['C_CONTIGUOUS']:
             img = np.ascontiguousarray(img)
+        M = colour.matrix_RGB_to_RGB(
+            colour.RGB_COLOURSPACES['ProPhoto RGB'],
+            colour.RGB_COLOURSPACES['sRGB'],
+        )
+        utils.apply_matrix_inplace(img, M)
         utils.linear_to_srgb_inplace(img)
 
     # --- Step 5: 应用 LUT ---

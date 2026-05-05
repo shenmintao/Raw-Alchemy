@@ -687,6 +687,13 @@ class ImageProcessor(QThread):
         try:
             # Display transform - sRGB Standard
             if not log_space or log_space == 'None':
+                M = colour.matrix_RGB_to_RGB(
+                    colour.RGB_COLOURSPACES['ProPhoto RGB'],
+                    colour.RGB_COLOURSPACES['sRGB']
+                )
+                if not img.flags['C_CONTIGUOUS']:
+                    img = np.ascontiguousarray(img)
+                utils.apply_matrix_inplace(img, M)
                 utils.linear_to_srgb_inplace(img)
             
             if not np.isfinite(img).all():
