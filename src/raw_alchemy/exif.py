@@ -195,25 +195,32 @@ def extract_lens_exif(raw_path: str, raw) -> Tuple[dict, Optional[Dict[str, dict
 
         # Sony2 目录错误是已知的 exiv2 库限制，不影响其他 EXIF 数据读取
         _logger.error(f"  ❌ [EXIF Error] {e}")
-        _logger.info("  ℹ️  Trying to extract basic info from rawpy...")
+        _logger.info("  ℹ️  Trying to extract basic info from RawSpeed metadata...")
 
-    # 如果 pyexiv2 失败或数据不完整，尝试从 rawpy 获取基本信息
+    # 如果 pyexiv2 失败或数据不完整，尝试从 RawSpeed result 获取基本信息
     if pyexiv2_failed:
         try:
-            # 使用新的 rawpy 参数对象 (rawpy >= 0.20.0)
-            result["camera_maker"] = raw.camera_params.make
-            result["camera_model"] = raw.camera_params.model
-            result["lens_maker"] = raw.lens_params.make
-            result["lens_model"] = raw.lens_params.model
-            result["focal_length"] = raw.other_params.focal_len
-            result["aperture"] = raw.other_params.aperture
-            result["iso"] = raw.other_params.iso_speed
-            result["exposure_time"] = raw.other_params.shutter  # float seconds
-            if raw.other_params.timestamp > 0:
-                result["datetime"] = time.strftime(
-                    "%Y:%m:%d %H:%M:%S", time.localtime(raw.other_params.timestamp)
-                )
-            # 如果 pyexiv2 失败，metadata 为 None，这里可以考虑不构造或者提供简单的 None
+            # Check if this is a RawSpeed RawDecodeResult (has .make, .model, .iso_speed)
+            if hasattr(raw, 'make') and hasattr(raw, 'model'):
+                # RawSpeed RawDecodeResult
+                result["camera_maker"] = raw.make
+                result["camera_model"] = raw.model
+                if raw.iso_speed and raw.iso_speed > 0:
+                    result["iso"] = raw.iso_speed
+            elif hasattr(raw, 'camera_params'):
+                # Legacy rawpy object fallback
+                result["camera_maker"] = raw.camera_params.make
+                result["camera_model"] = raw.camera_params.model
+                result["lens_maker"] = raw.lens_params.make
+                result["lens_model"] = raw.lens_params.model
+                result["focal_length"] = raw.other_params.focal_len
+                result["aperture"] = raw.other_params.aperture
+                result["iso"] = raw.other_params.iso_speed
+                result["exposure_time"] = raw.other_params.shutter
+                if raw.other_params.timestamp > 0:
+                    result["datetime"] = time.strftime(
+                        "%Y:%m:%d %H:%M:%S", time.localtime(raw.other_params.timestamp)
+                    )
         except Exception as e:
             print(f"  ❌ [EXIF Error (Fallback)] {e}")
 
@@ -392,10 +399,10 @@ def write_exif_from_dict(output_path: str, exif_dict: dict, logger: Any) -> None
             if basic_exif:
                 output_img.modify_exif(basic_exif)
                 logger.info(
-                    f"    ✅ Basic EXIF written from rawpy data ({len(basic_exif)} tags)"
+                    f"    ✅ Basic EXIF written from metadata ({len(basic_exif)} tags)"
                 )
             else:
-                logger.warning("    ⚠️  No valid EXIF data to write from rawpy")
+                logger.warning("    ⚠️  No valid EXIF data to write")
         finally:
             output_img.close()
 

@@ -2,12 +2,10 @@ import os
 import sys
 from functools import lru_cache
 from typing import Optional, Tuple, Dict
-import rawpy
 import numpy as np
 import colour
 from loguru import logger
 from raw_alchemy import lensfun_wrapper as lf
-import pyexiv2
 from raw_alchemy.math_ops import (
     apply_matrix_inplace,
     apply_lut_inplace,
@@ -330,140 +328,22 @@ def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Op
         logger.error(f"  ❌ [Lens Error] {e}")
         return image # 失败则返回原图
 
-def extract_lens_exif(raw_path: str, raw) -> Tuple[dict, Optional[Dict[str, dict]]]:
+def extract_lens_exif(raw_path: str, raw_or_result) -> Tuple[dict, Optional[Dict[str, dict]]]:
     """
-    使用 pyexiv2 从 RAW 文件中提取 EXIF 和镜头信息。
+    Extract EXIF and lens info from RAW file.
+
+    Delegates to raw_alchemy.exif.extract_lens_exif which uses pyexiv2 for
+    EXIF reading and falls back to RawSpeed metadata if pyexiv2 fails.
+
+    Args:
+        raw_path: Path to the RAW file
+        raw_or_result: RawSpeed RawDecodeResult (or legacy rawpy object for compatibility)
+
     Returns:
-        Tuple[dict, Optional[Dict[str, dict]]]: (镜头校正参数, 完整的元数据字典{'exif', 'iptc', 'xmp'})
+        Tuple[dict, Optional[Dict[str, dict]]]: (lens correction params, full metadata dict or None)
     """
-    result = {}
-    metadata = None
-    pyexiv2_failed = False
-    
-    try:
-        # 使用 pyexiv2 读取 EXIF 数据
-        # 使用 verify_supported=False 防止某些 raw 格式检查报错
-        # 使用 ignore_xmp_decoding_errors 防止 XMP 解析错误
-        with pyexiv2.Image(raw_path) as exif_img:
-            exif_data = exif_img.read_exif() or {}
-            iptc_data = exif_img.read_iptc() or {}
-            xmp_data = exif_img.read_xmp() or {}
-            
-            metadata = {
-                'exif': exif_data,
-                'iptc': iptc_data,
-                'xmp': xmp_data
-            }
-        
-        # 提取镜头校正所需的信息
-        # 相机制造商和型号
-        result['camera_maker'] = exif_data.get('Exif.Image.Make', '').strip()
-        result['camera_model'] = exif_data.get('Exif.Image.Model', '').strip()
-        
-        # 镜头信息 (不同厂商的标签可能不同)
-        lens_model = (
-            exif_data.get('Exif.Photo.LensModel') or
-            exif_data.get('Exif.Canon.LensModel') or
-            exif_data.get('Exif.Nikon3.Lens') or
-            exif_data.get('Exif.Panasonic.LensType') or
-            exif_data.get('Exif.OlympusEq.LensModel') or
-            ''
-        )
-        result['lens_model'] = lens_model.strip() if lens_model else ''
-
-        # 固定镜头相机 (如 Sony ZV-1, RX100 等) 没有 LensModel 标签，
-        # 用相机型号作为镜头标识，lensfun 可据此查找对应的内置镜头
-        if not result['lens_model']:
-            camera_model = result.get('camera_model', '')
-            lens_spec = exif_data.get('Exif.Photo.LensSpecification', '')
-            if camera_model and lens_spec:
-                result['lens_model'] = camera_model
-                logger.info(f"  ℹ️  [Lens] Fixed-lens camera detected, using camera model as lens: {camera_model}")
-        
-        # 镜头制造商
-        lens_maker = exif_data.get('Exif.Photo.LensMake', '').strip()
-        result['lens_maker'] = lens_maker if lens_maker else ''
-        
-        # 焦距
-        focal_length_str = exif_data.get('Exif.Photo.FocalLength', '')
-        if focal_length_str:
-            try:
-                # 焦距通常是 "50/1" 这样的分数格式
-                if '/' in str(focal_length_str):
-                    num, denom = map(float, str(focal_length_str).split('/'))
-                    result['focal_length'] = num / denom if denom != 0 else 0
-                else:
-                     # 尝试直接解析为浮点数
-                    result['focal_length'] = float(focal_length_str)
-            except (ValueError, ZeroDivisionError):
-                pass
-        
-        # 光圈
-        aperture_str = exif_data.get('Exif.Photo.FNumber', '')
-        if aperture_str:
-            try:
-                # 光圈通常是 "28/10" 这样的分数格式
-                if '/' in str(aperture_str):
-                    num, denom = map(float, str(aperture_str).split('/'))
-                    result['aperture'] = num / denom if denom != 0 else 0
-                else:
-                    # 尝试直接解析为浮点数
-                    result['aperture'] = float(aperture_str)
-            except (ValueError, ZeroDivisionError):
-                pass
-        
-        # ISO 感光度
-        result['iso'] = (
-            exif_data.get('Exif.Photo.ISOSpeedRatings') or 
-            exif_data.get('Exif.Photo.ISOSpeed') or 
-            ''
-        )
-        
-        # 快门速度 / 曝光时间 (保留原始字符串，如 "1/100")
-        result['exposure_time'] = exif_data.get('Exif.Photo.ExposureTime', '')
-        
-        # 拍摄时间
-        result['datetime'] = (
-            exif_data.get('Exif.Photo.DateTimeOriginal') or 
-            exif_data.get('Exif.Image.DateTime') or 
-            ''
-        )
-                
-    except Exception as e:
-        error_msg = str(e)
-        pyexiv2_failed = True
-        
-        # Sony2 目录错误是已知的 exiv2 库限制，不影响其他 EXIF 数据读取
-        logger.error(f"  ❌ [EXIF Error] {error_msg}")
-        logger.info("  ℹ️  Trying to extract basic info from rawpy...")
-    
-    # 如果 pyexiv2 失败或数据不完整，尝试从 rawpy 获取基本信息
-    if pyexiv2_failed:
-        try:
-            # 使用新的 rawpy 参数对象 (rawpy >= 0.20.0)
-            result['camera_maker'] = raw.camera_params.make
-            result['camera_model'] = raw.camera_params.model
-            result['lens_maker'] = raw.lens_params.make
-            result['lens_model'] = raw.lens_params.model
-            result['focal_length'] = raw.other_params.focal_len
-            result['aperture'] = raw.other_params.aperture
-            result['iso'] = raw.other_params.iso_speed
-            result['exposure_time'] = raw.other_params.shutter # float seconds
-            
-            import time
-            if raw.other_params.timestamp > 0:
-                result['datetime'] = time.strftime('%Y:%m:%d %H:%M:%S', time.localtime(raw.other_params.timestamp))
-            
-            # 如果 pyexiv2 失败，metadata 为 None，这里可以考虑不构造或者提供简单的 None
-        except Exception as e:
-            # logger(f"  ❌ [EXIF Error] {e}") # logger is not available globally in utils mostly? 
-            # actually logger is imported in utils.py
-            print(f"  ❌ [EXIF Error (Fallback)] {e}")
-
-    # 过滤掉空值
-    result = {k: v for k, v in result.items() if v}
-    
-    return result, metadata
+    from raw_alchemy.exif import extract_lens_exif as _extract
+    return _extract(raw_path, raw_or_result)
 
 
 def compute_denoise_normalization_gain(img_linear: np.ndarray,

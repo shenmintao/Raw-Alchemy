@@ -27,7 +27,7 @@ def save_image(
         output_path: 输出路径
         logger: 日志处理器
         exif_metadata: 完整的元数据字典 {'exif', 'iptc', 'xmp'} (代替之前的 pyexiv2.Image 对象)
-        exif_dict: 从 rawpy 提取的 EXIF 数据字典，当 exif_metadata 写入失败或不可用时降级使用
+        exif_dict: 从 RawSpeed 提取的 EXIF 数据字典，当 exif_metadata 写入失败或不可用时降级使用
 
     
     Returns:
@@ -288,7 +288,7 @@ def _write_exif(output_path: str, exif_metadata: dict, logger: Logger) -> bool:
 
 def _write_exif_from_dict(output_path: str, exif_dict: dict, logger: Logger):
     """
-    从 rawpy 提取的数据字典构造并写入基本 EXIF 标签
+    从 RawSpeed 提取的数据字典构造并写入基本 EXIF 标签
     
     Args:
         output_path: 输出文件路径
@@ -354,10 +354,10 @@ def _write_exif_from_dict(output_path: str, exif_dict: dict, logger: Logger):
         if basic_exif:
             output_img.modify_exif(basic_exif)
             output_img.close()
-            logger.info(f"    ✅ Basic EXIF written from rawpy data ({len(basic_exif)} tags)")
+            logger.info(f"    ✅ Basic EXIF written from RawSpeed data ({len(basic_exif)} tags)")
         else:
             output_img.close()
-            logger.warning("    ⚠️  No valid EXIF data to write from rawpy")
+            logger.warning("    ⚠️  No valid EXIF data to write from RawSpeed")
         
     except Exception as e:
         logger.warning(f"    ⚠️  Failed to write EXIF from dict: {e}")

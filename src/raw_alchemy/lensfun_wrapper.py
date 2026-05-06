@@ -725,6 +725,98 @@ def apply_lens_correction(
     return output
 
 
+def compute_lens_distortion_map(
+    image: np.ndarray,
+    camera_maker: Optional[str],
+    camera_model: str,
+    lens_maker: Optional[str],
+    lens_model: str,
+    focal_length: float,
+    aperture: float,
+    crop_factor: Optional[float] = None,
+    correct_distortion: bool = True,
+    correct_tca: bool = True,
+    correct_vignetting: bool = True,
+    distance: float = 1000.0,
+    custom_db_path: Optional[str] = None,
+) -> Optional[tuple]:
+    """Compute lens distortion map (CPU) for GPU remap.
+
+    Returns (coords, oob_mask, vignette_corrected_image) or None if no correction needed.
+    - coords: (H, W, 3, 2) float32 — per-channel (x, y) from lensfun
+    - oob_mask: (H, W) bool — out-of-bounds mask
+    - image: possibly vignette-corrected (in-place)
+    """
+    height, width = image.shape[:2]
+
+    db = _find_lensfun_db(custom_db_path)
+    if db is None:
+        return None
+
+    lens = db.find_lens(camera_maker, camera_model, lens_maker, lens_model)
+    if lens is None:
+        return None
+
+    if crop_factor is None:
+        crop_factor = db.get_crop_factor(camera_maker, camera_model)
+    logger.info(f"  📷 [Lensfun] Using camera crop factor: {crop_factor:.2f}")
+
+    modifier = LensfunModifier(lens, focal_length, crop_factor, width, height, LF_PF_F32)
+
+    # Vignetting: apply in-place on CPU (per-pixel color modification, fast)
+    if correct_vignetting:
+        modifier.enable_vignetting_correction(aperture, distance)
+        image_f32 = image if image.dtype == np.float32 else image.astype(np.float32)
+        modifier.apply_color_modification(image_f32, 0.0, 0.0, width, height)
+        if image.dtype != np.float32:
+            np.copyto(image, image_f32.astype(image.dtype))
+
+    # Geometry: compute distortion map (CPU, fast ~few ms)
+    if not correct_distortion and not correct_tca:
+        return None
+
+    if correct_distortion:
+        modifier.enable_distortion_correction()
+    if correct_tca:
+        modifier.enable_tca_correction()
+
+    coords = modifier.apply_subpixel_geometry_distortion(0.0, 0.0, width, height)
+    if coords is None:
+        return None
+
+    # Auto-crop scale (same logic as apply_lens_correction)
+    x_min = min(coords[:, :, ch, 0].min() for ch in range(3))
+    x_max = max(coords[:, :, ch, 0].max() for ch in range(3))
+    y_min = min(coords[:, :, ch, 1].min() for ch in range(3))
+    y_max = max(coords[:, :, ch, 1].max() for ch in range(3))
+
+    if x_min < 0 or y_min < 0 or x_max >= width or y_max >= height:
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        scale_x = (width - 1) / x_range if x_range > 0 else 1.0
+        scale_y = (height - 1) / y_range if y_range > 0 else 1.0
+        scale = min(scale_x, scale_y)
+        cx, cy = width / 2.0, height / 2.0
+        for ch in range(3):
+            coords[:, :, ch, 0] = cx + (coords[:, :, ch, 0] - cx) * scale
+            coords[:, :, ch, 1] = cy + (coords[:, :, ch, 1] - cy) * scale
+        logger.info(f"  ⚖️ [Lensfun] Auto-crop scale: {scale:.4f} (src range: x=[{x_min:.1f},{x_max:.1f}] y=[{y_min:.1f},{y_max:.1f}])")
+
+    # Build OOB mask
+    interp_margin = 2.0
+    oob_mask = np.zeros((height, width), dtype=bool)
+    for ch in range(3):
+        oob_mask |= (coords[:, :, ch, 0] < interp_margin) | (coords[:, :, ch, 0] > width - 1 - interp_margin)
+        oob_mask |= (coords[:, :, ch, 1] < interp_margin) | (coords[:, :, ch, 1] > height - 1 - interp_margin)
+
+    # Clamp coords
+    for ch in range(3):
+        np.clip(coords[:, :, ch, 0], 0, width - 1, out=coords[:, :, ch, 0])
+        np.clip(coords[:, :, ch, 1], 0, height - 1, out=coords[:, :, ch, 1])
+
+    return coords, oob_mask, image
+
+
 def get_lens_info(
     camera_maker: Optional[str],
     camera_model: str,

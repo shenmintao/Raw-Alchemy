@@ -1117,6 +1117,94 @@ def max_inplace(img, min_val):
 
 
 # =========================================================
+# GPU Lens Remap (replaces scipy.map_coordinates)
+# =========================================================
+
+@ti.func
+def _bicubic_weight(t: ti.f32) -> ti.types.vector(4, ti.f32):
+    """Mitchell-Netravali bicubic weights (B=0, C=0.5 = Catmull-Rom)."""
+    t2 = t * t
+    t3 = t2 * t
+    w0 = -0.5 * t3 + t2 - 0.5 * t
+    w1 = 1.5 * t3 - 2.5 * t2 + 1.0
+    w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t
+    w3 = 0.5 * t3 - 0.5 * t2
+    return ti.Vector([w0, w1, w2, w3])
+
+
+@ti.func
+def _sample_bicubic(
+    src: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    x: ti.f32, y: ti.f32, H: ti.i32, W: ti.i32,
+) -> ti.f32:
+    """Bicubic interpolation of a 2D array at (x, y)."""
+    ix = ti.cast(ti.floor(x), ti.i32)
+    iy = ti.cast(ti.floor(y), ti.i32)
+    fx = x - ti.cast(ix, ti.f32)
+    fy = y - ti.cast(iy, ti.f32)
+
+    wx = _bicubic_weight(fx)
+    wy = _bicubic_weight(fy)
+
+    val = ti.cast(0.0, ti.f32)
+    for dy in ti.static(range(4)):
+        for dx in ti.static(range(4)):
+            sy = ti.min(ti.max(iy - 1 + dy, 0), H - 1)
+            sx = ti.min(ti.max(ix - 1 + dx, 0), W - 1)
+            val += wy[dy] * wx[dx] * src[sy, sx]
+    return val
+
+
+@ti.kernel
+def _lens_remap_kernel(
+    src: ti.types.ndarray(dtype=ti.f32, ndim=3),   # (H, W, 3) input
+    dst: ti.types.ndarray(dtype=ti.f32, ndim=3),   # (H, W, 3) output
+    coords_x: ti.types.ndarray(dtype=ti.f32, ndim=3),  # (H, W, 3) x coords per channel
+    coords_y: ti.types.ndarray(dtype=ti.f32, ndim=3),  # (H, W, 3) y coords per channel
+    oob_mask: ti.types.ndarray(dtype=ti.i32, ndim=2),   # (H, W) out-of-bounds mask
+):
+    """GPU bicubic remap with per-channel coordinates (for TCA correction)."""
+    H = src.shape[0]
+    W = src.shape[1]
+    for row, col in ti.ndrange(dst.shape[0], dst.shape[1]):
+        if oob_mask[row, col] != 0:
+            dst[row, col, 0] = 0.0
+            dst[row, col, 1] = 0.0
+            dst[row, col, 2] = 0.0
+        else:
+            for ch in ti.static(range(3)):
+                x = coords_x[row, col, ch]
+                y = coords_y[row, col, ch]
+                dst[row, col, ch] = _sample_bicubic(src[:, :, ch], x, y, H, W)
+
+
+def lens_remap_gpu(src_gpu, dst_gpu, coords, oob_mask_np):
+    """GPU lens distortion remap (replaces scipy.map_coordinates).
+
+    Args:
+        src_gpu: Source GpuImage (HxWx3 float32)
+        dst_gpu: Destination GpuImage (HxWx3 float32)
+        coords: (H, W, 3, 2) float32 numpy — per-channel (x, y) from lensfun
+        oob_mask_np: (H, W) bool numpy — out-of-bounds mask
+    """
+    h, w = coords.shape[:2]
+    dst_gpu._allocate(h, w, 3)
+
+    # Split coords into x and y, upload to GPU
+    coords_x = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
+    coords_y = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
+    oob = ti.ndarray(dtype=ti.i32, shape=(h, w))
+
+    coords_x.from_numpy(np.ascontiguousarray(coords[:, :, :, 0], dtype=np.float32))
+    coords_y.from_numpy(np.ascontiguousarray(coords[:, :, :, 1], dtype=np.float32))
+    oob.from_numpy(oob_mask_np.astype(np.int32))
+
+    _lens_remap_kernel(src_gpu.arr, dst_gpu.arr, coords_x, coords_y, oob)
+
+    del coords_x, coords_y, oob
+
+
+# =========================================================
 # Fused Exposure + Adjustments + sRGB Grading (single pass)
 # =========================================================
 

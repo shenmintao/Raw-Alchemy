@@ -1,23 +1,49 @@
 import gc
-import rawpy
 import numpy as np
 import colour
 import os
 from typing import Optional
 
-# 尝试导入同级目录下的模块，如果失败则尝试绝对导入 (方便不同运行环境调试)
 from raw_alchemy import utils
 from raw_alchemy.config import LOG_TO_WORKING_SPACE, LOG_ENCODING_MAP
 from raw_alchemy.logger import create_logger
 from raw_alchemy.metering import apply_auto_exposure
 from raw_alchemy.file_io import save_image
 from raw_alchemy.onnx.denoiser import denoise_raw
-from raw_alchemy.math_ops import log_encode_gpu
+from raw_alchemy.math_ops import log_encode_gpu, apply_matrix_inplace
 
 
 # ==========================================
 #              核心处理函数
 # ==========================================
+
+def _rawspeed_decode_to_prophoto(result) -> np.ndarray:
+    """Decode RawSpeed result to ProPhoto Linear float32 (H, W, 3).
+
+    Applies: RCD demosaic -> WB -> color matrix -> ProPhoto.
+    """
+    from raw_alchemy.demosaic import rcd_demosaic
+
+    bayer_norm = result.normalize()
+    rgb = rcd_demosaic(bayer_norm, result.filters)
+
+    # White balance (normalize by G channel)
+    wb = result.wb_coeffs
+    g = wb[1] if wb[1] > 0 else 1.0
+    rgb[:, :, 0] *= wb[0] / g
+    rgb[:, :, 2] *= wb[2] / g
+
+    # Color matrix: Camera -> XYZ -> ProPhoto
+    if result.color_matrix is not None:
+        cam_to_xyz = np.linalg.inv(result.color_matrix[:3, :3])
+        prophoto_to_xyz = colour.RGB_COLOURSPACES['ProPhoto RGB'].matrix_RGB_to_XYZ
+        xyz_to_prophoto = np.linalg.inv(prophoto_to_xyz)
+        cam_to_prophoto = xyz_to_prophoto @ cam_to_xyz
+        apply_matrix_inplace(rgb, cam_to_prophoto)
+
+    np.maximum(rgb, 0.0, out=rgb)
+    return rgb
+
 
 def process_image(
     raw_path: str,
@@ -53,10 +79,14 @@ def process_image(
     
     logger.info(f"🧪 [Raw Alchemy] Processing: {raw_path}")
 
-    # --- Step 1: 解码 RAW (统一至 ProPhoto RGB / 16-bit Linear) ---
-    # 提取 EXIF (用于镜头校正和后续写入)
-    with rawpy.imread(raw_path) as raw:
-        exif_data, exif_metadata = utils.extract_lens_exif(raw_path, raw)
+    # --- Step 1: 解码 RAW (RawSpeed + RCD demosaic -> ProPhoto RGB Linear) ---
+    from raw_alchemy.rawspeed_binding import RawSpeedDecoder
+    from raw_alchemy.demosaic import rcd_demosaic
+    from raw_alchemy.exif import extract_lens_exif
+
+    _decoder = RawSpeedDecoder()
+    _rs_result = _decoder.decode(raw_path)
+    exif_data, exif_metadata = extract_lens_exif(raw_path, _rs_result)
 
     if denoise_enabled:
         # CANS RAW V2: packed RAW → ProPhoto Linear RGB (replaces demosaicing)
@@ -65,41 +95,11 @@ def process_image(
             img = denoise_raw(raw_path, exposure_ratio=1.0)
             logger.info("  ✅ CANS denoise complete")
         except Exception as e:
-            logger.error(f"  ❌ CANS denoise failed, falling back to rawpy: {e}")
-            with rawpy.imread(raw_path) as raw:
-                prophoto_linear = raw.postprocess(
-                    gamma=(1, 1),
-                    no_auto_bright=True,
-                    use_camera_wb=True,
-                    use_auto_wb=False,
-                    output_bps=16,
-                    output_color=rawpy.ColorSpace.ProPhoto,
-                    bright=1.0,
-                    highlight_mode=2,
-                    demosaic_algorithm=rawpy.DemosaicAlgorithm.AAHD,
-                )
-                img = prophoto_linear.astype(np.float32) / 65535.0
-                del prophoto_linear
-                gc.collect()
+            logger.error(f"  ❌ CANS denoise failed, falling back to RawSpeed+RCD: {e}")
+            img = _rawspeed_decode_to_prophoto(_rs_result)
     else:
-        logger.info(f"  🔹 [Step 1] Decoding RAW...")
-        with rawpy.imread(raw_path) as raw:
-            # 解码: 必须使用 16-bit 以保留 Log 转换所需的动态范围
-            prophoto_linear = raw.postprocess(
-                gamma=(1, 1),
-                no_auto_bright=True,
-                use_camera_wb=True,
-                use_auto_wb=False,
-                output_bps=16,
-                output_color=rawpy.ColorSpace.ProPhoto,
-                bright=1.0,
-                highlight_mode=2, # 2=Blend (防止高光死白)
-                demosaic_algorithm=rawpy.DemosaicAlgorithm.AAHD,
-            )
-            # 转为 Float32 (0.0 - 1.0) 进行数学运算
-            img = prophoto_linear.astype(np.float32) / 65535.0
-            del prophoto_linear
-            gc.collect()
+        logger.info(f"  🔹 [Step 1] Decoding RAW (RawSpeed + RCD)...")
+        img = _rawspeed_decode_to_prophoto(_rs_result)
 
     source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
 

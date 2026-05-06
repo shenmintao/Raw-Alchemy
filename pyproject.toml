@@ -18,7 +18,6 @@ dependencies = [
     "requests",
     "tifffile",
     "click",
-    "rawpy @ git+https://github.com/shenmintao/rawpy.git",
     "colour-science @ git+https://github.com/colour-science/colour.git@develop",
     "scipy",
     "Pillow",
@@ -49,6 +48,8 @@ raw-alchemy-gui = "raw_alchemy.main:main"
 [tool.setuptools.package-data]
 raw_alchemy = [
     "locales/*.json",
+    "vendor/*.dll",
+    "vendor/cameras.xml",
     "vendor/*.onnx",
     "vendor/*.onnx.data",
     "vendor/lensfun/lib/*.dll",

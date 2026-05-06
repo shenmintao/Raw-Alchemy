@@ -2,7 +2,7 @@
 GPU-resident image processing pipeline using Taichi.
 
 All image data lives on GPU as ti.ndarray. Data crosses CPU-GPU boundary only:
-  1. RAW decode (rawpy -> numpy -> GPU upload)   [CPU -> GPU, once per image]
+  1. RAW decode (RawSpeed + RCD demosaic -> numpy -> GPU upload)  [CPU -> GPU, once per image]
   2. Lens correction (GPU -> CPU -> GPU)          [scipy, once per image]
   3. Display output (GPU -> numpy)                [GPU -> CPU, each frame]
 
@@ -15,7 +15,6 @@ import os
 import gc
 import taichi as ti
 import numpy as np
-import rawpy
 import colour
 from typing import Optional
 from PySide6.QtCore import QThread, Signal
@@ -192,6 +191,53 @@ class ImageProcessor(QThread):
     # Loading
     # =================================================================
 
+    def _get_rs_decoder(self):
+        """Get or create the singleton RawSpeed decoder."""
+        if not hasattr(self, '_rs_decoder') or self._rs_decoder is None:
+            from raw_alchemy.rawspeed_binding import RawSpeedDecoder
+            self._rs_decoder = RawSpeedDecoder()
+        return self._rs_decoder
+
+    def _rawspeed_to_prophoto(self, path: str):
+        """Decode RAW via RawSpeed + RCD demosaic -> ProPhoto Linear float32.
+
+        Returns:
+            (img, exif_data, exif_metadata) where img is (H, W, 3) float32 ProPhoto Linear.
+        """
+        from raw_alchemy.rawspeed_binding import RawSpeedDecoder
+        from raw_alchemy.demosaic import rcd_demosaic
+        from raw_alchemy.exif import extract_lens_exif
+
+        decoder = self._get_rs_decoder()
+        result = decoder.decode(path)
+
+        # Demosaic
+        bayer_norm = result.normalize()  # float32 [0,1]
+        rgb = rcd_demosaic(bayer_norm, result.filters)
+
+        # Apply white balance (normalize by G channel)
+        wb = result.wb_coeffs  # [R, G, B, G2]
+        g = wb[1] if wb[1] > 0 else 1.0
+        rgb[:, :, 0] *= wb[0] / g
+        # rgb[:, :, 1] *= 1.0  # G is reference
+        rgb[:, :, 2] *= wb[2] / g
+
+        # Apply color matrix: Camera -> XYZ -> ProPhoto
+        if result.color_matrix is not None:
+            cam_to_xyz = np.linalg.inv(result.color_matrix[:3, :3])
+            prophoto_to_xyz = colour.RGB_COLOURSPACES['ProPhoto RGB'].matrix_RGB_to_XYZ
+            xyz_to_prophoto = np.linalg.inv(prophoto_to_xyz)
+            cam_to_prophoto = xyz_to_prophoto @ cam_to_xyz
+            apply_matrix_inplace(rgb, cam_to_prophoto)
+
+        # Clip negatives (gamut mapping can produce them)
+        np.maximum(rgb, 0.0, out=rgb)
+
+        # Extract EXIF via pyexiv2 (RawSpeed only provides make/model/iso)
+        exif_data, exif_metadata = extract_lens_exif(path, result)
+
+        return rgb, exif_data, exif_metadata
+
     def _do_preload(self, request: ProcessRequest):
         """Preload RAW into CPU cache only."""
         path = request.path
@@ -199,33 +245,17 @@ class ImageProcessor(QThread):
             return
 
         try:
-            with rawpy.imread(path) as raw:
-                exif_data, _exif_meta = utils.extract_lens_exif(path, raw)
-                # Full resolution decode
-                raw_post = raw.postprocess(
-                    gamma=(1, 1),
-                    no_auto_bright=True,
-                    use_camera_wb=True,
-                    use_auto_wb=False,
-                    output_bps=16,
-                    output_color=rawpy.ColorSpace.ProPhoto,
-                    bright=1.0,
-                    highlight_mode=2,
-                    demosaic_algorithm=rawpy.DemosaicAlgorithm.AAHD,
-                )
-                img = (raw_post / 65535.0).astype(np.float32)
-                del raw_post
-                gc.collect()
+            img, exif_data, _exif_meta = self._rawspeed_to_prophoto(path)
 
-                new_cache_item = CachedImage(
-                    path=path,
-                    linear_data=img,
-                    exif_data=exif_data,
-                    lens_key=None,
-                    exif_metadata=_exif_meta,
-                )
-                self.cache_manager.put(path, new_cache_item)
-                logger.info(f"[Worker] Preloaded: {os.path.basename(path)} ({img.shape[1]}x{img.shape[0]})")
+            new_cache_item = CachedImage(
+                path=path,
+                linear_data=img,
+                exif_data=exif_data,
+                lens_key=None,
+                exif_metadata=_exif_meta,
+            )
+            self.cache_manager.put(path, new_cache_item)
+            logger.info(f"[Worker] Preloaded: {os.path.basename(path)} ({img.shape[1]}x{img.shape[0]})")
 
         except Exception as e:
             logger.warning(f"Preload failed for {path}: {e}")
@@ -262,38 +292,22 @@ class ImageProcessor(QThread):
             logger.info(f"[Worker] Cache Miss - Loading: {os.path.basename(path)}")
 
             try:
-                with rawpy.imread(path) as raw:
-                    self.exif_data, self.exif_metadata = utils.extract_lens_exif(path, raw)
-                    # FULL resolution decode
-                    raw_post = raw.postprocess(
-                        gamma=(1, 1),
-                        no_auto_bright=True,
-                        use_camera_wb=True,
-                        use_auto_wb=False,
-                        output_bps=16,
-                        output_color=rawpy.ColorSpace.ProPhoto,
-                        bright=1.0,
-                        highlight_mode=2,
-                        demosaic_algorithm=rawpy.DemosaicAlgorithm.AAHD,
-                    )
-                    img_np = (raw_post / 65535.0).astype(np.float32)
-                    del raw_post
-                    gc.collect()
+                img_np, self.exif_data, self.exif_metadata = self._rawspeed_to_prophoto(path)
 
-                    # Keep on CPU (GPU upload only when needed for processing)
-                    self.cpu_linear = img_np
+                # Keep on CPU (GPU upload only when needed for processing)
+                self.cpu_linear = img_np
 
-                    # Cache on CPU
-                    new_cache_item = CachedImage(
-                        path=path,
-                        linear_data=img_np,
-                        exif_data=self.exif_data,
-                        lens_key=None,
-                        exif_metadata=self.exif_metadata,
-                    )
-                    self.cache_manager.put(path, new_cache_item)
+                # Cache on CPU
+                new_cache_item = CachedImage(
+                    path=path,
+                    linear_data=img_np,
+                    exif_data=self.exif_data,
+                    lens_key=None,
+                    exif_metadata=self.exif_metadata,
+                )
+                self.cache_manager.put(path, new_cache_item)
 
-                    logger.info(f"[Worker] Loaded: {img_np.shape[1]}x{img_np.shape[0]}")
+                logger.info(f"[Worker] Loaded: {img_np.shape[1]}x{img_np.shape[0]}")
 
             except Exception as e:
                 logger.error(f"Error loading image {path}: {e}")
@@ -418,22 +432,48 @@ class ImageProcessor(QThread):
                     self.cached_denoise_full = None
                     self.last_denoise_key = None
 
-            # --- Stage 1: Lens Correction (CPU - scipy) ---
+            # --- Stage 1: Lens Correction (CPU distortion map + GPU remap) ---
             current_lens_key = (params.get('lens_correct'), params.get('custom_db_path'),
                                 denoise_enabled)
 
             if current_lens_key != self.cached_lens_key or not self.gpu_corrected.valid:
                 logger.debug("[Worker] Lens correction...")
                 if params.get('lens_correct') and self.exif_data:
-                    self.cpu_corrected = utils.apply_lens_correction(
-                        linear_source, self.exif_data,
-                        custom_db_path=params.get('custom_db_path')
+                    from raw_alchemy.lensfun_wrapper import compute_lens_distortion_map
+                    from raw_alchemy.math_ops import lens_remap_gpu
+
+                    lf_params = {**self.exif_data}
+                    dist_result = compute_lens_distortion_map(
+                        linear_source,
+                        camera_maker=lf_params.get('camera_maker'),
+                        camera_model=lf_params.get('camera_model'),
+                        lens_maker=lf_params.get('lens_maker'),
+                        lens_model=lf_params.get('lens_model'),
+                        focal_length=lf_params.get('focal_length', 0),
+                        aperture=lf_params.get('aperture', 0),
+                        crop_factor=lf_params.get('crop_factor'),
+                        custom_db_path=params.get('custom_db_path'),
                     )
+
+                    if dist_result is not None:
+                        coords, oob_mask, corrected_img = dist_result
+                        # Upload source to GPU, then remap on GPU
+                        self.gpu_corrected.upload(corrected_img)
+                        # Use a temp buffer for remap output
+                        from raw_alchemy.gpu_buffer import GpuImage
+                        gpu_temp = GpuImage()
+                        lens_remap_gpu(self.gpu_corrected, gpu_temp, coords, oob_mask)
+                        # Swap: corrected = remapped result
+                        self.gpu_corrected.copy_from(gpu_temp)
+                        gpu_temp.clear()
+                        self.cpu_corrected = self.gpu_corrected.to_numpy()
+                    else:
+                        self.cpu_corrected = linear_source
+                        self.gpu_corrected.upload(self.cpu_corrected)
                 else:
                     self.cpu_corrected = linear_source
+                    self.gpu_corrected.upload(self.cpu_corrected)
 
-                # Upload to GPU
-                self.gpu_corrected.upload(self.cpu_corrected)
                 self.cached_lens_key = current_lens_key
 
                 # Invalidate downstream caches
