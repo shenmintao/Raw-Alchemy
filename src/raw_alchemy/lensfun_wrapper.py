@@ -638,44 +638,71 @@ def apply_lens_correction(
     # 创建修改器
     modifier = LensfunModifier(lens, focal_length, crop_factor, width, height, LF_PF_F32)
     
-    # 启用所需的校正并应用自动缩放
+    # 启用所需的校正
     if correct_distortion:
         modifier.enable_distortion_correction()
-        # 获取并应用自动缩放以消除黑边
-        auto_scale = modifier.get_auto_scale()
-        if auto_scale < 1.0:
-            modifier.enable_scaling(1.0/auto_scale)
-        else:
-            modifier.enable_scaling(auto_scale)
-        logger.info(f"  ⚖️ [Lensfun] Auto-scaling enabled with factor: {auto_scale:.4f}")
 
     if correct_tca:
         modifier.enable_tca_correction()
-    
+
     if correct_vignetting:
         modifier.enable_vignetting_correction(aperture, distance)
-    
+
     # 创建输出图像
     output = np.zeros_like(image)
-    
+
     # 步骤1: 应用颜色修改（暗角）
     # 这是原位操作，会直接修改 image 数组。
     # 后续的几何校正会从这个修改后的 image 中读取数据，所以这是期望的行为。
     if correct_vignetting:
         modifier.apply_color_modification(image, 0.0, 0.0, width, height)
-    
+
     # 步骤2: 应用几何畸变和TCA校正
     if correct_distortion or correct_tca:
         coords = modifier.apply_subpixel_geometry_distortion(0.0, 0.0, width, height)
-        
+
         if coords is not None:
-            # 使用scipy的map_coordinates进行插值
+            # 检查坐标是否超出图像范围，如果是则向中心缩放以消除黑边
+            x_min = min(coords[:, :, ch, 0].min() for ch in range(3))
+            x_max = max(coords[:, :, ch, 0].max() for ch in range(3))
+            y_min = min(coords[:, :, ch, 1].min() for ch in range(3))
+            y_max = max(coords[:, :, ch, 1].max() for ch in range(3))
+
+            if x_min < 0 or y_min < 0 or x_max >= width or y_max >= height:
+                # 计算将坐标范围压缩到 [0, width-1] x [0, height-1] 所需的缩放
+                x_range = x_max - x_min
+                y_range = y_max - y_min
+                scale_x = (width - 1) / x_range if x_range > 0 else 1.0
+                scale_y = (height - 1) / y_range if y_range > 0 else 1.0
+                scale = min(scale_x, scale_y)
+
+                cx, cy = width / 2.0, height / 2.0
+                for ch in range(3):
+                    coords[:, :, ch, 0] = cx + (coords[:, :, ch, 0] - cx) * scale
+                    coords[:, :, ch, 1] = cy + (coords[:, :, ch, 1] - cy) * scale
+
+                logger.info(f"  ⚖️ [Lensfun] Auto-crop scale: {scale:.4f} (src range: x=[{x_min:.1f},{x_max:.1f}] y=[{y_min:.1f},{y_max:.1f}])")
+
+            # 构建越界掩码：任一通道越界的像素全部置黑，避免 R/G/B 独立 clamp 产生彩色伪影
+            # order=3 三次插值需要 4x4 邻域，边界 2 像素内会采样到零填充值，
+            # 不同通道坐标不同（TCA）导致混入量不一致产生彩色噪点，因此加 margin
+            interp_margin = 2.0
+            oob_mask = np.zeros((height, width), dtype=bool)
+            for ch in range(3):
+                oob_mask |= (coords[:, :, ch, 0] < interp_margin) | (coords[:, :, ch, 0] > width - 1 - interp_margin)
+                oob_mask |= (coords[:, :, ch, 1] < interp_margin) | (coords[:, :, ch, 1] > height - 1 - interp_margin)
+
+            # clamp 坐标以便 map_coordinates 不会报错
+            for ch in range(3):
+                np.clip(coords[:, :, ch, 0], 0, width - 1, out=coords[:, :, ch, 0])
+                np.clip(coords[:, :, ch, 1], 0, height - 1, out=coords[:, :, ch, 1])
+
             from scipy.ndimage import map_coordinates
-            
+
             for c in range(3):  # R, G, B
                 coords_c = coords[:, :, c, :]
                 coordinates = np.array([coords_c[:, :, 1], coords_c[:, :, 0]])
-                
+
                 output[:, :, c] = map_coordinates(
                     image[:, :, c],
                     coordinates,
@@ -683,6 +710,9 @@ def apply_lens_correction(
                     mode='constant',
                     cval=0.0
                 )
+
+            # 将越界像素的所有通道统一置零（黑色）
+            output[oob_mask] = 0.0
         else:
             output = image
     else:

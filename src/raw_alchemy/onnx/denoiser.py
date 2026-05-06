@@ -1,33 +1,33 @@
 """
-Denoiser module using ONNX Runtime for cross-platform image denoising.
+CANS RAW V2 denoiser — packed RAW → ProPhoto Linear RGB via ONNX Runtime.
+
+Two ONNX models (auto-selected by CFA pattern):
+  - cans_raw_v2_bayer_fp16.onnx   (4ch Bayer → 3ch ProPhoto RGB, 2× upscale)
+  - cans_raw_v2_xtrans_fp16.onnx  (9ch X-Trans → 3ch ProPhoto RGB, 3× upscale)
+
+Tile-based inference with Hann window blending for seamless large-image processing.
 
 Supports:
-- Windows: CPU, CUDA (if available)
-- macOS: CPU, CoreML (if available)
-- Linux: CPU, CUDA (if available)
-
-Note: DirectML is explicitly disabled due to compatibility issues.
+  - Windows: CPU, CUDA (if available)
+  - macOS: CPU, CoreML (if available)
+  - Linux: CPU, CUDA (if available)
 """
+
 import os
 import sys
 import platform
 import numpy as np
-from typing import Optional, Callable, Tuple
+import rawpy
+from typing import Optional, Callable
 from loguru import logger
 
 
+# ---------------------------------------------------------------------------
+# CUDA setup (must run before importing onnxruntime)
+# ---------------------------------------------------------------------------
+
 def _setup_cuda_paths():
-    """
-    Setup CUDA library paths for onnxruntime-gpu.
-    
-    Checks two locations:
-    1. Local downloaded CUDA runtime (~/.raw_alchemy/cuda_runtime/)
-    2. nvidia packages in site-packages (pip install nvidia-cublas-cu12 etc.)
-    
-    CRITICAL: This must be called before importing onnxruntime.
-    The gpu_runtime module handles preloading DLLs to ensure they're in memory.
-    """
-    # First, try to use locally downloaded CUDA runtime
+    """Setup CUDA library paths for onnxruntime-gpu."""
     try:
         from . import gpu_runtime
         if gpu_runtime.setup_cuda_dll_paths():
@@ -37,486 +37,601 @@ def _setup_cuda_paths():
         pass
     except Exception as e:
         logger.debug(f"Failed to setup local CUDA runtime: {e}")
-    
-    # Windows-only fallback: Check for nvidia packages in site-packages
+
     if platform.system() != 'Windows':
         return
-    
-    # Fallback: Check for nvidia packages in site-packages
+
     try:
         import site
         site_packages = site.getsitepackages()
-        if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
-            # Virtual environment
+        if hasattr(sys, 'real_prefix') or (
+            hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix
+        ):
             venv_site = os.path.join(sys.prefix, 'Lib', 'site-packages')
             if venv_site not in site_packages:
                 site_packages.insert(0, venv_site)
-        
+
         nvidia_paths = []
         for sp in site_packages:
             nvidia_base = os.path.join(sp, 'nvidia')
             if os.path.isdir(nvidia_base):
-                # Look for bin directories containing DLLs
                 for subdir in os.listdir(nvidia_base):
                     bin_path = os.path.join(nvidia_base, subdir, 'bin')
                     if os.path.isdir(bin_path):
                         nvidia_paths.append(bin_path)
-        
-        # Add paths using os.add_dll_directory (Python 3.8+)
+
         if hasattr(os, 'add_dll_directory'):
             for path in nvidia_paths:
                 try:
                     os.add_dll_directory(path)
-                    logger.debug(f"Added DLL directory: {path}")
-                except Exception as e:
-                    logger.debug(f"Failed to add DLL directory {path}: {e}")
-        
-        # Also add to PATH for older Python versions
+                except Exception:
+                    pass
+
         if nvidia_paths:
-            os.environ['PATH'] = os.pathsep.join(nvidia_paths) + os.pathsep + os.environ.get('PATH', '')
-            
+            os.environ['PATH'] = (
+                os.pathsep.join(nvidia_paths) + os.pathsep + os.environ.get('PATH', '')
+            )
     except Exception as e:
         logger.debug(f"Failed to setup CUDA paths: {e}")
 
 
-# Setup CUDA paths before importing onnxruntime
 _setup_cuda_paths()
 
-# Global session cache
-_session = None
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+_session_bayer = None
+_session_xtrans = None
 _session_provider = None
 
-# Model filename - using NIND UtNet FP16 model
-# This model uses FP16 input/output with fixed 504x504 tile size
-MODEL_FILENAME = "nind_utnet_fp16.onnx"
+BAYER_MODEL = "cans_raw_v2_bayer_fp16.onnx"
+XTRANS_MODEL = "cans_raw_v2_xtrans_fp16.onnx"
 
+# Tile size at packed resolution (before upscale)
+DEFAULT_TILE_SIZE = 256
+DEFAULT_TILE_OVERLAP = 32
+
+
+# ---------------------------------------------------------------------------
+# RAW packing (from preprocess_raw.py)
+# ---------------------------------------------------------------------------
+
+def _detect_sensor(raw) -> str:
+    """Detect sensor type from rawpy object."""
+    pattern = raw.raw_pattern
+    if pattern.shape == (2, 2):
+        return 'bayer'
+    elif pattern.shape == (6, 6):
+        return 'xtrans'
+    else:
+        raise ValueError(f"Unknown CFA pattern shape: {pattern.shape}")
+
+
+def _pack_bayer(raw) -> np.ndarray:
+    """Pack Bayer raw to (H/2, W/2, 4) float32, black-level subtracted and normalized.
+
+    Channel order: [R, G1, B, G2] at positions (0,0), (0,1), (1,1), (1,0).
+    """
+    im = raw.raw_image_visible.astype(np.float32)
+    bl = float(raw.black_level_per_channel[0])
+    wl = float(raw.white_level)
+    im = np.maximum(im - bl, 0) / (wl - bl)
+
+    H, W = im.shape
+    H = H // 2 * 2
+    W = W // 2 * 2
+    im = im[:H, :W]
+
+    return np.stack([
+        im[0::2, 0::2],  # R
+        im[0::2, 1::2],  # G1
+        im[1::2, 1::2],  # B
+        im[1::2, 0::2],  # G2
+    ], axis=-1)
+
+
+def _pack_xtrans(raw) -> np.ndarray:
+    """Pack X-Trans raw to (H/3, W/3, 9) float32, SID convention."""
+    im = raw.raw_image_visible.astype(np.float32)
+    bl = float(raw.black_level_per_channel[0])
+    wl = float(raw.white_level)
+    im = np.maximum(im - bl, 0) / (wl - bl)
+
+    H = (im.shape[0] // 6) * 6
+    W = (im.shape[1] // 6) * 6
+    im = im[:H, :W]
+
+    out = np.zeros((H // 3, W // 3, 9), dtype=np.float32)
+
+    # Channels 0-4: R, G, B subsets (SID convention)
+    out[0::2, 0::2, 0] = im[0:H:6, 0:W:6]
+    out[0::2, 1::2, 0] = im[0:H:6, 4:W:6]
+    out[1::2, 0::2, 0] = im[3:H:6, 1:W:6]
+    out[1::2, 1::2, 0] = im[3:H:6, 3:W:6]
+
+    out[0::2, 0::2, 1] = im[0:H:6, 2:W:6]
+    out[0::2, 1::2, 1] = im[0:H:6, 5:W:6]
+    out[1::2, 0::2, 1] = im[3:H:6, 2:W:6]
+    out[1::2, 1::2, 1] = im[3:H:6, 5:W:6]
+
+    out[0::2, 0::2, 2] = im[0:H:6, 1:W:6]
+    out[0::2, 1::2, 2] = im[0:H:6, 3:W:6]
+    out[1::2, 0::2, 2] = im[3:H:6, 0:W:6]
+    out[1::2, 1::2, 2] = im[3:H:6, 4:W:6]
+
+    out[0::2, 0::2, 3] = im[1:H:6, 2:W:6]
+    out[0::2, 1::2, 3] = im[2:H:6, 5:W:6]
+    out[1::2, 0::2, 3] = im[5:H:6, 2:W:6]
+    out[1::2, 1::2, 3] = im[4:H:6, 5:W:6]
+
+    out[0::2, 0::2, 4] = im[2:H:6, 2:W:6]
+    out[0::2, 1::2, 4] = im[1:H:6, 5:W:6]
+    out[1::2, 0::2, 4] = im[4:H:6, 2:W:6]
+    out[1::2, 1::2, 4] = im[5:H:6, 5:W:6]
+
+    out[:, :, 5] = im[1:H:3, 0:W:3]
+    out[:, :, 6] = im[1:H:3, 1:W:3]
+    out[:, :, 7] = im[2:H:3, 0:W:3]
+    out[:, :, 8] = im[2:H:3, 1:W:3]
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
 
 def _get_base_path() -> str:
-    """
-    获取资源的基础路径。
-    兼容：开发环境、PyInstaller (单文件/文件夹)、Nuitka (单文件/文件夹)。
-    """
-    # 1. 优先处理 PyInstaller One-file 模式
+    """Get resource base path (dev, PyInstaller, Nuitka)."""
     if hasattr(sys, '_MEIPASS'):
         return sys._MEIPASS
-
-    # 2. 处理 PyInstaller One-dir 模式 (检查是否存在 _internal 文件夹)
-    # PyInstaller 6+ 默认将依赖放在 _internal 中
     executable_dir = os.path.dirname(sys.executable)
-    pyinstaller_internal_path = os.path.join(executable_dir, '_internal')
-    
-    # 只有当处于 frozen 状态 且 _internal 文件夹确实存在时，才使用它
-    if getattr(sys, 'frozen', False) and os.path.isdir(pyinstaller_internal_path):
-        return pyinstaller_internal_path
-
-    # 3. Nuitka (单文件/文件夹) 以及 普通 Python 脚本
-    # Nuitka 会修正 __file__ 指向正确的运行时位置（无论是临时目录还是 dist 目录）
+    internal = os.path.join(executable_dir, '_internal')
+    if getattr(sys, 'frozen', False) and os.path.isdir(internal):
+        return internal
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _get_model_path() -> str:
-    """Get the path to the ONNX model file."""
-    base_path = _get_base_path()
-    
-    # 可能的模型路径
-    possible_paths = [
-        # vendor 目录（模型现在存放在 vendor 中）
-        os.path.join(base_path, "vendor", MODEL_FILENAME),
-        # PyInstaller/Nuitka 打包后的路径
-        os.path.join(base_path, "raw_alchemy", "vendor", MODEL_FILENAME),
-        # 开发环境：相对于 onnx 目录向上一级
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vendor", MODEL_FILENAME),
-        # 旧路径（兼容）
-        os.path.join(base_path, MODEL_FILENAME),
-        os.path.join(base_path, "raw_alchemy", "onnx", MODEL_FILENAME),
+def _find_model(model_filename: str) -> str:
+    """Find the ONNX model file."""
+    base = _get_base_path()
+    candidates = [
+        os.path.join(base, "vendor", model_filename),
+        os.path.join(base, "raw_alchemy", "vendor", model_filename),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vendor", model_filename),
     ]
-    
-    for path in possible_paths:
-        normalized_path = os.path.normpath(path)
-        if os.path.exists(normalized_path):
-            logger.debug(f"Found ONNX model at: {normalized_path}")
-            return normalized_path
-    
+    for p in candidates:
+        np_ = os.path.normpath(p)
+        if os.path.exists(np_):
+            return np_
     raise FileNotFoundError(
-        f"ONNX model '{MODEL_FILENAME}' not found. "
-        f"Searched paths: {possible_paths}"
+        f"ONNX model '{model_filename}' not found. Searched: {candidates}"
     )
 
 
 def _get_providers() -> list:
-    """
-    Get the list of execution providers based on the platform.
-    DirectML is explicitly excluded due to compatibility issues.
-    """
+    """Get execution providers (CUDA > CoreML > CPU). DirectML excluded."""
     try:
         import onnxruntime as ort
     except ImportError:
         raise ImportError("onnxruntime is required. Install with: pip install onnxruntime")
-    
+
     available = ort.get_available_providers()
     providers = []
-    system = platform.system()
-    
-    logger.debug(f"Available ONNX Runtime providers: {available}")
-    logger.debug(f"Platform: {system}")
-    
-    # CUDA for Windows/Linux with NVIDIA GPU
+
     if 'CUDAExecutionProvider' in available:
         providers.append('CUDAExecutionProvider')
         logger.info("Using CUDA execution provider")
-    
-    # CoreML for macOS (Apple Silicon and Intel)
-    elif 'CoreMLExecutionProvider' in available and system == 'Darwin':
+    elif 'CoreMLExecutionProvider' in available and platform.system() == 'Darwin':
         providers.append('CoreMLExecutionProvider')
         logger.info("Using CoreML execution provider (macOS)")
-    
-    # Note: DirectML is explicitly NOT used due to compatibility issues
-    # elif 'DmlExecutionProvider' in available and system == 'Windows':
-    #     providers.append('DmlExecutionProvider')
-    
-    # Always add CPU as fallback
+
     providers.append('CPUExecutionProvider')
-    
     if len(providers) == 1:
-        logger.info("Using CPU execution provider (no GPU acceleration available)")
-    
+        logger.info("Using CPU execution provider (no GPU acceleration)")
     return providers
 
 
-def _get_session():
-    """Get or create the ONNX Runtime inference session (cached)."""
-    global _session, _session_provider
-    
-    if _session is not None:
-        return _session
-    
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        raise ImportError("onnxruntime is required. Install with: pip install onnxruntime")
-    
-    model_path = _get_model_path()
+def _get_session(sensor: str):
+    """Get or create ONNX session for the given sensor type."""
+    global _session_bayer, _session_xtrans, _session_provider
+
+    if sensor == 'bayer' and _session_bayer is not None:
+        return _session_bayer
+    if sensor == 'xtrans' and _session_xtrans is not None:
+        return _session_xtrans
+
+    import onnxruntime as ort
+
+    model_file = BAYER_MODEL if sensor == 'bayer' else XTRANS_MODEL
+    model_path = _find_model(model_file)
     providers = _get_providers()
-    
-    logger.info(f"Loading ONNX model from: {model_path}")
-    
-    # Create session options
+
+    logger.info(f"Loading CANS RAW V2 ({sensor}) from: {model_path}")
+
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
-    # Enable memory pattern optimization
+    sess_options.log_severity_level = 3
     sess_options.enable_mem_pattern = True
     sess_options.enable_cpu_mem_arena = True
-    
-    # Configure CUDA provider options for dynamic shapes
+
     provider_options = []
-    for provider in providers:
-        if provider == 'CUDAExecutionProvider':
-            cuda_options = {
+    for p in providers:
+        if p == 'CUDAExecutionProvider':
+            provider_options.append((p, {
                 'device_id': 0,
-                'arena_extend_strategy': 'kSameAsRequested',  # Better for dynamic shapes
-                'cudnn_conv_algo_search': 'HEURISTIC',  # Faster algo selection for dynamic shapes
+                'arena_extend_strategy': 'kSameAsRequested',
+                'cudnn_conv_algo_search': 'HEURISTIC',
                 'do_copy_in_default_stream': True,
-                'cudnn_conv_use_max_workspace': True,  # Use more workspace for faster convs
-            }
-            provider_options.append((provider, cuda_options))
+                'cudnn_conv_use_max_workspace': True,
+            }))
         else:
-            provider_options.append(provider)
-    
-    try:
-        _session = ort.InferenceSession(model_path, sess_options, providers=provider_options)
-        actual_providers = _session.get_providers()
-        _session_provider = actual_providers[0]
-        logger.info(f"ONNX session created with provider: {_session_provider}")
-        logger.info(f"All active providers: {actual_providers}")
-        
-        # Warn if CUDA was requested but not used
-        if 'CUDAExecutionProvider' in [p[0] if isinstance(p, tuple) else p for p in provider_options]:
-            if 'CUDAExecutionProvider' not in actual_providers:
-                logger.warning("⚠️ CUDA was requested but not available! Falling back to CPU.")
-                logger.warning("Check: 1) onnxruntime-gpu installed? 2) CUDA/cuDNN installed?")
-        
-        return _session
-    except Exception as e:
-        logger.error(f"Failed to create ONNX session: {e}")
-        raise
+            provider_options.append(p)
 
+    session = ort.InferenceSession(model_path, sess_options, providers=provider_options)
+    _session_provider = session.get_providers()[0]
+    logger.info(f"CANS session ({sensor}): {_session_provider}")
 
-# Tile size for the UtNet model (504 required by U-Net architecture)
-MIN_TILE_SIZE = 504
-
-
-def _pad_to_min_size(image: np.ndarray, min_size: int = MIN_TILE_SIZE, multiple: int = 8) -> Tuple[np.ndarray, Tuple[int, int]]:
-    """
-    Pad image to at least min_size and ensure dimensions are multiples of the given value.
-    Returns padded image and original dimensions.
-    
-    UtNet requires fixed 512x512 input to match the ONNX model export dimensions.
-    """
-    h, w = image.shape[:2]
-    orig_h, orig_w = h, w
-    
-    # First, ensure minimum size
-    target_h = max(h, min_size)
-    target_w = max(w, min_size)
-    
-    # Then, ensure multiple of 8
-    target_h = ((target_h + multiple - 1) // multiple) * multiple
-    target_w = ((target_w + multiple - 1) // multiple) * multiple
-    
-    pad_h = target_h - h
-    pad_w = target_w - w
-    
-    if pad_h == 0 and pad_w == 0:
-        return image, (orig_h, orig_w)
-    
-    if len(image.shape) == 3:
-        padded = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
+    if sensor == 'bayer':
+        _session_bayer = session
     else:
-        padded = np.pad(image, ((0, pad_h), (0, pad_w)), mode='reflect')
-    
-    return padded, (orig_h, orig_w)
+        _session_xtrans = session
+    return session
 
 
-def _process_tile(session, tile: np.ndarray) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# VRAM query
+# ---------------------------------------------------------------------------
+
+def _get_free_vram_mb() -> float:
+    """Query free GPU VRAM in MB. Returns 0 if unavailable."""
+    # Try pynvml (most reliable, ships with onnxruntime-gpu/CUDA toolkit)
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        pynvml.nvmlShutdown()
+        return info.free / (1024 * 1024)
+    except Exception:
+        pass
+
+    # Fallback: nvidia-smi
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.free', '--format=csv,nounits,noheader'],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip().split('\n')[0])
+    except Exception:
+        pass
+
+    return 0.0
+
+
+def _estimate_tile_vram_mb(in_ch: int, tile_size: int, upscale: int) -> float:
+    """Estimate VRAM needed per tile in MB (input + output + intermediate).
+
+    Conservative estimate: ~4x the raw input+output size for intermediate
+    activations and workspace.
     """
-    Process a single tile through the model.
-    
+    in_bytes = in_ch * tile_size * tile_size * 2  # fp16
+    out_bytes = 3 * (tile_size * upscale) ** 2 * 2  # fp16 output
+    # Model intermediate activations roughly 4x input
+    return (in_bytes + out_bytes) * 4 / (1024 * 1024)
+
+
+def _compute_batch_size(in_ch: int, tile_size: int, upscale: int,
+                        vram_reserve_mb: float = 512) -> int:
+    """Compute optimal batch size based on available VRAM.
+
     Args:
-        session: ONNX Runtime session
-        tile: Input tile in HWC format, float32, range [0, 1]
-    
-    Returns:
-        Denoised tile in HWC format (float32)
-    """
-    # Convert HWC to NCHW and ensure contiguous memory (FP16 input)
-    tile_nchw = np.ascontiguousarray(tile.transpose(2, 0, 1)[np.newaxis, ...], dtype=np.float16)
-    
-    # Run inference
-    input_name = session.get_inputs()[0].name
-    output = session.run(None, {input_name: tile_nchw})[0]
-    
-    # Convert NCHW back to HWC (return float32 for consistency)
-    result = output[0].transpose(1, 2, 0).astype(np.float32)
-    
-    return result
+        in_ch: Number of input channels (4 for Bayer, 9 for X-Trans)
+        tile_size: Tile size at packed resolution
+        upscale: 2 for Bayer, 3 for X-Trans
+        vram_reserve_mb: VRAM to keep free for other GPU tasks (Taichi, display)
 
-
-def _process_tiles_batch(session, tiles: list) -> list:
-    """
-    Process multiple tiles in a batch for better GPU utilization.
-    
-    Args:
-        session: ONNX Runtime session
-        tiles: List of input tiles in HWC format, float32, range [0, 1]
-    
     Returns:
-        List of denoised tiles in HWC format (float32)
+        Batch size (>= 1)
     """
-    if not tiles:
-        return []
-    
-    # Stack tiles into batch: list of HWC -> NCHW batch (FP16 input)
-    batch = np.ascontiguousarray(
-        np.stack([tile.transpose(2, 0, 1) for tile in tiles], axis=0),
-        dtype=np.float16
+    free_mb = _get_free_vram_mb()
+    if free_mb <= 0:
+        # Can't query VRAM — conservative default
+        return 1
+
+    per_tile_mb = _estimate_tile_vram_mb(in_ch, tile_size, upscale)
+    if per_tile_mb <= 0:
+        return 1
+
+    available = max(free_mb - vram_reserve_mb, per_tile_mb)
+    # CANS RAW V2 ONNX has ScatterElements ops that require batch=1
+    batch_size = 1
+
+    logger.info(
+        f"VRAM: {free_mb:.0f} MB free, {per_tile_mb:.1f} MB/tile, "
+        f"reserve {vram_reserve_mb:.0f} MB -> batch_size={batch_size}"
     )
-    
-    # Run inference
-    input_name = session.get_inputs()[0].name
-    output = session.run(None, {input_name: batch})[0]
-    
-    # Convert NCHW batch back to list of HWC (return float32 for consistency)
-    results = [output[i].transpose(1, 2, 0).astype(np.float32) for i in range(output.shape[0])]
-    
-    return results
+    return batch_size
 
 
-def denoise(
-    image: np.ndarray,
-    strength: float = 1.0,
-    tile_size: int = 504,  # UtNet requires 504 (U-Net skip connections)
-    tile_overlap: int = 64,  # Increased from 32 for better blending
-    batch_size: int = 4,  # Process 4 tiles at once for best GPU utilization
-    progress_callback: Optional[Callable[[int, int], None]] = None
-) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Orientation (match rawpy.postprocess behavior)
+# ---------------------------------------------------------------------------
+
+def _apply_flip(img: np.ndarray, flip_code: int) -> np.ndarray:
+    """Apply rawpy orientation to HWC image.
+
+    rawpy.sizes.flip values (matches libraw):
+        0 = no rotation
+        3 = 180°
+        5 = 90° CCW (270° CW)
+        6 = 90° CW
     """
-    Denoise an image using the SCUNet model.
-    
+    if flip_code == 0:
+        return img
+    elif flip_code == 3:
+        return np.rot90(img, k=2)
+    elif flip_code == 5:
+        return np.rot90(img, k=1)  # 90° CCW
+    elif flip_code == 6:
+        return np.rot90(img, k=3)  # 90° CW (= 270° CCW)
+    else:
+        logger.warning(f"Unknown flip code {flip_code}, skipping rotation")
+        return img
+
+
+# ---------------------------------------------------------------------------
+# Tile-based inference
+# ---------------------------------------------------------------------------
+
+def _has_wb_input(session) -> bool:
+    """Check if the ONNX model accepts a wb_iso input."""
+    return len(session.get_inputs()) >= 2
+
+
+def _build_wb_iso(raw) -> np.ndarray:
+    """Build WB+ISO condition vector from rawpy object.
+
+    Returns (4,) float32: [R/G, 1.0, B/G, log10(ISO)]
+    """
+    cam_wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+    g = cam_wb[1] if cam_wb[1] > 0 else 1.0
+    wb3 = np.array([cam_wb[0] / g, 1.0, cam_wb[2] / g], dtype=np.float32)
+
+    # ISO from EXIF
+    iso = 100.0
+    try:
+        import pyexiv2
+        # raw_path is not available here, will be passed separately
+    except Exception:
+        pass
+
+    return np.concatenate([wb3, [np.log10(iso)]], dtype=np.float32)
+
+
+def _process_batch(session, tiles_chw: list[np.ndarray],
+                   wb_iso: Optional[np.ndarray] = None) -> list[np.ndarray]:
+    """Run a batch of packed tiles through the ONNX model.
+
     Args:
-        image: Input image in HWC format, float32, range [0, 1]
-        strength: Denoising strength (0.0 = no effect, 1.0 = full effect)
-        tile_size: Size of tiles for processing (576 for ~3-4GB VRAM)
-        tile_overlap: Overlap between tiles to avoid seams
-        batch_size: Number of tiles to process in a batch (1 = dynamic model)
-        progress_callback: Optional callback function(current, total) for progress updates
-    
+        tiles_chw: List of (C, H, W) float16 packed RAW tiles (same spatial size)
+        wb_iso: Optional (4,) float32 WB+ISO condition [R/G, 1.0, B/G, log10(ISO)]
     Returns:
-        Denoised image in HWC format, float32, range [0, 1]
+        List of (3, H*upscale, W*upscale) float32 ProPhoto Linear RGB
     """
-    if strength <= 0:
-        return image.copy()
-    
-    # Clamp strength to valid range
-    strength = min(max(strength, 0.0), 1.0)
-    
-    # Ensure image is float32 and in valid range
-    if image.dtype != np.float32:
-        image = image.astype(np.float32)
-    
-    # Clip to [0, 1] range
-    image = np.clip(image, 0.0, 1.0)
-    
-    # Get session and log provider info
+    if not tiles_chw:
+        return []
+
+    if len(tiles_chw) == 1:
+        batch = tiles_chw[0][np.newaxis, ...]
+    else:
+        batch = np.stack(tiles_chw, axis=0)
+
+    feeds = {session.get_inputs()[0].name: batch}
+
+    # Add WB+ISO condition if model supports it
+    if wb_iso is not None and _has_wb_input(session):
+        B = batch.shape[0]
+        wb_batch = np.tile(wb_iso.astype(np.float16)[np.newaxis, :], (B, 1))
+        feeds[session.get_inputs()[1].name] = wb_batch
+
+    output = session.run(None, feeds)[0]
+    return [output[i].astype(np.float32) for i in range(output.shape[0])]
+
+
+def denoise_raw(
+    raw_path: str,
+    exposure_ratio: float = 1.0,
+    tile_size: int = DEFAULT_TILE_SIZE,
+    tile_overlap: int = DEFAULT_TILE_OVERLAP,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> np.ndarray:
+    """Denoise a RAW file using CANS RAW V2 (packed RAW → ProPhoto Linear RGB).
+
+    This replaces rawpy's demosaicing entirely — the model performs both
+    denoising and demosaicing in a single pass.
+
+    Args:
+        raw_path: Path to the RAW file (.ARW, .CR3, .NEF, .RAF, .DNG, etc.)
+        exposure_ratio: Multiply packed RAW by this ratio (for exposure matching)
+        tile_size: Tile size at packed resolution (default 256)
+        tile_overlap: Overlap in packed pixels (default 32)
+        progress_callback: Optional (current, total) callback
+
+    Returns:
+        (H, W, 3) float32 ProPhoto Linear RGB in [0, 1]
+    """
     import time
-    start_time = time.time()
-    session = _get_session()
-    session_time = time.time() - start_time
-    
-    h, w, c = image.shape
-    logger.info(f"Denoising image: {w}x{h} ({w*h/1e6:.1f}MP), provider: {_session_provider}, session load: {session_time:.2f}s")
-    
-    # Ensure tile_size is at least MIN_TILE_SIZE
-    tile_size = max(tile_size, MIN_TILE_SIZE)
-    
-    # For small images, process directly without tiling
-    if h <= tile_size and w <= tile_size:
-        # Pad to minimum size (256) and multiple of 8
-        padded, (orig_h, orig_w) = _pad_to_min_size(image, MIN_TILE_SIZE, 8)
-        
+    t0 = time.time()
+
+    # Open RAW, pack, extract WB+ISO and orientation
+    with rawpy.imread(raw_path) as raw:
+        sensor = _detect_sensor(raw)
+        if sensor == 'bayer':
+            packed = _pack_bayer(raw)
+            upscale = 2
+        else:
+            packed = _pack_xtrans(raw)
+            upscale = 3
+
+        # WB+ISO condition for shift15 model
+        cam_wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+        g = cam_wb[1] if cam_wb[1] > 0 else 1.0
+        wb3 = np.array([cam_wb[0] / g, 1.0, cam_wb[2] / g], dtype=np.float32)
+
+        # Orientation: rawpy.postprocess applies this internally,
+        # but we bypass rawpy so we must apply it manually.
+        # raw.sizes.flip: 0=no rotation, 3=180°, 5=90°CCW, 6=90°CW
+        flip_code = raw.sizes.flip
+
+    # ISO from EXIF (best effort)
+    iso = 100.0
+    try:
+        import pyexiv2
+        exif_img = pyexiv2.Image(raw_path)
+        exif_data = exif_img.read_exif()
+        iso = float(exif_data.get('Exif.Photo.ISOSpeedRatings', 100))
+        exif_img.close()
+    except Exception:
+        pass
+
+    wb_iso = np.concatenate([wb3, [np.log10(max(iso, 1.0))]], dtype=np.float32)
+
+    # Apply exposure ratio
+    if exposure_ratio != 1.0:
+        packed = np.clip(packed * exposure_ratio, 0.0, 1.0)
+
+    pack_h, pack_w, in_ch = packed.shape
+    out_h, out_w = pack_h * upscale, pack_w * upscale
+
+    logger.info(
+        f"CANS denoise: {os.path.basename(raw_path)} ({sensor}), "
+        f"packed {pack_w}x{pack_h} -> output {out_w}x{out_h}, "
+        f"WB=[{wb3[0]:.2f}, {wb3[2]:.2f}] ISO={iso:.0f} flip={flip_code}"
+    )
+
+    # Get ONNX session
+    session = _get_session(sensor)
+
+    # Convert to CHW float16
+    packed_chw = np.ascontiguousarray(packed.transpose(2, 0, 1), dtype=np.float16)
+
+    # Tile positions (at packed resolution)
+    step = tile_size - tile_overlap
+    ys = list(range(0, max(pack_h - tile_size, 0) + 1, step))
+    xs = list(range(0, max(pack_w - tile_size, 0) + 1, step))
+    if ys[-1] + tile_size < pack_h:
+        ys.append(pack_h - tile_size)
+    if xs[-1] + tile_size < pack_w:
+        xs.append(pack_w - tile_size)
+
+    total_tiles = len(ys) * len(xs)
+
+    # Compute batch size from available VRAM
+    batch_size = _compute_batch_size(in_ch, tile_size, upscale)
+
+    # Small image: single tile
+    if pack_h <= tile_size and pack_w <= tile_size:
         if progress_callback:
             progress_callback(0, 1)
-        
-        denoised = _process_tile(session, padded)
-        
-        # Crop back to original size
-        denoised = denoised[:orig_h, :orig_w, :]
-        
+        pad_h = max(tile_size - pack_h, 0)
+        pad_w = max(tile_size - pack_w, 0)
+        if pad_h > 0 or pad_w > 0:
+            tile = np.pad(packed_chw, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+        else:
+            tile = packed_chw
+        result = _process_batch(session, [tile.astype(np.float16)], wb_iso)[0]
+        result = result[:, :out_h, :out_w]
         if progress_callback:
             progress_callback(1, 1)
-        
-        # Blend with original based on strength
-        if strength < 1.0:
-            denoised = image * (1 - strength) + denoised * strength
-        
-        return np.clip(denoised, 0.0, 1.0)
-    
-    # Tiled processing for large images
-    step = tile_size - tile_overlap
-    
-    # Calculate number of tiles
-    n_tiles_h = max(1, (h - tile_overlap + step - 1) // step)
-    n_tiles_w = max(1, (w - tile_overlap + step - 1) // step)
-    total_tiles = n_tiles_h * n_tiles_w
-    
-    n_batches = (total_tiles + batch_size - 1) // batch_size
-    logger.debug(f"Processing {total_tiles} tiles ({n_tiles_h}x{n_tiles_w}) in {n_batches} batches (batch_size={batch_size})")
-    
-    # Output buffer and weight buffer for blending
-    output = np.zeros_like(image)
-    weights = np.zeros((h, w, 1), dtype=np.float32)
-    
-    # Create blending weights (smooth cosine ramp at edges for seamless blending)
-    def create_blend_weights(tile_h: int, tile_w: int, overlap: int) -> np.ndarray:
-        """Create smooth blending weights for a tile using cosine interpolation."""
-        weight = np.ones((tile_h, tile_w, 1), dtype=np.float32)
-        
-        if overlap > 0:
-            # Create smooth cosine ramps for edges (smoother than linear)
-            # Cosine ramp: 0.5 * (1 - cos(pi * x)) for x in [0, 1]
-            t = np.linspace(0, 1, overlap, dtype=np.float32)
-            ramp = 0.5 * (1 - np.cos(np.pi * t))
-            
-            # Top edge
-            weight[:overlap, :, 0] *= ramp[:, np.newaxis]
-            # Bottom edge
-            weight[-overlap:, :, 0] *= ramp[::-1, np.newaxis]
-            # Left edge
-            weight[:, :overlap, 0] *= ramp[np.newaxis, :]
-            # Right edge
-            weight[:, -overlap:, 0] *= ramp[::-1][np.newaxis, :]
-        
-        return weight
-    
-    current_tile = 0
-    
-    # Collect all tile info first
-    tile_infos = []
-    for i in range(n_tiles_h):
-        for j in range(n_tiles_w):
-            # Calculate tile boundaries
-            y_start = i * step
-            x_start = j * step
-            y_end = min(y_start + tile_size, h)
-            x_end = min(x_start + tile_size, w)
-            
-            # Adjust start if we're at the edge
-            if y_end == h:
-                y_start = max(0, h - tile_size)
-            if x_end == w:
-                x_start = max(0, w - tile_size)
-            
-            tile_infos.append((y_start, x_start, y_end, x_end))
-    
-    # Process tiles in batches
-    for batch_start in range(0, len(tile_infos), batch_size):
-        batch_end = min(batch_start + batch_size, len(tile_infos))
-        batch_infos = tile_infos[batch_start:batch_end]
-        
-        # Prepare batch of tiles
-        padded_tiles = []
-        orig_sizes = []
-        tile_sizes = []
-        
-        for y_start, x_start, y_end, x_end in batch_infos:
-            # Extract tile
-            tile = image[y_start:y_end, x_start:x_end, :].copy()
-            tile_h, tile_w = tile.shape[:2]
-            tile_sizes.append((tile_h, tile_w))
-            
-            # Pad tile to minimum size (256) and multiple of 8
-            padded_tile, (orig_tile_h, orig_tile_w) = _pad_to_min_size(tile, MIN_TILE_SIZE, 8)
-            padded_tiles.append(padded_tile)
-            orig_sizes.append((orig_tile_h, orig_tile_w))
-        
-        # Process batch
-        denoised_tiles = _process_tiles_batch(session, padded_tiles)
-        
-        # Apply results
-        for idx, (y_start, x_start, y_end, x_end) in enumerate(batch_infos):
-            orig_tile_h, orig_tile_w = orig_sizes[idx]
-            tile_h, tile_w = tile_sizes[idx]
-            
-            # Crop back to original tile size
-            denoised_tile = denoised_tiles[idx][:orig_tile_h, :orig_tile_w, :]
-            
-            # Create blend weights for this tile
-            blend_weights = create_blend_weights(tile_h, tile_w, tile_overlap // 2)
-            
-            # Accumulate results
-            output[y_start:y_end, x_start:x_end, :] += denoised_tile * blend_weights
-            weights[y_start:y_end, x_start:x_end, :] += blend_weights
-            
-            current_tile += 1
-            if progress_callback:
-                progress_callback(current_tile, total_tiles)
-    
-    # Normalize by weights
-    weights = np.maximum(weights, 1e-8)  # Avoid division by zero
-    output = output / weights
-    
-    # Blend with original based on strength
-    if strength < 1.0:
-        output = image * (1 - strength) + output * strength
-    
-    return np.clip(output, 0.0, 1.0)
+        elapsed = time.time() - t0
+        logger.info(f"CANS denoise done in {elapsed:.1f}s (1 tile, {_session_provider})")
+        out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0)
+        return _apply_flip(out, flip_code)
 
+    # Collect all tile coordinates
+    tile_infos = []
+    for y in ys:
+        y2 = min(y + tile_size, pack_h)
+        y = max(y2 - tile_size, 0)
+        for x in xs:
+            x2 = min(x + tile_size, pack_w)
+            x = max(x2 - tile_size, 0)
+            tile_infos.append((y, x, y2, x2))
+
+    total_tiles = len(tile_infos)
+
+    # Tile-based processing with Hann window blending
+    out_tile_size = tile_size * upscale
+    ramp = np.hanning(out_tile_size).astype(np.float32)
+    w2d = np.outer(ramp, ramp)[np.newaxis, :, :]  # (1, tile_out, tile_out)
+
+    accum = np.zeros((3, out_h, out_w), dtype=np.float32)
+    weight = np.zeros((1, out_h, out_w), dtype=np.float32)
+
+    current = 0
+    for batch_start in range(0, total_tiles, batch_size):
+        batch_infos = tile_infos[batch_start:batch_start + batch_size]
+
+        # Extract and pad tiles for this batch
+        tiles = []
+        for y, x, y2, x2 in batch_infos:
+            tile = packed_chw[:, y:y2, x:x2].copy()
+            th, tw = tile.shape[1], tile.shape[2]
+            if th < tile_size or tw < tile_size:
+                tile = np.pad(
+                    tile,
+                    ((0, 0), (0, tile_size - th), (0, tile_size - tw)),
+                    mode='reflect',
+                )
+            tiles.append(tile.astype(np.float16))
+
+        # Batch inference
+        preds = _process_batch(session, tiles, wb_iso)
+
+        # Accumulate results
+        for idx, (y, x, y2, x2) in enumerate(batch_infos):
+            pred = preds[idx]
+            oph = min(pred.shape[1], (y2 - y) * upscale)
+            opw = min(pred.shape[2], (x2 - x) * upscale)
+            pred = pred[:, :oph, :opw]
+            wt = w2d[:, :oph, :opw]
+
+            oy, ox = y * upscale, x * upscale
+            accum[:, oy:oy + oph, ox:ox + opw] += pred * wt
+            weight[:, oy:oy + oph, ox:ox + opw] += wt
+
+            current += 1
+            if progress_callback:
+                progress_callback(current, total_tiles)
+
+    weight = np.maximum(weight, 1e-8)
+    result = accum / weight
+
+    elapsed = time.time() - t0
+    n_batches = (total_tiles + batch_size - 1) // batch_size
+    logger.info(
+        f"CANS denoise done in {elapsed:.1f}s "
+        f"({total_tiles} tiles, {n_batches} batches of {batch_size}, {_session_provider})"
+    )
+
+    out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0)
+    return _apply_flip(out, flip_code)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def is_available() -> bool:
-    """Check if the denoiser is available (model exists and ONNX Runtime is installed)."""
+    """Check if the CANS denoiser is available (models + ONNX Runtime)."""
     try:
         import onnxruntime
-        _get_model_path()
+        _find_model(BAYER_MODEL)
         return True
     except (ImportError, FileNotFoundError):
         return False
@@ -525,32 +640,25 @@ def is_available() -> bool:
 def get_provider_info() -> dict:
     """Get information about the current execution provider."""
     try:
-        session = _get_session()
+        session = _get_session('bayer')
         return {
             "available": True,
             "provider": session.get_providers()[0],
             "all_providers": session.get_providers(),
         }
     except Exception as e:
-        return {
-            "available": False,
-            "error": str(e),
-        }
+        return {"available": False, "error": str(e)}
 
 
 def clear_session():
-    """Clear the cached session and release GPU memory."""
-    global _session, _session_provider
-    if _session is not None:
-        # Delete the session first
-        del _session
-        _session = None
-        _session_provider = None
-        
-        # Force garbage collection to release GPU memory
-        import gc
-        gc.collect()
-        
-        logger.info("ONNX session cleared and GPU memory released")
-    else:
-        _session_provider = None
+    """Clear cached sessions and release GPU memory."""
+    global _session_bayer, _session_xtrans, _session_provider
+    for name, sess in [('bayer', _session_bayer), ('xtrans', _session_xtrans)]:
+        if sess is not None:
+            del sess
+            logger.info(f"CANS session ({name}) cleared")
+    _session_bayer = None
+    _session_xtrans = None
+    _session_provider = None
+    import gc
+    gc.collect()

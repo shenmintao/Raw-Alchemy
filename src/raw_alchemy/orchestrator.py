@@ -29,7 +29,7 @@ def process_path(
     flip_vertical: bool = False,
     crop: tuple = (0.0, 0.0, 1.0, 1.0),
     # Denoising
-    denoise_strength: float = 0.0,
+    denoise_enabled: bool = False,
     # Sharpening
     sharpen_strength: float = 0.0,
 ):
@@ -99,7 +99,7 @@ def process_path(
                     rotation=rotation,
                     flip_horizontal=flip_horizontal,
                     flip_vertical=flip_vertical,
-                    denoise_strength=denoise_strength,
+                    denoise_enabled=denoise_enabled,
                     sharpen_strength=sharpen_strength,
                 ): filename for filename in raw_files
             }
@@ -155,7 +155,7 @@ def process_path(
                 flip_horizontal=flip_horizontal,
                 flip_vertical=flip_vertical,
                 crop=crop,
-                denoise_strength=denoise_strength,
+                denoise_enabled=denoise_enabled,
                 sharpen_strength=sharpen_strength,
             )
         finally:

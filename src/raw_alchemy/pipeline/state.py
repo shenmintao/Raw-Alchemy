@@ -5,10 +5,10 @@ from typing import Optional
 
 class ImageState:
     """
-    Unified state for a single image. 
-    Replaces the mess of: original_pixmap_raw, original_pixmap_scaled, 
+    Unified state for a single image.
+    Replaces the mess of: original_pixmap_raw, original_pixmap_scaled,
     last_processed_pixmap, _last_processed_pixmap_full, etc.
-    
+
     Three states total:
     - original: RAW decoded image
     - current: processed with current params
@@ -18,18 +18,21 @@ class ImageState:
         self.full: Optional[QPixmap] = None
         self.display: Optional[QPixmap] = None
         self.float_data: Optional[np.ndarray] = None  # For histogram
-    
-    def update_full(self, pixmap: QPixmap, float_data: Optional[np.ndarray] = None):
+        self.uint8_data: Optional[np.ndarray] = None   # For GL viewport
+
+    def update_full(self, pixmap: QPixmap, float_data: Optional[np.ndarray] = None,
+                    uint8_data: Optional[np.ndarray] = None):
         """Update the full-size image and clear cached display version"""
         self.full = pixmap
         self.float_data = float_data
+        self.uint8_data = uint8_data
         self.display = None  # Invalidate cached display
-    
+
     def get_display(self, size: QSize) -> Optional[QPixmap]:
         """Get display-sized version, caching the result"""
         if not self.full:
             return None
-        
+
         if self.display is None:
             self.display = self.full.scaled(
                 size,
@@ -37,9 +40,10 @@ class ImageState:
                 Qt.TransformationMode.SmoothTransformation
             )
         return self.display
-    
+
     def clear(self):
         """Clear all cached data"""
         self.full = None
         self.display = None
         self.float_data = None
+        self.uint8_data = None

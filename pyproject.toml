@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0", "numpy", "numba"]
+requires = ["setuptools>=61.0", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "raw_alchemy_studio"
-version = "0.5.0"
-description = "Raw Alchemy Studio - A fast culling/grading tool that applies cinematic LUTs to RAW photos with mathematical precision."
+version = "0.6.0"
+description = "Raw Alchemy Studio - A fast culling/grading tool that applies cinematic LUTs to RAW photos with mathematical precision. Powered by Taichi Lang for GPU-accelerated image processing."
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [
@@ -26,8 +26,9 @@ dependencies = [
     "pyinstaller",
     "zstandard",
     "ordered-set",
-    "numba",
+    "taichi",
     "matplotlib",
+    "PyOpenGL",
     "PySide6-Fluent-Widgets",
     "Send2Trash",
     "packaging",
@@ -44,3 +45,17 @@ dependencies = [
 [project.scripts]
 raw-alchemy = "raw_alchemy.cli:main"
 raw-alchemy-gui = "raw_alchemy.main:main"
+
+[tool.setuptools.package-data]
+raw_alchemy = [
+    "locales/*.json",
+    "vendor/*.onnx",
+    "vendor/*.onnx.data",
+    "vendor/lensfun/lib/*.dll",
+    "vendor/lensfun/lib/*.so",
+    "vendor/lensfun/lib/*.dylib",
+    "vendor/lensfun/lib/*.lib",
+    "vendor/lensfun/bin/*",
+    "vendor/lensfun/share/lensfun/version_2/*.xml",
+    "vendor/lensfun/include/lensfun/*.h",
+]

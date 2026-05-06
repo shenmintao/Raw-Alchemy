@@ -38,7 +38,7 @@ class ProcessorParams(TypedDict, total=False):
     _preload: bool
     
     # New Features
-    denoise_strength: float
+    denoise_enabled: bool
     sharpen_strength: float
     viewport_size: Tuple[int, int]
     perspective_corners: Optional[list]

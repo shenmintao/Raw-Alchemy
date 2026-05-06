@@ -2,12 +2,15 @@ import sys
 import os
 import shutil
 import time
+import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QFileDialog, QListWidget, QListWidgetItem, QFrame,
     QSplitter, QSizePolicy, QGraphicsDropShadowEffect, QGridLayout,
-    QInputDialog, QMessageBox
+    QInputDialog, QMessageBox, QTreeView, QHeaderView
 )
+from PySide6.QtWidgets import QFileSystemModel as _QFileSystemModel
+from PySide6.QtCore import QDir
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QObject, QTimer, QEvent, QRect
 from PySide6.QtGui import QIcon, QPixmap, QImage, QPainter, QColor, QResizeEvent
 
@@ -37,6 +40,7 @@ from raw_alchemy.ui.widgets.crop_rotate_viewer import CropRotateViewer
 from raw_alchemy.ui.widgets.perspective_viewer import PerspectiveViewer
 from raw_alchemy.ui.widgets.help_panel import HelpPanel
 from raw_alchemy.ui.widgets.about_panel import AboutPanel
+from raw_alchemy.ui.viewport_gl import ImageViewportGL
 from raw_alchemy.ui.widgets.settings_panel import SettingsPanel
 from PySide6.QtWidgets import QStackedWidget
 
@@ -102,6 +106,7 @@ class MainWindow(FluentWindow):
         
         # Request tracking
         self.current_request_id = 0
+        self._suppress_gallery_change = False
         
         # 预加载lensfun数据库（在后台线程中）
         self._preload_lensfun_database()
@@ -131,7 +136,7 @@ class MainWindow(FluentWindow):
         # Processing Debounce
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
-        self.update_timer.setInterval(25) # 100ms debounce
+        self.update_timer.setInterval(150) # 150ms debounce
         self.update_timer.timeout.connect(self.trigger_processing)
         
         # Load saved settings
@@ -220,6 +225,44 @@ class MainWindow(FluentWindow):
         if self.last_lut_folder_path and os.path.exists(self.last_lut_folder_path):
             self.right_panel.lut_folder = self.last_lut_folder_path
             self.right_panel.refresh_lut_list()
+
+        # Folder restore is deferred to showEvent to ensure tree viewport is laid out
+        self._need_restore_folder = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, '_need_restore_folder', False):
+            self._need_restore_folder = False
+            if self.last_folder_path and os.path.exists(self.last_folder_path):
+                QTimer.singleShot(300, lambda: self._open_folder(self.last_folder_path))
+
+    def _on_directory_loaded(self, loaded_path):
+        """When a directory is loaded, check if we need to keep expanding towards the target."""
+        if not self._pending_scroll_path:
+            # New directories loading may shift layout — debounce a final scroll
+            if self._scroll_target_path:
+                self._scroll_debounce_timer.start()
+            return
+        norm_loaded = os.path.normpath(loaded_path).lower()
+        norm_target = os.path.normpath(self._pending_scroll_path).lower()
+
+        if norm_loaded == norm_target:
+            # Target directory loaded — select and scroll
+            target = self._pending_scroll_path
+            self._pending_scroll_path = None
+            self._expand_tree_to(target)
+        else:
+            # Check if loaded_path is an ancestor of target
+            # Use rstrip to handle drive roots like "C:\" correctly
+            norm_loaded_prefix = norm_loaded.rstrip(os.sep) + os.sep
+            if norm_target.startswith(norm_loaded_prefix):
+                # An ancestor was loaded — expand the next level towards target
+                remaining = os.path.normpath(self._pending_scroll_path)[len(norm_loaded_prefix):]
+                next_name = remaining.split(os.sep)[0]
+                next_path = os.path.join(loaded_path, next_name)
+                next_idx = self.folder_model.index(next_path)
+                if next_idx.isValid():
+                    self.folder_tree.expand(next_idx)
     
     def save_settings(self):
         """Save current application settings"""
@@ -263,13 +306,59 @@ class MainWindow(FluentWindow):
         except Exception:
             pass
         
-        # 1. Left Panel (Gallery)
+        # 1. Left Panel (Folder Tree + Gallery) — Bridge-style browser
         self.left_panel = QWidget()
         self.left_panel.setFixedWidth(400)
         self.left_panel.setStyleSheet("background-color: transparent;")
         self.left_layout = QVBoxLayout(self.left_panel)
         self.left_layout.setContentsMargins(5, 10, 5, 10)
-        
+
+        # --- Folder Tree ---
+        self.folder_model = _QFileSystemModel()
+        self.folder_model.setFilter(
+            QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot | QDir.Filter.AllDirs | QDir.Filter.Drives
+        )
+        self.folder_model.setRootPath("")
+        self._pending_scroll_path = None
+        self._scroll_target_path = None
+        self._scroll_debounce_timer = QTimer()
+        self._scroll_debounce_timer.setSingleShot(True)
+        self._scroll_debounce_timer.setInterval(500)
+        self._scroll_debounce_timer.timeout.connect(self._do_final_scroll)
+        self.folder_model.directoryLoaded.connect(self._on_directory_loaded)
+
+        self.folder_tree = QTreeView()
+        self.folder_tree.setModel(self.folder_model)
+        self.folder_tree.setRootIndex(self.folder_model.index(""))
+        # Only show the Name column
+        for col in range(1, self.folder_model.columnCount()):
+            self.folder_tree.hideColumn(col)
+        self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.setAnimated(True)
+        self.folder_tree.setIndentation(16)
+        self.folder_tree.clicked.connect(self._on_folder_tree_clicked)
+        self.folder_tree.setStyleSheet("""
+            QTreeView {
+                background-color: transparent;
+                border: none;
+                outline: none;
+                color: white;
+            }
+            QTreeView::item {
+                padding: 4px 2px;
+            }
+            QTreeView::item:selected {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+            QTreeView::item:hover {
+                background-color: rgba(255, 255, 255, 0.05);
+            }
+            QTreeView::branch {
+                background-color: transparent;
+            }
+        """)
+
+        # --- Gallery Thumbnail Grid ---
         self.gallery_list = QListWidget()
         self.gallery_list.setIconSize(QSize(130, 100))
         self.gallery_list.setGridSize(QSize(160, 140))
@@ -283,7 +372,7 @@ class MainWindow(FluentWindow):
         self.gallery_list.setDefaultDropAction(Qt.DropAction.IgnoreAction)
 
         self.gallery_list.itemClicked.connect(self.on_gallery_item_clicked)
-        self.gallery_list.currentItemChanged.connect(lambda current, prev: self.on_gallery_item_clicked(current))
+        self.gallery_list.currentItemChanged.connect(self._on_gallery_current_changed)
         self.gallery_list.setStyleSheet("""
             QListWidget {
                 background-color: transparent;
@@ -303,18 +392,40 @@ class MainWindow(FluentWindow):
                 background-color: rgba(255, 255, 255, 0.05);
             }
         """)
-        
+
         self.open_btn = PrimaryPushButton(FIF.FOLDER, tr('open_folder'))
         self.open_btn.clicked.connect(self.browse_folder)
-        
+
         self.loading_label = CaptionLabel("")
         self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.loading_label.hide()
-        
-        self.left_layout.addWidget(SubtitleLabel(tr('library')))
-        self.left_layout.addWidget(self.gallery_list)
-        self.left_layout.addWidget(self.loading_label)
-        self.left_layout.addWidget(self.open_btn)
+
+        # --- Splitter: Folder Tree (top) | Gallery (bottom) ---
+        self.left_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.left_splitter.setStyleSheet("QSplitter::handle { background-color: rgba(255,255,255,0.08); height: 3px; }")
+
+        # Top: folder tree
+        tree_container = QWidget()
+        tree_layout = QVBoxLayout(tree_container)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_layout.setSpacing(4)
+        tree_layout.addWidget(SubtitleLabel(tr('library')))
+        tree_layout.addWidget(self.folder_tree)
+        tree_layout.addWidget(self.open_btn)
+
+        # Bottom: gallery thumbnails
+        gallery_container = QWidget()
+        gallery_layout = QVBoxLayout(gallery_container)
+        gallery_layout.setContentsMargins(0, 0, 0, 0)
+        gallery_layout.setSpacing(4)
+        gallery_layout.addWidget(self.gallery_list)
+        gallery_layout.addWidget(self.loading_label)
+
+        self.left_splitter.addWidget(tree_container)
+        self.left_splitter.addWidget(gallery_container)
+        self.left_splitter.setSizes([250, 400])
+
+        self.left_layout.addWidget(self.left_splitter)
         
         # 2. Center Panel (Preview Stack)
         self.center_panel = QWidget()
@@ -328,12 +439,20 @@ class MainWindow(FluentWindow):
         self.preview_layout = QVBoxLayout(self.page_preview)
         self.preview_layout.setContentsMargins(10, 10, 10, 10)
         
+        # OpenGL Viewport for GPU-accelerated image display
+        self.viewport = ImageViewportGL()
+        self.viewport.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.viewport.compare_pressed.connect(self.show_original)
+        self.viewport.compare_released.connect(self.show_processed)
+        self.viewport.viewport_resized.connect(self._sync_preview_label_geometry)
+
+        # Overlay label for status text (on top of viewport)
         self.preview_lbl = QLabel(tr('no_image_selected'))
         self.preview_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_lbl.setStyleSheet("background-color: #202020; border-radius: 8px; color: white;")
-        self.preview_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.preview_lbl.mousePressEvent = self.show_original
-        self.preview_lbl.mouseReleaseEvent = self.show_processed
+        self.preview_lbl.setStyleSheet("background-color: transparent; color: white; font-size: 16px;")
+        self.preview_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.preview_lbl.setParent(self.viewport)
+        self.preview_lbl.raise_()
         
         self.toolbar = QFrame()
         self.toolbar.setFixedHeight(60)
@@ -362,8 +481,8 @@ class MainWindow(FluentWindow):
         self.export_progress.setTextVisible(True)
         self.export_progress.hide()
 
-        self.btn_compare.pressed.connect(lambda: self.show_original(None))
-        self.btn_compare.released.connect(lambda: self.show_processed(None))
+        self.btn_compare.pressed.connect(self.show_original)
+        self.btn_compare.released.connect(self.show_processed)
         
         self.toolbar_layout.addWidget(self.btn_prev)
         self.toolbar_layout.addWidget(self.btn_next)
@@ -376,7 +495,7 @@ class MainWindow(FluentWindow):
         self.toolbar_layout.addWidget(self.btn_export_curr)
         self.toolbar_layout.addWidget(self.btn_export_all)
         
-        self.preview_layout.addWidget(self.preview_lbl)
+        self.preview_layout.addWidget(self.viewport)
         self.preview_layout.addWidget(self.toolbar)
         
         # --- Page 2: Crop Viewer ---
@@ -426,6 +545,26 @@ class MainWindow(FluentWindow):
         self.settings_widget.setObjectName("settingsInterface")
         self.addSubInterface(self.settings_widget, FIF.SETTING, tr('settings'))
 
+    def changeEvent(self, event):
+        """Track window minimize/restore to suppress spurious gallery signals."""
+        if event.type() == QEvent.Type.WindowStateChange:
+            old_minimized = bool(event.oldState() & Qt.WindowState.WindowMinimized)
+            new_minimized = bool(self.windowState() & Qt.WindowState.WindowMinimized)
+            if old_minimized and not new_minimized:
+                # Restoring from minimize — suppress currentItemChanged briefly
+                self._suppress_gallery_change = True
+                QTimer.singleShot(500, self._unsuppress_gallery_change)
+        super().changeEvent(event)
+
+    def _unsuppress_gallery_change(self):
+        self._suppress_gallery_change = False
+
+    def _on_gallery_current_changed(self, current, prev):
+        """Wrapper that suppresses gallery changes during minimize/restore."""
+        if getattr(self, '_suppress_gallery_change', False):
+            return
+        self.on_gallery_item_clicked(current)
+
     def eventFilter(self, obj, event):
         if isinstance(obj, QWidget) and obj.window() == self:
             if event.type() == QEvent.Type.KeyPress:
@@ -438,7 +577,7 @@ class MainWindow(FluentWindow):
                     return True
                 elif key == Qt.Key.Key_Space:
                     if not event.isAutoRepeat():
-                        self.show_original(None)
+                        self.show_original()
                     return True
                 elif key == Qt.Key.Key_Delete:
                     self.delete_image()
@@ -449,7 +588,7 @@ class MainWindow(FluentWindow):
             elif event.type() == QEvent.Type.KeyRelease:
                 if event.key() == Qt.Key.Key_Space:
                     if not event.isAutoRepeat():
-                        self.show_processed(None)
+                        self.show_processed()
                     return True
         return super().eventFilter(obj, event)
 
@@ -457,10 +596,88 @@ class MainWindow(FluentWindow):
         start_dir = self.last_folder_path if self.last_folder_path and os.path.exists(self.last_folder_path) else ""
         folder = QFileDialog.getExistingDirectory(self, tr('select_folder'), start_dir)
         if folder:
-            self.current_folder = folder
-            self.last_folder_path = folder
-            self.gallery_list.clear()
-            self.start_thumbnail_scan(folder)
+            self._open_folder(folder)
+
+    def _on_folder_tree_clicked(self, index):
+        """Handle folder tree click — load thumbnails for selected directory"""
+
+        path = self.folder_model.filePath(index)
+        if path and os.path.isdir(path):
+            self._open_folder(path)
+
+    def _open_folder(self, folder):
+        """Open a folder: update state, sync tree selection, scan thumbnails"""
+        self.current_folder = folder
+        self.last_folder_path = folder
+        self.gallery_list.clear()
+
+        # Start chain-expansion: expand root ancestor, directoryLoaded will chain the rest
+        self._pending_scroll_path = folder
+        idx = self.folder_model.index(folder)
+        if idx.isValid():
+            ancestors = []
+            p = idx.parent()
+            while p.isValid():
+                ancestors.append(p)
+                p = p.parent()
+            if ancestors:
+                # Expand all ancestors from root towards target
+                for ancestor in reversed(ancestors):
+                    self.folder_tree.expand(ancestor)
+                # If ancestors were already loaded, directoryLoaded won't fire again,
+                # so use a fallback timer to finalize the selection
+                QTimer.singleShot(100, lambda f=folder: self._try_finalize_tree_selection(f))
+            else:
+                # Target is already at root level
+                self._pending_scroll_path = None
+                self._expand_tree_to(folder)
+        else:
+            # Index not yet valid (model still loading) — kick-start chain from drive root
+            drive = os.path.splitdrive(folder)[0]
+            if drive:
+                root_path = drive + os.sep
+                root_idx = self.folder_model.index(root_path)
+                if root_idx.isValid():
+                    self.folder_tree.expand(root_idx)
+            # directoryLoaded will chain-expand towards _pending_scroll_path
+
+        self.start_thumbnail_scan(folder)
+
+    def _try_finalize_tree_selection(self, folder):
+        """Fallback: if chain expansion via directoryLoaded didn't reach the target
+        (because ancestors were already loaded/expanded), select directly."""
+        if self._pending_scroll_path == folder:
+            self._pending_scroll_path = None
+            self._expand_tree_to(folder)
+
+    def _expand_tree_to(self, folder):
+        """Expand the folder tree view to show and select the given folder path."""
+        idx = self.folder_model.index(folder)
+        if not idx.isValid():
+            return
+        # Collect ancestors from root down
+        ancestors = []
+        p = idx.parent()
+        while p.isValid():
+            ancestors.append(p)
+            p = p.parent()
+        # Expand from root towards target
+        for ancestor in reversed(ancestors):
+            self.folder_tree.expand(ancestor)
+        self.folder_tree.setCurrentIndex(idx)
+        # Don't scrollTo now — directories are still loading and will shift layout.
+        # Set scroll target and start debounce; final scroll happens when loading settles.
+        self._scroll_target_path = folder
+        self._scroll_debounce_timer.start()
+
+    def _do_final_scroll(self):
+        """Scroll to target folder after directory loading has settled (debounced)."""
+        if not self._scroll_target_path:
+            return
+        idx = self.folder_model.index(self._scroll_target_path)
+        if idx.isValid():
+            self.folder_tree.scrollTo(idx, QTreeView.ScrollHint.PositionAtCenter)
+        self._scroll_target_path = None
 
     def start_thumbnail_scan(self, folder):
         if self.thumb_worker:
@@ -595,34 +812,21 @@ class MainWindow(FluentWindow):
         # effectively masking the lag while the processor works in background
         try:
             if self.crop_viewer.display_pixmap:
-                # 1. Get the full rotated image
                 full_pix = self.crop_viewer.display_pixmap
                 w = full_pix.width()
                 h = full_pix.height()
-                
-                # 2. Calculate crop rect in pixels
                 cx, cy, cw, ch = self.crop_viewer.crop_rect
                 px = int(cx * w)
                 py = int(cy * h)
                 pw = int(cw * w)
                 ph = int(ch * h)
-                
-                # 3. Sanity check
                 if pw > 0 and ph > 0:
-                    # 4. Crop
                     temp_preview = full_pix.copy(px, py, pw, ph)
-                    
-                    # 5. Scale to preview label size for display
-                    # Use SmoothTransformation and KeepAspectRatio to match normal behavior
-                    # This prevents the window from resizing if the crop is larger than the viewport
-                    scaled_preview = temp_preview.scaled(
-                        self.preview_lbl.size(),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation
-                    )
-                    
-                    self.preview_lbl.setPixmap(scaled_preview)
-                    # self.preview_lbl.setText("") # Clear text if any
+                    # Convert QPixmap to numpy uint8 for GL viewport
+                    qimg = temp_preview.toImage().convertToFormat(QImage.Format.Format_RGB888)
+                    ptr = qimg.bits()
+                    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(qimg.height(), qimg.width(), 3).copy()
+                    self.viewport.set_image(arr)
         except Exception as e:
             logger.warning(f"Failed to generate temp preview: {e}")
 
@@ -787,6 +991,7 @@ class MainWindow(FluentWindow):
 
     def load_image(self, path):
         self.preview_lbl.setText(tr('loading'))
+        self.viewport.clear_image()
         self.current_request_id = self.processor.load_image(path)
         
     def on_param_changed(self, params):
@@ -795,9 +1000,7 @@ class MainWindow(FluentWindow):
     def trigger_processing(self):
         if not self.current_raw_path: return
         params = self.right_panel.get_params()
-        # Pass viewport size for view-based LUT optimization
-        size = self.preview_lbl.size()
-        params['viewport_size'] = (size.width(), size.height())
+        size = self.viewport.size()
         params['viewport_size'] = (size.width(), size.height())
         self.current_request_id = self.processor.update_preview(self.current_raw_path, params)
     
@@ -805,39 +1008,38 @@ class MainWindow(FluentWindow):
         if not self.current_raw_path: return
         current_params = self.right_panel.get_params()
         self.file_baseline_params_cache[self.current_raw_path] = current_params.copy()
-        
-        if self.processor.cached_linear is not None:
-            self.baseline_processor.cached_linear = self.processor.cached_linear
-            self.baseline_processor.cached_corrected = self.processor.cached_corrected
-            self.baseline_processor.cached_lens_key = self.processor.cached_lens_key
-            self.baseline_processor.exif_data = self.processor.exif_data
-            self.baseline_processor.current_path = self.current_raw_path
+
+        if self.processor.cpu_linear is not None:
+            # Share CPU cache so baseline processor can load from it
+            self.baseline_processor.cache_manager = self.processor.cache_manager
             self.baseline_processor.update_preview(self.current_raw_path, current_params)
-        
+
         InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
     
         
-    def on_baseline_result(self, img_uint8, img_float, image_path, request_id):
+    def on_baseline_result(self, img_uint8, image_path, request_id, applied_ev):
         if image_path != self.current_raw_path: return
         h, w, c = img_uint8.shape
         qimg = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg.copy())
-        self.baseline.update_full(pixmap, img_float)
+        self.baseline.update_full(pixmap, None, img_uint8.copy())
     
     def regenerate_baseline_for_current_image(self):
         if not self.current_raw_path or self.current_raw_path not in self.file_baseline_params_cache: return
-        if self.processor.cached_linear is None: return
-        
+        if not self.processor.cpu_linear is not None: return
+
         baseline_params = self.file_baseline_params_cache[self.current_raw_path]
-        self.baseline_processor.cached_linear = self.processor.cached_linear
-        self.baseline_processor.cached_corrected = self.processor.cached_corrected
-        self.baseline_processor.cached_lens_key = self.processor.cached_lens_key
-        self.baseline_processor.exif_data = self.processor.exif_data
-        self.baseline_processor.current_path = self.current_raw_path
+        self.baseline_processor.cache_manager = self.processor.cache_manager
         self.baseline_processor.update_preview(self.current_raw_path, baseline_params)
 
-    def on_process_result(self, img_uint8, img_float, image_path, request_id, applied_ev):
+    def on_process_result(self, img_uint8, image_path, request_id, applied_ev):
         """Handle processing result"""
+        # Close denoise/processing progress dialog
+        if self.denoise_progress_dialog:
+            self.denoise_progress_dialog.setContent(tr('done'))
+            self.denoise_progress_dialog.setState(True)
+            self.denoise_progress_dialog = None
+
         if image_path != self.current_raw_path:
             return
 
@@ -857,50 +1059,49 @@ class MainWindow(FluentWindow):
         h, w, c = img_uint8.shape
         img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(img)
-        
+
         # Update Thumbnail
         for i in range(self.gallery_list.count()):
             item = self.gallery_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == image_path:
-                # Align with ThumbnailWorker: scale to height 300, preserve aspect ratio, no padding.
-                # This prevents the thumbnail from shrinking/changing layout when updated.
-                scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.SmoothTransformation)
+                scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
                 item.setIcon(QIcon(scaled))
-                
-                # Force repaint of the item area to prevent ghosting artifacts
-                # when aspect ratio changes (e.g. rotation) on a transparent background
                 rect = self.gallery_list.visualItemRect(item)
                 self.gallery_list.viewport().update(rect)
                 break
-        
+
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
-        
-        self.current.update_full(pixmap, img_float.copy())
-        # Update params cache to current state
+
+        self.current.update_full(pixmap, None, img_uint8.copy())
         if self.current_raw_path:
              self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
-        
+
         if self.original.full is None:
-            self.original.update_full(pixmap.copy(), img_float.copy())
-        
+            self.original.update_full(pixmap.copy(), None, img_uint8.copy())
+
         if self.right_panel.auto_exp_radio.isChecked():
             self.right_panel.auto_ev_value = applied_ev
             try:
                 self.right_panel.exp_slider.valueChanged.disconnect(self.right_panel.exp_slider_callback)
             except (TypeError, RuntimeError):
-                pass  # 信号未连接或已断开
+                pass
             self.right_panel.exp_slider.setValue(int(applied_ev * 10))
             self.right_panel.exp_slider.update()
             self.right_panel.exp_value_label.setText(f"{tr('exposure_ev')}: {applied_ev:+.1f}")
             self.right_panel.exp_slider.valueChanged.connect(self.right_panel.exp_slider_callback)
-        
-        display_pixmap = self.current.get_display(self.preview_lbl.size())
-        if display_pixmap:
-            self.preview_lbl.setPixmap(display_pixmap)
-            self.preview_lbl.update()
-        
-        self.right_panel.hist_widget.update_data(img_float)
-        self.right_panel.waveform_widget.update_data(img_float)
+
+        # Display via OpenGL viewport (priority — show image first)
+        self.viewport.set_image(img_uint8)
+        self.preview_lbl.setText("")
+
+        # Defer histogram/waveform to next event loop iteration (async)
+        img_for_hist = img_uint8
+        QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+
+    def _update_histogram_async(self, img_uint8):
+        """Deferred histogram/waveform update — runs after viewport display."""
+        self.right_panel.hist_widget.update_data(img_uint8)
+        self.right_panel.waveform_widget.update_data(img_uint8)
 
     def on_load_complete(self, image_path, request_id):
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
@@ -912,9 +1113,7 @@ class MainWindow(FluentWindow):
     def _trigger_processing_for_path(self, path):
         if path != self.current_raw_path: return
         params = self.right_panel.get_params()
-        # Pass viewport size for view-based LUT optimization
-        size = self.preview_lbl.size()
-        params['viewport_size'] = (size.width(), size.height())
+        size = self.viewport.size()
         params['viewport_size'] = (size.width(), size.height())
         self.current_request_id = self.processor.update_preview(path, params)
 
@@ -1019,35 +1218,47 @@ class MainWindow(FluentWindow):
                 except Exception as e2:
                     InfoBar.error(tr('delete_failed'), str(e2), parent=self)
 
-    def show_original(self, event):
+    def show_original(self):
         img_to_show = self.baseline if self.baseline.full else self.original
         if not img_to_show.full: return
-        display_pixmap = img_to_show.get_display(self.preview_lbl.size())
-        if display_pixmap: self.preview_lbl.setPixmap(display_pixmap)
+        if img_to_show.uint8_data is not None:
+            self.viewport.set_image(img_to_show.uint8_data)
         InfoBar.info(tr('compare_showing_baseline'), "", parent=self)
 
-    def show_processed(self, event):
+    def show_processed(self):
         if not self.current.full:
-            if self.original.full:
-                display_pixmap = self.original.get_display(self.preview_lbl.size())
-                if display_pixmap: self.preview_lbl.setPixmap(display_pixmap)
+            if self.original.uint8_data is not None:
+                self.viewport.set_image(self.original.uint8_data)
             return
-        display_pixmap = self.current.get_display(self.preview_lbl.size())
-        if display_pixmap: self.preview_lbl.setPixmap(display_pixmap)
+        if self.current.uint8_data is not None:
+            self.viewport.set_image(self.current.uint8_data)
 
     def export_current(self):
         if not self.current_raw_path: return
         base = os.path.splitext(os.path.basename(self.current_raw_path))[0]
         start_dir = self.last_export_path if self.last_export_path else (self.last_folder_path if self.last_folder_path else "")
         default_path = os.path.join(start_dir, base) if start_dir else base
-        
+
         path, _ = QFileDialog.getSaveFileName(self, tr('export_image'), default_path, "JPEG (*.jpg);;HEIF (*.heif);;TIFF (*.tif);;DNG (*.dng)")
-        
+
         if path:
             self.last_export_path = os.path.dirname(path)
             self.saving_infobar = InfoBar.info(tr('saving'), tr('saving_image'), duration=-1, parent=self)
             self.btn_export_curr.setEnabled(False)
-            self.run_export(self.current_raw_path, path, is_single_export=True)
+
+            # Try to reuse cached data from preview pipeline
+            # (cpu_corrected already includes demosaic + denoise + lens correction)
+            cached_data = self.processor.get_cached_for_export()
+            if cached_data is not None:
+                self.run_export(
+                    self.current_raw_path, path,
+                    is_single_export=True,
+                    cached_img=cached_data['corrected'],
+                    cached_exif_data=cached_data.get('exif_data'),
+                    cached_exif_metadata=cached_data.get('exif_metadata'),
+                )
+            else:
+                self.run_export(self.current_raw_path, path, is_single_export=True)
 
     def export_all(self):
         if not self.marked_files:
@@ -1112,44 +1323,74 @@ class MainWindow(FluentWindow):
         self.batch_export_idx += 1
         self.run_export(input_path, output_path, params=params, callback=self.batch_export_next)
 
-    def run_export(self, input_path, output_path, params=None, callback=None, is_single_export=False):
+    def run_export(self, input_path, output_path, params=None, callback=None,
+                   is_single_export=False, cached_img=None, cached_exif_data=None,
+                   cached_exif_metadata=None):
         p = params if params else self.right_panel.get_params()
-        
+
         ext = os.path.splitext(output_path)[1].lower().replace('.', '')
         if ext not in ['jpg', 'heif', 'tif', 'tiff', 'dng']: ext = 'jpg'
-        
+
+        # Capture cached references for the closure
+        _cached_img = cached_img
+        _cached_exif_data = cached_exif_data
+        _cached_exif_metadata = cached_exif_metadata
+
         class ExportThread(QThread):
             finished_sig = Signal(bool, str)
             def run(self):
                 try:
-                    orchestrator.process_path(
-                        input_path=input_path,
-                        output_path=output_path,
-                        log_space=p.get('log_space'),
-                        lut_path=p.get('lut_path'),
-                        exposure=p.get('exposure', 0.0),
-                        lens_correct=p.get('lens_correct', True),
-                        custom_db_path=p.get('custom_db_path'),
-                        metering_mode=p.get('metering_mode', 'matrix'),
-                        jobs=1,
-                        logger_func=lambda msg: None,
-                        output_format=ext,
-                        wb_temp=p.get('wb_temp', 0.0),
-                        wb_tint=p.get('wb_tint', 0.0),
-                        saturation=p.get('saturation', 1.0),
-                        contrast=p.get('contrast', 1.0),
-                        highlight=p.get('highlight', 0.0),
-                        shadow=p.get('shadow', 0.0),
-                        # Geometry
-                        rotation=p.get('rotation', 0),
-                        flip_horizontal=p.get('flip_horizontal', False),
-                        flip_vertical=p.get('flip_vertical', False),
-                        crop=p.get('crop', (0.0, 0.0, 1.0, 1.0)),
-                        # Denoising
-                        denoise_strength=p.get('denoise_strength', 0.0),
-                        # Sharpening
-                        sharpen_strength=p.get('sharpen_strength', 0.0),
-                    )
+                    if _cached_img is not None:
+                        # Fast path: reuse preview cache (skip demosaic + lens + denoise)
+                        from raw_alchemy.core import export_from_cache
+                        export_from_cache(
+                            cached_img=_cached_img,
+                            output_path=output_path,
+                            exif_data=_cached_exif_data,
+                            exif_metadata=_cached_exif_metadata,
+                            log_space=p.get('log_space'),
+                            lut_path=p.get('lut_path'),
+                            exposure=p.get('exposure', 0.0),
+                            metering_mode=p.get('metering_mode', 'matrix'),
+                            wb_temp=p.get('wb_temp', 0.0),
+                            wb_tint=p.get('wb_tint', 0.0),
+                            saturation=p.get('saturation', 1.0),
+                            contrast=p.get('contrast', 1.0),
+                            highlight=p.get('highlight', 0.0),
+                            shadow=p.get('shadow', 0.0),
+                            rotation=p.get('rotation', 0),
+                            flip_horizontal=p.get('flip_horizontal', False),
+                            flip_vertical=p.get('flip_vertical', False),
+                            crop=p.get('crop', (0.0, 0.0, 1.0, 1.0)),
+                            sharpen_strength=p.get('sharpen_strength', 0.0),
+                        )
+                    else:
+                        # Full path: read RAW from scratch
+                        orchestrator.process_path(
+                            input_path=input_path,
+                            output_path=output_path,
+                            log_space=p.get('log_space'),
+                            lut_path=p.get('lut_path'),
+                            exposure=p.get('exposure', 0.0),
+                            lens_correct=p.get('lens_correct', True),
+                            custom_db_path=p.get('custom_db_path'),
+                            metering_mode=p.get('metering_mode', 'matrix'),
+                            jobs=1,
+                            logger_func=lambda msg: None,
+                            output_format=ext,
+                            wb_temp=p.get('wb_temp', 0.0),
+                            wb_tint=p.get('wb_tint', 0.0),
+                            saturation=p.get('saturation', 1.0),
+                            contrast=p.get('contrast', 1.0),
+                            highlight=p.get('highlight', 0.0),
+                            shadow=p.get('shadow', 0.0),
+                            rotation=p.get('rotation', 0),
+                            flip_horizontal=p.get('flip_horizontal', False),
+                            flip_vertical=p.get('flip_vertical', False),
+                            crop=p.get('crop', (0.0, 0.0, 1.0, 1.0)),
+                            denoise_enabled=p.get('denoise_enabled', False),
+                            sharpen_strength=p.get('sharpen_strength', 0.0),
+                        )
                     self.finished_sig.emit(True, "")
                 except Exception as e:
                     self.finished_sig.emit(False, str(e))
@@ -1175,22 +1416,13 @@ class MainWindow(FluentWindow):
         self.export_thread.finished_sig.connect(on_finish)
         self.export_thread.start()
 
+    def _sync_preview_label_geometry(self, w=None, h=None):
+        if hasattr(self, 'preview_lbl') and hasattr(self, 'viewport'):
+            self.preview_lbl.setGeometry(0, 0, self.viewport.width(), self.viewport.height())
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.original.display = None
-        self.current.display = None
-        self.baseline.display = None
-        if not hasattr(self, 'resize_timer'):
-            self.resize_timer = QTimer()
-            self.resize_timer.setSingleShot(True)
-            self.resize_timer.setInterval(25)
-            self.resize_timer.timeout.connect(self._on_resize_complete)
-        self.resize_timer.start()
-
-    def _on_resize_complete(self):
-        if self.current.full:
-            display_pixmap = self.current.get_display(self.preview_lbl.size())
-            if display_pixmap: self.preview_lbl.setPixmap(display_pixmap)
+        self._sync_preview_label_geometry()
 
     def on_denoise_started(self):
         """Called when denoising starts - show progress dialog"""
@@ -1216,11 +1448,10 @@ class MainWindow(FluentWindow):
             )
     
     def on_denoise_finished(self):
-        """Called when denoising finishes - hide progress dialog"""
+        """Called when denoising finishes - keep dialog showing pipeline progress"""
         if self.denoise_progress_dialog:
-            self.denoise_progress_dialog.setContent(tr('done'))
-            self.denoise_progress_dialog.setState(True)
-            self.denoise_progress_dialog = None
+            self.denoise_progress_dialog.setTitle(tr('processing'))
+            self.denoise_progress_dialog.setContent(tr('denoise_done_processing'))
 
     def closeEvent(self, event):
         self.save_settings()
@@ -1228,7 +1459,7 @@ class MainWindow(FluentWindow):
             self.thumb_worker.stop()
             self.thumb_worker.quit()
             self.thumb_worker.wait()
-        if self.processor.isRunning():
-            self.processor.quit()
-            self.processor.wait()
+        self.processor.stop_and_cleanup()
+        if hasattr(self, 'baseline_processor'):
+            self.baseline_processor.stop_and_cleanup()
         super().closeEvent(event)

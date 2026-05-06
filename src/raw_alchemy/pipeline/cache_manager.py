@@ -8,10 +8,11 @@ class CachedImage:
     """
     Container for cached image data
     """
-    def __init__(self, path: str, linear_data: np.ndarray, exif_data: Any, lens_key: Any, corrected_data: Optional[np.ndarray] = None):
+    def __init__(self, path: str, linear_data: np.ndarray, exif_data: Any, lens_key: Any, corrected_data: Optional[np.ndarray] = None, exif_metadata: Any = None):
         self.path = path
         self.linear_data = linear_data
         self.exif_data = exif_data
+        self.exif_metadata = exif_metadata
         self.lens_key = lens_key
         self.corrected_data = corrected_data
         

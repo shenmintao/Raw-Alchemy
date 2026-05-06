@@ -9,10 +9,7 @@ from PIL import Image
 import pillow_heif
 from typing import List, Optional
 from raw_alchemy.logger import Logger
-from raw_alchemy.exif import (
-    write_exif as _write_exif,
-    write_exif_from_dict as _write_exif_from_dict,
-)
+import pyexiv2
 
 def save_image(
     img: np.ndarray,
@@ -24,7 +21,7 @@ def save_image(
 ) -> bool:
     """
     保存图像到指定路径，根据扩展名自动选择格式
-
+    
     Args:
         img: 图像数据 (float32, 0.0-1.0)
         output_path: 输出路径
@@ -32,50 +29,55 @@ def save_image(
         exif_metadata: 完整的元数据字典 {'exif', 'iptc', 'xmp'} (代替之前的 pyexiv2.Image 对象)
         exif_dict: 从 rawpy 提取的 EXIF 数据字典，当 exif_metadata 写入失败或不可用时降级使用
 
-
+    
     Returns:
         bool: 是否保存成功
     """
     if logger is None:
         from .logger import create_logger
         logger = create_logger()
-
+    
     # 确保数据在有效范围内
     np.clip(img, 0.0, 1.0, out=img)
-
+    
     file_ext = os.path.splitext(output_path)[1].lower()
-
-    # 某些格式不适合用 pyexiv2 写入完整元数据：
-    # - TIFF: 不复制 RAW 的完整 EXIF/IPTC/XMP。RAW 元数据里可能带有
-    #   CFA/DNG 专用标签、MakerNote 偏移、缩略图引用、SubIFD/其他 TIFF 结构标签；
-    #   这些内容移植到新生成的 RGB TIFF 后，可能破坏 IFD 结构，导致 Photoshop
-    #   等严格解析器无法打开。所以 TIFF 仅保留基础 EXIF 的降级写入。
-    # - DNG: 避免完整 EXIF 注入破坏 IFD 结构
-    allow_full_exif_write = True
+    
+    # 标记是否已经处理了 EXIF (DNG 内部处理，不需要后续 pyexiv2 介入)
+    exif_handled_internally = False
 
     try:
         if file_ext in ['.tif', '.tiff']:
             _save_tiff(img, output_path, logger)
-            allow_full_exif_write = False
         elif file_ext == '.dng':
             _save_dng(img, output_path, color_matrix, logger)
-            allow_full_exif_write = False
+            exif_handled_internally = True  # 【重要】DNG 格式已在保存时写入了必要标签
         elif file_ext in ['.heic', '.heif']:
             _save_heif(img, output_path, logger)
         else:
             _save_jpeg_or_other(img, output_path, file_ext, logger)
+        
+        # 【修改逻辑】只有非 DNG 格式才使用 pyexiv2 写入 EXIF
+        # 因为 pyexiv2 修改 DNG 会导致 "Multiple IFDs" 结构错误
+        # 【PR #23 修复】TIFF 也不能写完整 EXIF（CFA/MakerNote 标签会损坏 IFD 结构）
+        allow_full_exif = not exif_handled_internally and file_ext not in ['.tif', '.tiff']
+        if not exif_handled_internally:
+            exif_written = False
+            if exif_metadata and allow_full_exif:
+                exif_written = _write_exif(output_path, exif_metadata, logger)
 
-        exif_written = False
-        if allow_full_exif_write and exif_metadata:
-            exif_written = _write_exif(output_path, exif_metadata, logger)
-
-        # 如果完整 EXIF 不适用或写入失败，则尝试降级写入基础 EXIF
-        if not exif_written and exif_dict:
+            # 如果主要 EXIF 写入失败或被跳过（TIFF），降级写入基础标签
+            if not exif_written and exif_dict:
+                if not allow_full_exif:
+                    logger.info("  ℹ️  TIFF format: using basic EXIF only (full EXIF skipped)")
+                else:
+                    logger.info("  ⚠️  Falling back to basic EXIF writing from dictionary...")
+                _write_exif_from_dict(output_path, exif_dict, logger)
+        else:
             _write_exif_from_dict(output_path, exif_dict, logger)
-
+        
         logger.info(f"  ✅ Saved: {output_path}")
         return True
-
+        
     except Exception as e:
         logger.error(f"  ❌ Failed to save file: {e}")
         import traceback
@@ -87,7 +89,7 @@ def _save_tiff(img: np.ndarray, output_path: str, logger: Logger):
     """保存为 16-bit TIFF 格式"""
     logger.info("    Format: TIFF (16-bit, ZLIB Optimized)")
     output_image_uint16 = (img * 65535).astype(np.uint16)
-
+    
     tifffile.imwrite(
         output_path,
         output_image_uint16,
@@ -102,7 +104,7 @@ def _save_heif(img: np.ndarray, output_path: str, logger: Logger):
     """保存为 10-bit HEIF 格式"""
     logger.info("    Format: HEIF (10-bit, High Quality)")
     output_image_uint16 = (img * 65535).astype(np.uint16)
-
+    
     heif_file = pillow_heif.from_bytes(
         mode='RGB;16',
         size=(output_image_uint16.shape[1], output_image_uint16.shape[0]),
@@ -115,15 +117,15 @@ def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):
     """保存为 16-bit DNG 格式 (Adobe Digital Negative)"""
     logger.info("    Format: DNG (16-bit, Linear Raw)")
     output_image_uint16 = (img * 65535).astype(np.uint16)
-
+    
     # 34892 = LinearRaw (表示数据是线性的且已去马赛克)
     photometric = 34892
-
+    
     # DNG 基础标签
     dng_version = [1, 4, 0, 0]
     dng_backward_version = [1, 2, 0, 0]
     camera_model = "Raw Alchemy"
-
+    
     # WhiteLevel: 16-bit 满量程
     white_level = (1 << 16) - 1
     black_level = [0, 0, 0] # RGB 三通道的黑电平
@@ -142,7 +144,7 @@ def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):
     matrix_rational = []
     for v in matrix_xyz:
         matrix_rational.extend([int(v * 10000), 10000])
-
+    
     calibration_illuminant1 = 21 # D65
 
     # TIFF Data Types (使用整数代码以兼容不同版本的 tifffile)
@@ -159,12 +161,12 @@ def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):
     baseline_exposure_offset_value = [0, 1] # 0.0 EV
 
     profile_name = "Linear Flat"
-
+    
     # ProfileToneCurve: 定义一条直线 (0.0->0.0, 1.0->1.0)
     # 这会覆盖 Adobe 默认的强对比曲线
     # 格式: [Input1, Output1, Input2, Output2] (浮点数)
     profile_tone_curve = [0.0, 0.0, 1.0, 1.0]
-
+    
     # ProfileEmbedPolicy: 允许复制和使用此配置
     profile_embed_policy = [0]
 
@@ -176,7 +178,7 @@ def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):
     # 注意: Tags 必须按 ID 升序排列
     extratags = [
         (254, TIFF_LONG, 1, 0),                        # NewSubfileType (Main Image)
-        (274, TIFF_SHORT, 1, 1),                       # Orientation (TopLeft)
+        (274, TIFF_SHORT, 1, 1),                       # Orientation (TopLeft) 
         (50706, TIFF_BYTE, 4, dng_version),            # DNGVersion
         (50707, TIFF_BYTE, 4, dng_backward_version),   # DNGBackwardVersion
         (50708, TIFF_ASCII, len(camera_model)+1, camera_model), # UniqueCameraModel
@@ -198,7 +200,7 @@ def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):
     # 使用无损压缩以保持图像质量 (虽然用户建议 compression=None，但 dng 通常可以接受无损压缩，先保持基本兼容性)
     # 若要完全匹配用户建议，可移除 comparison
     # 考虑到文件体积，我们仍然不使用 ZLIB 压缩，或者使用 compression=None 确保兼容性
-
+    
     tifffile.imwrite(
         output_path,
         output_image_uint16,
@@ -208,17 +210,17 @@ def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):
         planarconfig=1,
         extratags=extratags,
         description="Linear RGB DNG generated by Raw Alchemy",
-        metadata=None
+        metadata=None 
     )
 
 
 def _save_jpeg_or_other(img: np.ndarray, output_path: str, file_ext: str, logger: Logger):
     """保存为 8-bit JPEG 或其他格式"""
     logger.info(f"    Format: {file_ext.upper()} (8-bit High Quality)")
-
+    
     # 转换为 8-bit（img 已经在 save_image 中被 clip 过了）
     output_image_uint8 = (img * 255).astype(np.uint8)
-
+    
     # JPEG 特殊优化参数
     save_params = {}
     if file_ext in ['.jpg', '.jpeg']:
@@ -227,6 +229,135 @@ def _save_jpeg_or_other(img: np.ndarray, output_path: str, file_ext: str, logger
             'subsampling': 2,
             'optimize': True
         }
-
+    
     # 保存时暂时不写入 EXIF，通过 _write_exif 将 EXIF 注入文件
     Image.fromarray(output_image_uint8).save(output_path, **save_params)
+
+
+def _write_exif(output_path: str, exif_metadata: dict, logger: Logger) -> bool:
+    """
+    将 EXIF 数据写入输出文件（排除旋转信息）
+    Args:
+        output_path: 输出文件路径
+        exif_metadata: 包含 'exif', 'iptc', 'xmp' 字典的元数据对象
+        logger: 日志器
+    Returns: True if successful, False otherwise
+    """
+    try:
+        if not exif_metadata:
+            return False
+
+        exif_data = exif_metadata.get('exif', {})
+        iptc_data = exif_metadata.get('iptc', {})
+        xmp_data = exif_metadata.get('xmp', {})
+        
+        if not exif_data and not iptc_data and not xmp_data:
+            logger.info("    ℹ️  No EXIF data provided to write.")
+            return False
+
+        # 打开输出文件并写入 EXIF 数据
+        output_img = pyexiv2.Image(output_path)
+        
+        # 写入 EXIF 数据，但排除旋转相关标签
+        if exif_data:
+            # 创建过滤副本，不修改原始 dict
+            _ROTATION_TAGS = frozenset({
+                'Exif.Image.Orientation',
+                'Exif.Thumbnail.JPEGInterchangeFormat',
+                'Exif.Thumbnail.JPEGInterchangeFormatLength',
+            })
+            filtered_exif = {k: v for k, v in exif_data.items() if k not in _ROTATION_TAGS}
+            output_img.modify_exif(filtered_exif)
+        
+        # 写入 IPTC 数据
+        if iptc_data:
+            output_img.modify_iptc(iptc_data)
+        
+        # 写入 XMP 数据
+        if xmp_data:
+            output_img.modify_xmp(xmp_data)
+        
+        output_img.close()
+        logger.info("    ✅ EXIF data written successfully (rotation info excluded)")
+        return True
+        
+    except Exception as e:
+        logger.warning(f"    ⚠️  Failed to write full EXIF data: {e}")
+        return False
+
+
+def _write_exif_from_dict(output_path: str, exif_dict: dict, logger: Logger):
+    """
+    从 rawpy 提取的数据字典构造并写入基本 EXIF 标签
+    
+    Args:
+        output_path: 输出文件路径
+        exif_dict: 包含相机和镜头信息的字典 (从 utils.extract_lens_exif 返回)
+        logger: 日志处理器
+    """
+    try:
+        # 打开输出文件
+        output_img = pyexiv2.Image(output_path)
+        
+        # 构造基本的 EXIF 数据
+        basic_exif = {}
+        
+        # 相机信息
+        if exif_dict.get('camera_maker'):
+            basic_exif['Exif.Image.Make'] = exif_dict['camera_maker']
+        
+        if exif_dict.get('camera_model'):
+            basic_exif['Exif.Image.Model'] = exif_dict['camera_model']
+        
+        # 镜头信息
+        if exif_dict.get('lens_model'):
+            basic_exif['Exif.Photo.LensModel'] = exif_dict['lens_model']
+        
+        if exif_dict.get('lens_maker'):
+            basic_exif['Exif.Photo.LensMake'] = exif_dict['lens_maker']
+        
+        # 拍摄参数
+        if exif_dict.get('focal_length'):
+            # 将浮点数转换为分数格式（例如 50.0 -> "50/1"）
+            focal_mm = exif_dict['focal_length']
+            basic_exif['Exif.Photo.FocalLength'] = f"{int(focal_mm * 10)}/10"
+        
+        if exif_dict.get('aperture'):
+            # 光圈值（例如 2.8 -> "28/10"）
+            aperture = exif_dict['aperture']
+            basic_exif['Exif.Photo.FNumber'] = f"{int(aperture * 10)}/10"
+        
+        # ISO
+        if exif_dict.get('iso'):
+            basic_exif['Exif.Photo.ISOSpeedRatings'] = str(exif_dict['iso'])
+            
+        # 曝光时间 (如果是字符串 "1/100" 直接写入，如果是 float 则转换)
+        if exif_dict.get('exposure_time'):
+            et = exif_dict['exposure_time']
+            if isinstance(et, (float, int)):
+                # Convert float seconds to fractional string approx
+                if et >= 1:
+                     basic_exif['Exif.Photo.ExposureTime'] = f"{int(et)}/1"
+                else:
+                     # e.g. 0.01 -> 1/100
+                     denom = int(1.0 / et + 0.5)
+                     basic_exif['Exif.Photo.ExposureTime'] = f"1/{denom}"
+            else:
+                basic_exif['Exif.Photo.ExposureTime'] = str(et)
+
+        # 拍摄时间 "YYYY:MM:DD HH:MM:SS"
+        if exif_dict.get('datetime'):
+             basic_exif['Exif.Photo.DateTimeOriginal'] = str(exif_dict['datetime'])
+             basic_exif['Exif.Image.DateTime'] = str(exif_dict['datetime'])
+
+        # 写入 EXIF 数据
+        if basic_exif:
+            output_img.modify_exif(basic_exif)
+            output_img.close()
+            logger.info(f"    ✅ Basic EXIF written from rawpy data ({len(basic_exif)} tags)")
+        else:
+            output_img.close()
+            logger.warning("    ⚠️  No valid EXIF data to write from rawpy")
+        
+    except Exception as e:
+        logger.warning(f"    ⚠️  Failed to write EXIF from dict: {e}")

@@ -293,36 +293,15 @@ class InspectorPanel(ScrollArea):
         # --- AI Denoise ---
         self.denoise_card = SimpleCardWidget()
         denoise_layout = QVBoxLayout(self.denoise_card)
-        
-        # Denoise strength slider
-        denoise_header_layout = QHBoxLayout()
-        self.denoise_label = BodyLabel(f"{tr('denoise_strength')}: 0.00")
-        
-        # Revert button for denoise
-        self.denoise_revert_btn = ToolButton(FIF.HISTORY)
-        self.denoise_revert_btn.setFixedSize(24, 24)
-        self.denoise_revert_btn.setToolTip(tr('revert_to_baseline_or_default'))
-        self.denoise_revert_btn.clicked.connect(self._revert_denoise)
-        
-        denoise_header_layout.addWidget(self.denoise_label)
-        denoise_header_layout.addStretch()
-        denoise_header_layout.addWidget(self.denoise_revert_btn)
-        
-        self.denoise_slider = NoWheelSlider(Qt.Orientation.Horizontal)
-        self.denoise_slider.setRange(0, 100)  # 0.0 to 1.0
-        self.denoise_slider.setValue(0)
-        
-        def update_denoise_label(val):
-            """Update label and trigger debounced parameter change"""
-            real_val = val / 100.0
-            self.denoise_label.setText(f"{tr('denoise_strength')}: {real_val:.2f}")
-            self._on_param_change()
-        
-        self.denoise_slider.valueChanged.connect(update_denoise_label)
-        
-        denoise_layout.addLayout(denoise_header_layout)
-        denoise_layout.addWidget(self.denoise_slider)
-        
+
+        # Denoise toggle switch
+        self.denoise_switch = SwitchButton()
+        self.denoise_switch.setChecked(False)
+        self.denoise_switch.checkedChanged.connect(self._on_denoise_toggled)
+        self._update_denoise_switch_text()
+
+        denoise_layout.addWidget(self.denoise_switch)
+
         # Info label about AI denoise
         self.denoise_info_label = BodyLabel(tr('denoise_info'))
         self.denoise_info_label.setWordWrap(True)
@@ -457,10 +436,9 @@ class InspectorPanel(ScrollArea):
                     self.slider_labels[key].setText(f"{name}: {real_val:.2f}")
         
         # Denoise
-        if 'denoise_strength' in params:
-            denoise_val = params['denoise_strength']
-            self.denoise_slider.setValue(int(denoise_val * 100))
-            self.denoise_label.setText(f"{tr('denoise_strength')}: {denoise_val:.2f}")
+        if 'denoise_enabled' in params:
+            self.denoise_switch.setChecked(params['denoise_enabled'])
+            self._update_denoise_switch_text()
         
         # Sharpen
         if 'sharpen_strength' in params:
@@ -694,8 +672,8 @@ class InspectorPanel(ScrollArea):
         for key, (slider, scale, _, _) in self.sliders.items():
             params[key] = slider.value() / scale
         
-        # Add denoise strength
-        params['denoise_strength'] = self.denoise_slider.value() / 100.0
+        # Add denoise toggle
+        params['denoise_enabled'] = self.denoise_switch.isChecked()
         
         # Add sharpen strength
         params['sharpen_strength'] = self.sharpen_slider.value() / 100.0
@@ -755,17 +733,25 @@ class InspectorPanel(ScrollArea):
         InfoBar.success(tr('reset_to_default'), tr('reset_to_default_message'), parent=self)
 
     def _revert_denoise(self):
-        """Revert denoise slider to baseline or default"""
-        if self.saved_baseline_params and 'denoise_strength' in self.saved_baseline_params:
-            # Revert to baseline
-            val = self.saved_baseline_params['denoise_strength']
-            self.denoise_slider.setValue(int(val * 100))
-            self.denoise_label.setText(f"{tr('denoise_strength')}: {val:.2f}")
+        """Revert denoise toggle to baseline or default"""
+        if self.saved_baseline_params and 'denoise_enabled' in self.saved_baseline_params:
+            self.denoise_switch.setChecked(self.saved_baseline_params['denoise_enabled'])
         else:
-            # Revert to default (0)
-            self.denoise_slider.setValue(0)
-            self.denoise_label.setText(f"{tr('denoise_strength')}: 0.00")
+            self.denoise_switch.setChecked(False)
+        self._update_denoise_switch_text()
         self._on_param_change()
+
+    def _on_denoise_toggled(self):
+        """Handle denoise switch toggle"""
+        self._update_denoise_switch_text()
+        self._on_param_change()
+
+    def _update_denoise_switch_text(self):
+        """Update the denoise switch button text based on its state"""
+        if self.denoise_switch.isChecked():
+            self.denoise_switch.setText(tr('denoise_on'))
+        else:
+            self.denoise_switch.setText(tr('denoise_off'))
 
     def _revert_sharpen(self):
         """Revert sharpen slider to baseline or default"""
