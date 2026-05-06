@@ -2,7 +2,7 @@
 GPU-resident image processing pipeline using Taichi.
 
 All image data lives on GPU as ti.ndarray. Data crosses CPU-GPU boundary only:
-  1. RAW decode (RawSpeed + RCD demosaic -> numpy -> GPU upload)  [CPU -> GPU, once per image]
+  1. RAW decode (rawpy + RCD demosaic -> numpy -> GPU upload)  [CPU -> GPU, once per image]
   2. Lens correction (GPU -> CPU -> GPU)          [scipy, once per image]
   3. Display output (GPU -> numpy)                [GPU -> CPU, each frame]
 
@@ -191,50 +191,59 @@ class ImageProcessor(QThread):
     # Loading
     # =================================================================
 
-    def _get_rs_decoder(self):
-        """Get or create the singleton RawSpeed decoder."""
-        if not hasattr(self, '_rs_decoder') or self._rs_decoder is None:
-            from raw_alchemy.rawspeed_binding import RawSpeedDecoder
-            self._rs_decoder = RawSpeedDecoder()
-        return self._rs_decoder
+    def _rawpy_to_prophoto(self, path: str):
+        """Decode RAW via rawpy + RCD demosaic -> ProPhoto Linear float32.
 
-    def _rawspeed_to_prophoto(self, path: str):
-        """Decode RAW via RawSpeed + RCD demosaic -> ProPhoto Linear float32.
+        rawpy is used ONLY for reading raw sensor data and metadata (no postprocess).
 
         Returns:
             (img, exif_data, exif_metadata) where img is (H, W, 3) float32 ProPhoto Linear.
         """
-        from raw_alchemy.rawspeed_binding import RawSpeedDecoder
-        from raw_alchemy.demosaic import rcd_demosaic
+        import rawpy
+        from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters
         from raw_alchemy.exif import extract_lens_exif
+        from raw_alchemy.onnx.denoiser import _apply_flip
 
-        decoder = self._get_rs_decoder()
-        result = decoder.decode(path)
+        with rawpy.imread(path) as raw:
+            # Read raw sensor data (NO postprocess)
+            bayer = raw.raw_image_visible.astype(np.float32)
+            bl = np.array(raw.black_level_per_channel, dtype=np.float32)
+            wl = float(raw.white_level)
+            wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+            rgb_xyz = raw.rgb_xyz_matrix[:3, :3].copy()  # 3x3 Camera->XYZ
+            flip = raw.sizes.flip
+            cfa_pattern = raw.raw_pattern.copy()
 
-        # Demosaic
-        bayer_norm = result.normalize()  # float32 [0,1]
-        rgb = rcd_demosaic(bayer_norm, result.filters)
+        # Black level subtract + normalize
+        bl_avg = float(bl[0])
+        bayer_norm = np.maximum(bayer - bl_avg, 0) / (wl - bl_avg)
+
+        # Convert raw_pattern to dcraw filters
+        dcraw_filters = get_dcraw_filters(cfa_pattern)
+
+        # RCD demosaic
+        rgb = rcd_demosaic(bayer_norm, dcraw_filters)
+
+        # Apply orientation
+        rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
 
         # Apply white balance (normalize by G channel)
-        wb = result.wb_coeffs  # [R, G, B, G2]
         g = wb[1] if wb[1] > 0 else 1.0
         rgb[:, :, 0] *= wb[0] / g
-        # rgb[:, :, 1] *= 1.0  # G is reference
         rgb[:, :, 2] *= wb[2] / g
 
         # Apply color matrix: Camera -> XYZ -> ProPhoto
-        if result.color_matrix is not None:
-            cam_to_xyz = np.linalg.inv(result.color_matrix[:3, :3])
-            prophoto_to_xyz = colour.RGB_COLOURSPACES['ProPhoto RGB'].matrix_RGB_to_XYZ
-            xyz_to_prophoto = np.linalg.inv(prophoto_to_xyz)
-            cam_to_prophoto = xyz_to_prophoto @ cam_to_xyz
-            apply_matrix_inplace(rgb, cam_to_prophoto)
+        cam_to_xyz = rgb_xyz.astype(np.float64)
+        prophoto = colour.RGB_COLOURSPACES['ProPhoto RGB']
+        xyz_to_prophoto = prophoto.matrix_XYZ_to_RGB
+        cam_to_prophoto = (xyz_to_prophoto @ cam_to_xyz).astype(np.float64)
+        apply_matrix_inplace(rgb, cam_to_prophoto)
 
         # Clip negatives (gamut mapping can produce them)
         np.maximum(rgb, 0.0, out=rgb)
 
-        # Extract EXIF via pyexiv2 (RawSpeed only provides make/model/iso)
-        exif_data, exif_metadata = extract_lens_exif(path, result)
+        # Extract EXIF via pyexiv2
+        exif_data, exif_metadata = extract_lens_exif(path, None)
 
         return rgb, exif_data, exif_metadata
 
@@ -245,7 +254,7 @@ class ImageProcessor(QThread):
             return
 
         try:
-            img, exif_data, _exif_meta = self._rawspeed_to_prophoto(path)
+            img, exif_data, _exif_meta = self._rawpy_to_prophoto(path)
 
             new_cache_item = CachedImage(
                 path=path,
@@ -292,7 +301,7 @@ class ImageProcessor(QThread):
             logger.info(f"[Worker] Cache Miss - Loading: {os.path.basename(path)}")
 
             try:
-                img_np, self.exif_data, self.exif_metadata = self._rawspeed_to_prophoto(path)
+                img_np, self.exif_data, self.exif_metadata = self._rawpy_to_prophoto(path)
 
                 # Keep on CPU (GPU upload only when needed for processing)
                 self.cpu_linear = img_np

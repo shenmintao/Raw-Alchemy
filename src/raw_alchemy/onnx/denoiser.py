@@ -84,7 +84,6 @@ _setup_cuda_paths()
 _session_bayer = None
 _session_xtrans = None
 _session_provider = None
-_rs_decoder = None
 
 BAYER_MODEL = "cans_raw_v2_bayer_fp16.onnx"
 XTRANS_MODEL = "cans_raw_v2_xtrans_fp16.onnx"
@@ -98,25 +97,26 @@ DEFAULT_TILE_OVERLAP = 32
 # RAW packing (from preprocess_raw.py)
 # ---------------------------------------------------------------------------
 
-def _detect_sensor_from_result(result) -> str:
-    """Detect sensor type from RawSpeed decode result."""
-    if result.is_xtrans:
+def _detect_sensor(raw) -> str:
+    """Detect sensor type from rawpy object using raw_pattern."""
+    pattern = raw.raw_pattern
+    if pattern.shape == (6, 6):
         return 'xtrans'
-    elif result.is_bayer:
+    elif pattern.shape == (2, 2):
         return 'bayer'
     else:
-        raise ValueError(f"Unknown CFA filter code: 0x{result.filters:08x}")
+        raise ValueError(f"Unknown CFA pattern shape: {pattern.shape}")
 
 
-def _pack_bayer(result) -> np.ndarray:
+def _pack_bayer(raw) -> np.ndarray:
     """Pack Bayer raw to (H/2, W/2, 4) float32, black-level subtracted and normalized.
 
     Channel order: [R, G1, B, G2] at positions (0,0), (0,1), (1,1), (1,0).
-    Uses RawSpeed decode result instead of rawpy.
+    Uses rawpy raw_image_visible directly.
     """
-    im = result.bayer.astype(np.float32)
-    bl = float(result.black_levels[0])
-    wl = float(result.white_level)
+    im = raw.raw_image_visible.astype(np.float32)
+    bl = float(raw.black_level_per_channel[0])
+    wl = float(raw.white_level)
     im = np.maximum(im - bl, 0) / (wl - bl)
 
     H, W = im.shape
@@ -132,14 +132,14 @@ def _pack_bayer(result) -> np.ndarray:
     ], axis=-1)
 
 
-def _pack_xtrans(result) -> np.ndarray:
+def _pack_xtrans(raw) -> np.ndarray:
     """Pack X-Trans raw to (H/3, W/3, 9) float32, SID convention.
 
-    Uses RawSpeed decode result instead of rawpy.
+    Uses rawpy raw_image_visible directly.
     """
-    im = result.bayer.astype(np.float32)
-    bl = float(result.black_levels[0])
-    wl = float(result.white_level)
+    im = raw.raw_image_visible.astype(np.float32)
+    bl = float(raw.black_level_per_channel[0])
+    wl = float(raw.white_level)
     im = np.maximum(im - bl, 0) / (wl - bl)
 
     H = (im.shape[0] // 6) * 6
@@ -396,16 +396,19 @@ def _has_wb_input(session) -> bool:
     return len(session.get_inputs()) >= 2
 
 
-def _build_wb_iso(result) -> np.ndarray:
-    """Build WB+ISO condition vector from RawSpeed decode result.
+def _build_wb_iso(cam_wb: np.ndarray, iso: float) -> np.ndarray:
+    """Build WB+ISO condition vector.
+
+    Args:
+        cam_wb: (4,) camera white balance [R, G, B, G2]
+        iso: ISO speed value
 
     Returns (4,) float32: [R/G, 1.0, B/G, log10(ISO)]
     """
-    cam_wb = np.array(result.wb_coeffs, dtype=np.float32)
     g = cam_wb[1] if cam_wb[1] > 0 else 1.0
     wb3 = np.array([cam_wb[0] / g, 1.0, cam_wb[2] / g], dtype=np.float32)
 
-    iso = float(result.iso_speed) if result.iso_speed > 0 else 100.0
+    iso = float(iso) if iso > 0 else 100.0
 
     return np.concatenate([wb3, [np.log10(max(iso, 1.0))]], dtype=np.float32)
 
@@ -463,47 +466,40 @@ def denoise_raw(
         (H, W, 3) float32 ProPhoto Linear RGB in [0, 1]
     """
     import time
+    import rawpy
     t0 = time.time()
 
-    # Open RAW via RawSpeed, pack, extract WB+ISO and orientation
-    from raw_alchemy.rawspeed_binding import RawSpeedDecoder
+    # Open RAW via rawpy, pack, extract WB+ISO and orientation
+    with rawpy.imread(raw_path) as raw:
+        sensor = _detect_sensor(raw)
 
-    # Use a module-level decoder to avoid repeated init
-    global _rs_decoder
-    if '_rs_decoder' not in globals() or _rs_decoder is None:
-        _rs_decoder = RawSpeedDecoder()
+        if sensor == 'bayer':
+            packed = _pack_bayer(raw)
+            upscale = 2
+        else:
+            packed = _pack_xtrans(raw)
+            upscale = 3
 
-    result = _rs_decoder.decode(raw_path)
-    sensor = _detect_sensor_from_result(result)
+        # WB+ISO condition
+        cam_wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+        flip_code = raw.sizes.flip
 
-    if sensor == 'bayer':
-        packed = _pack_bayer(result)
-        upscale = 2
-    else:
-        packed = _pack_xtrans(result)
-        upscale = 3
+        # Extract ISO from EXIF (rawpy doesn't expose ISO directly)
+        iso = 100.0
 
-    # WB+ISO condition
-    cam_wb = np.array(result.wb_coeffs, dtype=np.float32)
-    g = cam_wb[1] if cam_wb[1] > 0 else 1.0
-    wb3 = np.array([cam_wb[0] / g, 1.0, cam_wb[2] / g], dtype=np.float32)
-
-    iso = float(result.iso_speed) if result.iso_speed > 0 else 100.0
-
-    # Orientation: RawSpeed doesn't provide EXIF orientation.
-    # Read it from EXIF via pyexiv2 (best effort).
-    flip_code = 0
+    # Get ISO from EXIF via pyexiv2 (best effort)
     try:
         import pyexiv2
         with pyexiv2.Image(raw_path) as exif_img:
             exif_data = exif_img.read_exif() or {}
-            orientation = int(exif_data.get('Exif.Image.Orientation', 1))
-            # Map EXIF orientation to rawpy flip codes:
-            # EXIF 1=normal(0), 3=180(3), 6=90CW(6), 8=90CCW(5)
-            _exif_to_flip = {1: 0, 2: 0, 3: 3, 4: 0, 5: 5, 6: 6, 7: 6, 8: 5}
-            flip_code = _exif_to_flip.get(orientation, 0)
+            iso_str = exif_data.get('Exif.Photo.ISOSpeedRatings') or exif_data.get('Exif.Photo.ISOSpeed', '')
+            if iso_str:
+                iso = float(iso_str)
     except Exception:
         pass
+
+    g = cam_wb[1] if cam_wb[1] > 0 else 1.0
+    wb3 = np.array([cam_wb[0] / g, 1.0, cam_wb[2] / g], dtype=np.float32)
 
     wb_iso = np.concatenate([wb3, [np.log10(max(iso, 1.0))]], dtype=np.float32)
 

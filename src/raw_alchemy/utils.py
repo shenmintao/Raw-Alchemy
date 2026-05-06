@@ -328,22 +328,22 @@ def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Op
         logger.error(f"  ❌ [Lens Error] {e}")
         return image # 失败则返回原图
 
-def extract_lens_exif(raw_path: str, raw_or_result) -> Tuple[dict, Optional[Dict[str, dict]]]:
+def extract_lens_exif(raw_path: str, raw=None) -> Tuple[dict, Optional[Dict[str, dict]]]:
     """
     Extract EXIF and lens info from RAW file.
 
     Delegates to raw_alchemy.exif.extract_lens_exif which uses pyexiv2 for
-    EXIF reading and falls back to RawSpeed metadata if pyexiv2 fails.
+    EXIF reading.
 
     Args:
         raw_path: Path to the RAW file
-        raw_or_result: RawSpeed RawDecodeResult (or legacy rawpy object for compatibility)
+        raw: Optional rawpy object for fallback metadata extraction
 
     Returns:
         Tuple[dict, Optional[Dict[str, dict]]]: (lens correction params, full metadata dict or None)
     """
     from raw_alchemy.exif import extract_lens_exif as _extract
-    return _extract(raw_path, raw_or_result)
+    return _extract(raw_path, raw)
 
 
 def compute_denoise_normalization_gain(img_linear: np.ndarray,

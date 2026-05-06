@@ -17,29 +17,49 @@ from raw_alchemy.math_ops import log_encode_gpu, apply_matrix_inplace
 #              核心处理函数
 # ==========================================
 
-def _rawspeed_decode_to_prophoto(result) -> np.ndarray:
-    """Decode RawSpeed result to ProPhoto Linear float32 (H, W, 3).
+def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
+    """Decode RAW via rawpy + RCD demosaic to ProPhoto Linear float32 (H, W, 3).
 
-    Applies: RCD demosaic -> WB -> color matrix -> ProPhoto.
+    rawpy is used ONLY for reading raw sensor data and metadata (no postprocess).
+    Applies: RCD demosaic -> orientation -> WB -> color matrix -> ProPhoto.
     """
-    from raw_alchemy.demosaic import rcd_demosaic
+    import rawpy
+    from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters
+    from raw_alchemy.onnx.denoiser import _apply_flip
 
-    bayer_norm = result.normalize()
-    rgb = rcd_demosaic(bayer_norm, result.filters)
+    with rawpy.imread(raw_path) as raw:
+        bayer = raw.raw_image_visible.astype(np.float32)
+        bl = np.array(raw.black_level_per_channel, dtype=np.float32)
+        wl = float(raw.white_level)
+        wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+        rgb_xyz = raw.rgb_xyz_matrix[:3, :3].copy()
+        flip = raw.sizes.flip
+        cfa_pattern = raw.raw_pattern.copy()
+
+    # Black level subtract + normalize
+    bl_avg = float(bl[0])
+    bayer_norm = np.maximum(bayer - bl_avg, 0) / (wl - bl_avg)
+
+    # Convert raw_pattern to dcraw filters
+    dcraw_filters = get_dcraw_filters(cfa_pattern)
+
+    # RCD demosaic
+    rgb = rcd_demosaic(bayer_norm, dcraw_filters)
+
+    # Apply orientation
+    rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
 
     # White balance (normalize by G channel)
-    wb = result.wb_coeffs
     g = wb[1] if wb[1] > 0 else 1.0
     rgb[:, :, 0] *= wb[0] / g
     rgb[:, :, 2] *= wb[2] / g
 
     # Color matrix: Camera -> XYZ -> ProPhoto
-    if result.color_matrix is not None:
-        cam_to_xyz = np.linalg.inv(result.color_matrix[:3, :3])
-        prophoto_to_xyz = colour.RGB_COLOURSPACES['ProPhoto RGB'].matrix_RGB_to_XYZ
-        xyz_to_prophoto = np.linalg.inv(prophoto_to_xyz)
-        cam_to_prophoto = xyz_to_prophoto @ cam_to_xyz
-        apply_matrix_inplace(rgb, cam_to_prophoto)
+    cam_to_xyz = rgb_xyz.astype(np.float64)
+    prophoto = colour.RGB_COLOURSPACES['ProPhoto RGB']
+    xyz_to_prophoto = prophoto.matrix_XYZ_to_RGB
+    cam_to_prophoto = (xyz_to_prophoto @ cam_to_xyz).astype(np.float64)
+    apply_matrix_inplace(rgb, cam_to_prophoto)
 
     np.maximum(rgb, 0.0, out=rgb)
     return rgb
@@ -79,14 +99,10 @@ def process_image(
     
     logger.info(f"🧪 [Raw Alchemy] Processing: {raw_path}")
 
-    # --- Step 1: 解码 RAW (RawSpeed + RCD demosaic -> ProPhoto RGB Linear) ---
-    from raw_alchemy.rawspeed_binding import RawSpeedDecoder
-    from raw_alchemy.demosaic import rcd_demosaic
+    # --- Step 1: 解码 RAW (rawpy + RCD demosaic -> ProPhoto RGB Linear) ---
     from raw_alchemy.exif import extract_lens_exif
 
-    _decoder = RawSpeedDecoder()
-    _rs_result = _decoder.decode(raw_path)
-    exif_data, exif_metadata = extract_lens_exif(raw_path, _rs_result)
+    exif_data, exif_metadata = extract_lens_exif(raw_path, None)
 
     if denoise_enabled:
         # CANS RAW V2: packed RAW → ProPhoto Linear RGB (replaces demosaicing)
@@ -95,11 +111,11 @@ def process_image(
             img = denoise_raw(raw_path, exposure_ratio=1.0)
             logger.info("  ✅ CANS denoise complete")
         except Exception as e:
-            logger.error(f"  ❌ CANS denoise failed, falling back to RawSpeed+RCD: {e}")
-            img = _rawspeed_decode_to_prophoto(_rs_result)
+            logger.error(f"  ❌ CANS denoise failed, falling back to rawpy+RCD: {e}")
+            img = _rawpy_decode_to_prophoto(raw_path)
     else:
-        logger.info(f"  🔹 [Step 1] Decoding RAW (RawSpeed + RCD)...")
-        img = _rawspeed_decode_to_prophoto(_rs_result)
+        logger.info(f"  🔹 [Step 1] Decoding RAW (rawpy + RCD)...")
+        img = _rawpy_decode_to_prophoto(raw_path)
 
     source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
 

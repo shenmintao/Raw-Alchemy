@@ -197,18 +197,11 @@ def extract_lens_exif(raw_path: str, raw) -> Tuple[dict, Optional[Dict[str, dict
         _logger.error(f"  ❌ [EXIF Error] {e}")
         _logger.info("  ℹ️  Trying to extract basic info from RawSpeed metadata...")
 
-    # 如果 pyexiv2 失败或数据不完整，尝试从 RawSpeed result 获取基本信息
-    if pyexiv2_failed:
+    # 如果 pyexiv2 失败，尝试从 rawpy 对象获取基本信息 (if provided)
+    if pyexiv2_failed and raw is not None:
         try:
-            # Check if this is a RawSpeed RawDecodeResult (has .make, .model, .iso_speed)
-            if hasattr(raw, 'make') and hasattr(raw, 'model'):
-                # RawSpeed RawDecodeResult
-                result["camera_maker"] = raw.make
-                result["camera_model"] = raw.model
-                if raw.iso_speed and raw.iso_speed > 0:
-                    result["iso"] = raw.iso_speed
-            elif hasattr(raw, 'camera_params'):
-                # Legacy rawpy object fallback
+            if hasattr(raw, 'camera_params'):
+                # rawpy object fallback
                 result["camera_maker"] = raw.camera_params.make
                 result["camera_model"] = raw.camera_params.model
                 result["lens_maker"] = raw.lens_params.make

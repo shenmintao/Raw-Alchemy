@@ -7,22 +7,6 @@ from loguru import logger
 
 from raw_alchemy.config import SUPPORTED_RAW_EXTENSIONS
 
-# Module-level decoder shared across thumbnail worker threads
-_thumb_decoder = None
-_thumb_decoder_lock = None
-
-
-def _get_thumb_decoder():
-    """Get or create the shared RawSpeed decoder for thumbnails."""
-    global _thumb_decoder, _thumb_decoder_lock
-    import threading
-    if _thumb_decoder_lock is None:
-        _thumb_decoder_lock = threading.Lock()
-    with _thumb_decoder_lock:
-        if _thumb_decoder is None:
-            from raw_alchemy.rawspeed_binding import RawSpeedDecoder
-            _thumb_decoder = RawSpeedDecoder()
-        return _thumb_decoder
 
 
 class ThumbnailWorker(QThread):
@@ -53,28 +37,20 @@ class ThumbnailWorker(QThread):
                 return None
 
             image = None
-            orientation = 0
 
-            # 2. Read EXIF orientation (best effort)
+            # 2. Decode with rawpy and generate thumbnail via downscaled demosaic
             try:
-                import pyexiv2
-                with pyexiv2.Image(full_path) as exif_img:
-                    exif_data = exif_img.read_exif() or {}
-                    exif_orient = int(exif_data.get('Exif.Image.Orientation', 1))
-                    # Map EXIF orientation to flip codes:
-                    # EXIF 1=normal(0), 3=180(3), 6=90CW(6), 8=90CCW(5)
-                    _exif_to_flip = {1: 0, 2: 0, 3: 3, 4: 0, 5: 5, 6: 6, 7: 6, 8: 5}
-                    orientation = _exif_to_flip.get(exif_orient, 0)
-            except Exception:
-                pass
+                import rawpy
+                with rawpy.imread(full_path) as raw:
+                    # Read raw sensor data (NO postprocess)
+                    bayer = raw.raw_image_visible.astype(np.float32)
+                    bl = float(raw.black_level_per_channel[0])
+                    wl = float(raw.white_level)
+                    wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+                    flip = raw.sizes.flip
 
-            # 3. Decode with RawSpeed and generate thumbnail via downscaled demosaic
-            try:
-                decoder = _get_thumb_decoder()
-                result = decoder.decode(full_path)
-
-                # Simple half-size bilinear demosaic for speed (thumbnails don't need RCD quality)
-                bayer = result.normalize()
+                # Black level subtract + normalize
+                bayer = np.maximum(bayer - bl, 0) / (wl - bl)
                 h, w = bayer.shape
                 h2, w2 = h // 2 * 2, w // 2 * 2
                 bayer = bayer[:h2, :w2]
@@ -89,10 +65,14 @@ class ThumbnailWorker(QThread):
                 rgb = np.stack([r, (g1 + g2) * 0.5, b], axis=-1)
 
                 # Apply white balance
-                wb = result.wb_coeffs
                 g = wb[1] if wb[1] > 0 else 1.0
                 rgb[:, :, 0] *= wb[0] / g
                 rgb[:, :, 2] *= wb[2] / g
+
+                # Apply orientation
+                from raw_alchemy.onnx.denoiser import _apply_flip
+                rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
+                thumb_h, thumb_w = rgb.shape[0], rgb.shape[1]
 
                 # Simple sRGB-ish gamma for display (skip full color pipeline for speed)
                 np.clip(rgb, 0.0, 1.0, out=rgb)
@@ -113,16 +93,8 @@ class ThumbnailWorker(QThread):
             except Exception:
                 pass
 
-            # 4. 统一缩放 & 旋转
+            # 3. 统一缩放
             if image and not image.isNull():
-                # Apply rotation based on orientation
-                if orientation == 3:
-                    image = image.transformed(QTransform().rotate(180))
-                elif orientation == 5:
-                    image = image.transformed(QTransform().rotate(-90))
-                elif orientation == 6:
-                    image = image.transformed(QTransform().rotate(90))
-
                 # 统一缩放为 300px 高度，保持比例
                 return image.scaledToHeight(300)
 
