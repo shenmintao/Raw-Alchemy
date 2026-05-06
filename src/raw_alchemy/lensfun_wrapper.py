@@ -749,16 +749,25 @@ def compute_lens_distortion_map(
     """
     height, width = image.shape[:2]
 
-    db = _find_lensfun_db(custom_db_path)
-    if db is None:
+    if not _lensfun:
         return None
 
-    lens = db.find_lens(camera_maker, camera_model, lens_maker, lens_model)
-    if lens is None:
+    db = _get_or_create_database(custom_db_path=custom_db_path)
+    camera = db.find_camera(camera_maker, camera_model)
+    lens = db.find_lens(camera, lens_maker, lens_model)
+    if not lens:
         return None
 
     if crop_factor is None:
-        crop_factor = db.get_crop_factor(camera_maker, camera_model)
+        if camera:
+            try:
+                crop_factor = camera.contents.CropFactor
+                if crop_factor <= 0:
+                    crop_factor = 1.0
+            except (AttributeError, ValueError):
+                crop_factor = 1.0
+        else:
+            crop_factor = 1.0
     logger.info(f"  📷 [Lensfun] Using camera crop factor: {crop_factor:.2f}")
 
     modifier = LensfunModifier(lens, focal_length, crop_factor, width, height, LF_PF_F32)
