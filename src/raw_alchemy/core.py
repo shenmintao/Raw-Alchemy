@@ -18,43 +18,55 @@ from raw_alchemy.math_ops import log_encode_gpu, apply_matrix_inplace
 # ==========================================
 
 def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
-    """Decode RAW via rawpy + RCD demosaic to ProPhoto Linear float32 (H, W, 3).
+    """Decode RAW via GPU demosaic to ProPhoto Linear float32 (H, W, 3).
 
+    Supports Bayer (RCD) and X-Trans (Markesteijn) sensors.
     rawpy is used ONLY for reading raw sensor data and metadata (no postprocess).
-    Applies: RCD demosaic -> orientation -> WB -> color matrix -> ProPhoto.
     """
     import rawpy
     from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters
     from raw_alchemy.onnx.denoiser import _apply_flip
 
     with rawpy.imread(raw_path) as raw:
-        bayer = raw.raw_image_visible.astype(np.float32)
+        sensor_raw = raw.raw_image_visible.astype(np.float32)
         bl = np.array(raw.black_level_per_channel, dtype=np.float32)
         wl = float(raw.white_level)
         wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-        rgb_xyz = raw.rgb_xyz_matrix[:3, :3].copy()
         flip = raw.sizes.flip
-        cfa_pattern = raw.raw_pattern.copy()
+        cfa_pattern = raw.raw_pattern.copy() if raw.raw_pattern is not None else None
 
-    # Black level subtract + normalize
+    is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
+    is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
+
     bl_avg = float(bl[0])
-    bayer_norm = np.maximum(bayer - bl_avg, 0) / (wl - bl_avg)
+    raw_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
 
-    # Convert raw_pattern to dcraw filters
-    dcraw_filters = get_dcraw_filters(cfa_pattern)
+    if is_bayer:
+        dcraw_filters = get_dcraw_filters(cfa_pattern)
+        rgb = rcd_demosaic(raw_norm, dcraw_filters)
+    elif is_xtrans:
+        from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
+        rgb = xtrans_markesteijn_demosaic(raw_norm, cfa_pattern)
+    else:
+        import rawpy as _rawpy
+        with _rawpy.imread(raw_path) as _raw:
+            rgb16 = _raw.postprocess(
+                gamma=(1, 1), no_auto_bright=True, use_camera_wb=True,
+                use_auto_wb=False, output_bps=16,
+                output_color=_rawpy.ColorSpace.ProPhoto,
+                bright=1.0, highlight_mode=2,
+            )
+        rgb = (rgb16 / 65535.0).astype(np.float32)
+        del rgb16
+        np.maximum(rgb, 0.0, out=rgb)
+        return rgb
 
-    # RCD demosaic
-    rgb = rcd_demosaic(bayer_norm, dcraw_filters)
-
-    # Apply orientation
     rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
 
-    # White balance (normalize by G channel)
     g = wb[1] if wb[1] > 0 else 1.0
     rgb[:, :, 0] *= wb[0] / g
     rgb[:, :, 2] *= wb[2] / g
 
-    # Derive Camera→ProPhoto matrix from rawpy's color pipeline
     import rawpy as _rawpy
     with _rawpy.imread(raw_path) as _raw:
         _cam = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,

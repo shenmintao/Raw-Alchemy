@@ -203,18 +203,20 @@ class ImageProcessor(QThread):
         with rawpy.imread(path) as raw:
             cfa_pattern = raw.raw_pattern if raw.raw_pattern is not None else None
             is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
+            is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
 
-            if is_bayer:
-                # Bayer sensor: RCD GPU demosaic path
-                bayer = raw.raw_image_visible.astype(np.float32)
+            if is_bayer or is_xtrans:
+                sensor_raw = raw.raw_image_visible.astype(np.float32)
                 bl = np.array(raw.black_level_per_channel, dtype=np.float32)
                 wl = float(raw.white_level)
                 wb = np.array(raw.camera_whitebalance, dtype=np.float32)
                 flip = raw.sizes.flip
+                if is_xtrans:
+                    xtrans_pat = cfa_pattern.copy()
 
         if is_bayer:
             bl_avg = float(bl[0])
-            bayer_norm = np.maximum(bayer - bl_avg, 0) / (wl - bl_avg)
+            bayer_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
             dcraw_filters = get_dcraw_filters(cfa_pattern)
             rgb = rcd_demosaic(bayer_norm, dcraw_filters)
             rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
@@ -238,8 +240,33 @@ class ImageProcessor(QThread):
             del _cam, _pro, _cam_f, _pro_f
             apply_matrix_inplace(rgb, cam_to_prophoto)
 
+        elif is_xtrans:
+            from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
+
+            bl_avg = float(bl[0])
+            raw_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
+            rgb = xtrans_markesteijn_demosaic(raw_norm, xtrans_pat)
+            rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
+
+            g = wb[1] if wb[1] > 0 else 1.0
+            rgb[:, :, 0] *= wb[0] / g
+            rgb[:, :, 2] *= wb[2] / g
+
+            with rawpy.imread(path) as _raw:
+                _cam = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+                    output_bps=16, output_color=rawpy.ColorSpace.raw, half_size=True)
+                _pro = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+                    output_bps=16, output_color=rawpy.ColorSpace.ProPhoto, half_size=True)
+            _cam_f = _cam.astype(np.float64) / 65535.0
+            _pro_f = _pro.astype(np.float64) / 65535.0
+            cam_to_prophoto, _, _, _ = np.linalg.lstsq(
+                _cam_f.reshape(-1, 3), _pro_f.reshape(-1, 3), rcond=None)
+            cam_to_prophoto = cam_to_prophoto.T.astype(np.float64)
+            del _cam, _pro, _cam_f, _pro_f
+            apply_matrix_inplace(rgb, cam_to_prophoto)
+
         else:
-            # Non-Bayer sensor (Foveon, etc.): fallback to rawpy postprocess
+            # Non-Bayer/non-X-Trans sensor (Foveon, etc.): fallback to rawpy postprocess
             logger.info(f"  Non-Bayer sensor, using rawpy postprocess fallback")
             with rawpy.imread(path) as raw:
                 rgb16 = raw.postprocess(

@@ -8,30 +8,20 @@ from loguru import logger
 from raw_alchemy.config import SUPPORTED_RAW_EXTENSIONS
 
 
-def _apply_exif_rotation(image: QImage, full_path: str) -> QImage:
-    """Apply EXIF orientation to a QImage (for embedded thumbnails)."""
-    try:
-        import pyexiv2
-        exif_img = pyexiv2.Image(full_path)
-        exif = exif_img.read_exif()
-        exif_img.close()
-        orientation = int(exif.get('Exif.Image.Orientation', 1))
-    except Exception:
-        return image
+def _apply_flip_rotation(image: QImage, flip: int) -> QImage:
+    """Apply rawpy flip code to a QImage.
 
-    from PySide6.QtGui import QTransform
-    if orientation == 1:
+    flip values: 0=none, 3=180°, 5=90°CCW, 6=90°CW
+    """
+    if flip == 0:
         return image
-    elif orientation == 3:
+    from PySide6.QtGui import QTransform
+    if flip == 3:
         return image.transformed(QTransform().rotate(180))
-    elif orientation == 6:
-        return image.transformed(QTransform().rotate(90))
-    elif orientation == 8:
+    elif flip == 5:
         return image.transformed(QTransform().rotate(-90))
-    elif orientation == 2:
-        return image.mirrored(True, False)
-    elif orientation == 4:
-        return image.mirrored(False, True)
+    elif flip == 6:
+        return image.transformed(QTransform().rotate(90))
     return image
 
 
@@ -74,11 +64,13 @@ class ThumbnailWorker(QThread):
 
             image = None
             used_embedded = False
+            flip = 0
 
             # Method 1: Extract embedded JPEG thumbnail (fastest, ~50ms)
             try:
                 import rawpy
                 with rawpy.imread(full_path) as raw:
+                    flip = raw.sizes.flip
                     thumb = raw.extract_thumb()
                 if thumb.format == rawpy.ThumbFormat.JPEG:
                     image = QImage()
@@ -95,13 +87,12 @@ class ThumbnailWorker(QThread):
             except Exception:
                 pass
 
-            # Apply EXIF rotation for embedded thumbnails from native RAW files.
-            # DNG embedded thumbnails are typically pre-rotated, skip for DNG.
+            # Embedded thumbnails are typically unrotated; apply camera orientation.
             if used_embedded and image and not image.isNull():
-                if ext != '.dng':
-                    image = _apply_exif_rotation(image, full_path)
+                image = _apply_flip_rotation(image, flip)
 
             # Method 2: Fallback to rawpy half_size postprocess
+            # rawpy.postprocess() applies orientation automatically, no extra rotation needed.
             if image is None or image.isNull():
                 try:
                     import rawpy
