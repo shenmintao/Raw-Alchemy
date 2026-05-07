@@ -38,45 +38,28 @@ class ThumbnailWorker(QThread):
 
             image = None
 
-            # 2. Decode with rawpy and generate thumbnail via downscaled demosaic
+            # 2. Use rawpy half_size postprocess (fast, accurate colors)
             try:
                 import rawpy
                 with rawpy.imread(full_path) as raw:
-                    # Read raw sensor data (NO postprocess)
-                    bayer = raw.raw_image_visible.astype(np.float32)
-                    bl = float(raw.black_level_per_channel[0])
-                    wl = float(raw.white_level)
-                    wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-                    flip = raw.sizes.flip
-
-                # Black level subtract + normalize
-                bayer = np.maximum(bayer - bl, 0) / (wl - bl)
-                h, w = bayer.shape
-                h2, w2 = h // 2 * 2, w // 2 * 2
-                bayer = bayer[:h2, :w2]
-
-                # Quick 2x2 average demosaic (just average the Bayer quad)
-                r = bayer[0::2, 0::2]
-                g1 = bayer[0::2, 1::2]
-                g2 = bayer[1::2, 0::2]
-                b = bayer[1::2, 1::2]
-                thumb_h, thumb_w = r.shape
-
-                rgb = np.stack([r, (g1 + g2) * 0.5, b], axis=-1)
-
-                # Apply white balance
-                g = wb[1] if wb[1] > 0 else 1.0
-                rgb[:, :, 0] *= wb[0] / g
-                rgb[:, :, 2] *= wb[2] / g
-
-                # Apply orientation
-                from raw_alchemy.onnx.denoiser import _apply_flip
-                rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
+                    rgb16 = raw.postprocess(
+                        gamma=(1, 1),
+                        no_auto_bright=True,
+                        use_camera_wb=True,
+                        use_auto_wb=False,
+                        output_bps=16,
+                        output_color=rawpy.ColorSpace.sRGB,
+                        half_size=True,
+                    )
+                rgb = rgb16.astype(np.float32) / 65535.0
+                del rgb16
                 thumb_h, thumb_w = rgb.shape[0], rgb.shape[1]
 
-                # Simple sRGB-ish gamma for display (skip full color pipeline for speed)
+                # sRGB OETF
                 np.clip(rgb, 0.0, 1.0, out=rgb)
-                rgb = np.power(rgb, 1.0 / 2.2)
+                mask = rgb <= 0.0031308
+                rgb[mask] *= 12.92
+                rgb[~mask] = 1.055 * np.power(rgb[~mask], 1.0 / 2.4) - 0.055
 
                 # Convert to uint8
                 thumb_uint8 = (rgb * 255).astype(np.uint8)

@@ -1134,10 +1134,11 @@ def _bicubic_weight(t: ti.f32) -> ti.types.vector(4, ti.f32):
 
 @ti.func
 def _sample_bicubic(
-    src: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    src: ti.types.ndarray(dtype=ti.f32, ndim=3),
+    ch: ti.i32,
     x: ti.f32, y: ti.f32, H: ti.i32, W: ti.i32,
 ) -> ti.f32:
-    """Bicubic interpolation of a 2D array at (x, y)."""
+    """Bicubic interpolation of a HxWx3 array at (x, y) for channel ch."""
     ix = ti.cast(ti.floor(x), ti.i32)
     iy = ti.cast(ti.floor(y), ti.i32)
     fx = x - ti.cast(ix, ti.f32)
@@ -1151,7 +1152,7 @@ def _sample_bicubic(
         for dx in ti.static(range(4)):
             sy = ti.min(ti.max(iy - 1 + dy, 0), H - 1)
             sx = ti.min(ti.max(ix - 1 + dx, 0), W - 1)
-            val += wy[dy] * wx[dx] * src[sy, sx]
+            val += wy[dy] * wx[dx] * src[sy, sx, ch]
     return val
 
 
@@ -1175,7 +1176,7 @@ def _lens_remap_kernel(
             for ch in ti.static(range(3)):
                 x = coords_x[row, col, ch]
                 y = coords_y[row, col, ch]
-                dst[row, col, ch] = _sample_bicubic(src[:, :, ch], x, y, H, W)
+                dst[row, col, ch] = _sample_bicubic(src, ch, x, y, H, W)
 
 
 def lens_remap_gpu(src_gpu, dst_gpu, coords, oob_mask_np):

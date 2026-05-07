@@ -54,11 +54,19 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     rgb[:, :, 0] *= wb[0] / g
     rgb[:, :, 2] *= wb[2] / g
 
-    # Color matrix: Camera -> XYZ -> ProPhoto
-    cam_to_xyz = rgb_xyz.astype(np.float64)
-    prophoto = colour.RGB_COLOURSPACES['ProPhoto RGB']
-    xyz_to_prophoto = prophoto.matrix_XYZ_to_RGB
-    cam_to_prophoto = (xyz_to_prophoto @ cam_to_xyz).astype(np.float64)
+    # Derive Camera→ProPhoto matrix from rawpy's color pipeline
+    import rawpy as _rawpy
+    with _rawpy.imread(raw_path) as _raw:
+        _cam = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+            output_bps=16, output_color=_rawpy.ColorSpace.raw, half_size=True)
+        _pro = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+            output_bps=16, output_color=_rawpy.ColorSpace.ProPhoto, half_size=True)
+    _cam_f = _cam.astype(np.float64) / 65535.0
+    _pro_f = _pro.astype(np.float64) / 65535.0
+    cam_to_prophoto, _, _, _ = np.linalg.lstsq(
+        _cam_f.reshape(-1, 3), _pro_f.reshape(-1, 3), rcond=None)
+    cam_to_prophoto = cam_to_prophoto.T.astype(np.float64)
+    del _cam, _pro, _cam_f, _pro_f
     apply_matrix_inplace(rgb, cam_to_prophoto)
 
     np.maximum(rgb, 0.0, out=rgb)

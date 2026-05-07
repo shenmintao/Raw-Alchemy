@@ -79,19 +79,15 @@ class ImageProcessor(QThread):
         self.cpu_linear: Optional[np.ndarray] = None
         self.cpu_corrected: Optional[np.ndarray] = None  # After lens correction
 
-        # ===== GPU Buffers (5 total — ~1.5GB for 24MP) =====
+        # ===== GPU Buffers (3 total — immutable source + temp + output) =====
         self.gpu_corrected = GpuImage()    # Lens-corrected, uploaded once
-        self.gpu_cropped = GpuImage()      # After geo+crop (GPU-resident, replaces cpu_geo_result)
-        self.gpu_exposed = GpuImage()      # After exposure (cached)
-        self.gpu_adjusted = GpuImage()     # After WB/HS/Sat/Con (cached, pre-grading)
-        self.gpu_graded = GpuImage()       # After grading (Log+LUT+sRGB)
+        self.gpu_cropped = GpuImage()      # After geo+crop (immutable ProPhoto Linear source)
+        self.gpu_graded = GpuImage()       # Output: always rebuilt from gpu_cropped
 
         # ===== Cache Keys =====
         self.cached_lens_key = None
         self.last_geo_crop_key = None   # Combined geometry+perspective+crop
-        self.last_exposure_key = None
-        self.last_adjustment_key = None
-        self.last_grading_key = None
+        self.last_grading_key = None    # Combined exposure+adjust+grading
 
         # Metering Cache
         self.cached_auto_ev = 0.0
@@ -232,11 +228,21 @@ class ImageProcessor(QThread):
         rgb[:, :, 0] *= wb[0] / g
         rgb[:, :, 2] *= wb[2] / g
 
-        # Apply color matrix: Camera -> XYZ -> ProPhoto
-        cam_to_xyz = rgb_xyz.astype(np.float64)
-        prophoto = colour.RGB_COLOURSPACES['ProPhoto RGB']
-        xyz_to_prophoto = prophoto.matrix_XYZ_to_RGB
-        cam_to_prophoto = (xyz_to_prophoto @ cam_to_xyz).astype(np.float64)
+        # Derive Camera→ProPhoto matrix from rawpy's internal color pipeline.
+        # rawpy's postprocess with half_size is fast (~0.4s) and gives us the
+        # exact color conversion that matches libraw's complex matrix chain.
+        import rawpy as _rawpy
+        with _rawpy.imread(path) as _raw:
+            _cam = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+                output_bps=16, output_color=_rawpy.ColorSpace.raw, half_size=True)
+            _pro = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+                output_bps=16, output_color=_rawpy.ColorSpace.ProPhoto, half_size=True)
+        _cam_f = _cam.astype(np.float64) / 65535.0
+        _pro_f = _pro.astype(np.float64) / 65535.0
+        cam_to_prophoto, _, _, _ = np.linalg.lstsq(
+            _cam_f.reshape(-1, 3), _pro_f.reshape(-1, 3), rcond=None)
+        cam_to_prophoto = cam_to_prophoto.T.astype(np.float64)
+        del _cam, _pro, _cam_f, _pro_f
         apply_matrix_inplace(rgb, cam_to_prophoto)
 
         # Clip negatives (gamut mapping can produce them)
@@ -337,12 +343,8 @@ class ImageProcessor(QThread):
         self.gpu_corrected.clear()
         self.last_geo_crop_key = None
         self.gpu_cropped.clear()
-        self.last_exposure_key = None
-        self.gpu_exposed.clear()
-        self.last_adjustment_key = None
         self.last_grading_key = None
         self.cached_graded_clean = None
-        self.gpu_adjusted.clear()
         self.gpu_graded.clear()
         self.cached_auto_ev = 0.0
         self.last_metering_key = None
@@ -352,8 +354,6 @@ class ImageProcessor(QThread):
         try:
             self.gpu_corrected.clear()
             self.gpu_cropped.clear()
-            self.gpu_exposed.clear()
-            self.gpu_adjusted.clear()
             self.gpu_graded.clear()
             self._gpu_uint8 = None
             logger.debug("[Worker] GPU buffers released.")
@@ -488,8 +488,7 @@ class ImageProcessor(QThread):
                 # Invalidate downstream caches
                 self.last_geo_crop_key = None
                 self.gpu_cropped.clear()
-                self.last_exposure_key = None
-                self.last_adjustment_key = None
+                self.last_grading_key = None
 
                 # Update CPU cache
                 cached_item = self.cache_manager.get(request.path)
@@ -510,35 +509,37 @@ class ImageProcessor(QThread):
             if geo_crop_key != self.last_geo_crop_key or not self.gpu_cropped.valid:
                 logger.debug("[Worker] Geometry+Perspective+Crop (GPU)...")
 
-                # Geometry: gpu_corrected → gpu_exposed (as temp)
+                # Geometry: gpu_corrected → gpu_graded (as temp)
                 apply_geometry_gpu(
-                    self.gpu_corrected, self.gpu_exposed,
+                    self.gpu_corrected, self.gpu_graded,
                     rotation=params.get('rotation', 0),
                     flip_h=params.get('flip_horizontal', False),
                     flip_v=params.get('flip_vertical', False)
                 )
 
-                # Perspective: gpu_exposed → gpu_graded (as temp)
+                # Perspective: gpu_graded (temp) → gpu_corrected reused as temp2
                 corners = params.get('perspective_corners')
                 default_corners = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
                 if corners and corners != default_corners:
                     from raw_alchemy.math_ops import perspective_warp_kernel, compute_perspective_matrix
-                    h, w = self.gpu_exposed.height, self.gpu_exposed.width
+                    from raw_alchemy.gpu_buffer import GpuImage
+                    h, w = self.gpu_graded.height, self.gpu_graded.width
                     _, M_inv = compute_perspective_matrix(corners, w, h)
-                    self.gpu_graded._allocate(h, w, 3)
-                    perspective_warp_kernel(self.gpu_exposed.arr, self.gpu_graded.arr, M_inv)
-                    # Crop: gpu_graded → gpu_cropped
+                    gpu_persp = GpuImage()
+                    gpu_persp._allocate(h, w, 3)
+                    perspective_warp_kernel(self.gpu_graded.arr, gpu_persp.arr, M_inv)
+                    # Crop: gpu_persp → gpu_cropped
+                    crop_rect = params.get('crop', (0.0, 0.0, 1.0, 1.0))
+                    apply_crop_gpu(gpu_persp, self.gpu_cropped, crop_rect)
+                    gpu_persp.clear()
+                else:
+                    # No perspective — Crop: gpu_graded (temp) → gpu_cropped
                     crop_rect = params.get('crop', (0.0, 0.0, 1.0, 1.0))
                     apply_crop_gpu(self.gpu_graded, self.gpu_cropped, crop_rect)
-                else:
-                    # No perspective — Crop: gpu_exposed → gpu_cropped
-                    crop_rect = params.get('crop', (0.0, 0.0, 1.0, 1.0))
-                    apply_crop_gpu(self.gpu_exposed, self.gpu_cropped, crop_rect)
 
                 # GPU-resident: no CPU download needed
                 self.last_geo_crop_key = geo_crop_key
-                self.last_exposure_key = None
-                self.last_adjustment_key = None
+                self.last_grading_key = None
 
             # --- Stage 5: Auto Exposure ---
             current_metering_key = (
@@ -572,8 +573,9 @@ class ImageProcessor(QThread):
 
             self.last_applied_ev = applied_ev
 
-            # --- Stage 6-8 Fused: Exposure + Adjustments + Grading ---
-            # Combine into a single cache key to enable fused GPU kernel
+            # --- Stage 6-8: Exposure + Adjustments + Grading ---
+            # Always start from gpu_cropped (immutable ProPhoto Linear source).
+            # Every parameter change re-processes from this clean source.
             log_space = params.get('log_space')
             lut_path = params.get('lut_path')
             wb_temp = params.get('wb_temp', 0.0)
@@ -583,23 +585,20 @@ class ImageProcessor(QThread):
             sat = params.get('saturation', 1.0)
             con = params.get('contrast', 1.0)
 
-            use_fused = (not log_space or log_space == 'None') and not lut_path
-
-            adjustment_key = (
+            grading_key = (
                 self.last_geo_crop_key,
                 final_exposure_gain,
                 wb_temp, wb_tint,
                 highlight, shadow,
                 sat, con,
+                log_space, lut_path,
             )
 
-            if use_fused:
-                # Fused path: single kernel, no intermediate copies
-                grading_key = (adjustment_key, log_space, lut_path)
+            if grading_key != self.last_grading_key:
+                use_fused = (not log_space or log_space == 'None') and not lut_path
 
-                if grading_key != self.last_grading_key:
-                    logger.debug("[Worker] Fused Expose+Adjust+sRGB (GPU)...")
-
+                if use_fused:
+                    # Fused path: single kernel gpu_cropped → gpu_graded
                     source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
                     luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
                     M_srgb = colour.matrix_RGB_to_RGB(
@@ -627,29 +626,15 @@ class ImageProcessor(QThread):
                         apply_srgb=True,
                     )
 
-                    self.last_grading_key = grading_key
-                    self.last_adjustment_key = adjustment_key
-                    self.last_exposure_key = (self.last_geo_crop_key, final_exposure_gain)
-                    # Defer cached_graded_clean download — only needed if sharpening is on
-                    self.cached_graded_clean = None
-                    self._graded_clean_pending = True
+                else:
+                    # Non-fused: copy from gpu_cropped, apply each step in-place
+                    self.gpu_graded.copy_from(self.gpu_cropped)
+                    arr = self.gpu_graded.arr
 
-            else:
-                # Non-fused path: Log space or LUT — need separate stages
-                exposure_key = (self.last_geo_crop_key, final_exposure_gain)
+                    # Exposure
+                    apply_gain_inplace(arr, float(final_exposure_gain))
 
-                if exposure_key != self.last_exposure_key or not self.gpu_exposed.valid:
-                    logger.debug("[Worker] Exposure (GPU)...")
-                    self.gpu_exposed.copy_from(self.gpu_cropped)
-                    apply_gain_inplace(self.gpu_exposed.arr, float(final_exposure_gain))
-                    self.last_exposure_key = exposure_key
-                    self.last_adjustment_key = None
-
-                if adjustment_key != self.last_adjustment_key:
-                    logger.debug("[Worker] Adjustments (GPU)...")
-                    self.gpu_adjusted.copy_from(self.gpu_exposed)
-                    arr = self.gpu_adjusted.arr
-
+                    # White Balance
                     if wb_temp != 0.0 or wb_tint != 0.0:
                         t_val = wb_temp * 0.005
                         g_val = wb_tint * 0.005
@@ -658,6 +643,7 @@ class ImageProcessor(QThread):
                                                     float(1.0 - g_val),
                                                     float(1.0 - t_val))
 
+                    # Highlight / Shadow
                     if highlight != 0.0 or shadow != 0.0:
                         source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
                         luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
@@ -666,15 +652,70 @@ class ImageProcessor(QThread):
                                                         float(shadow / 100.0),
                                                         luma)
 
+                    # Saturation / Contrast
                     source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
                     luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
                     apply_saturation_contrast_inplace(arr,
                                                        float(sat), float(con), 0.18,
                                                        luma)
 
-                    self.last_adjustment_key = adjustment_key
-                    self.last_grading_key = None
-                    self.cached_graded_clean = None
+                    # Log + LUT or sRGB grading
+                    if log_space and log_space != 'None':
+                        log_color_space = config.LOG_TO_WORKING_SPACE.get(log_space)
+                        log_curve = config.LOG_ENCODING_MAP.get(log_space, log_space)
+
+                        if log_color_space:
+                            M = colour.matrix_RGB_to_RGB(
+                                colour.RGB_COLOURSPACES['ProPhoto RGB'],
+                                colour.RGB_COLOURSPACES[log_color_space])
+                            apply_matrix_inplace(arr, M)
+                            max_inplace(arr, 1e-6)
+                            if not log_encode_gpu(arr, log_curve):
+                                graded_np = self.gpu_graded.to_numpy()
+                                graded_np = colour.cctf_encoding(graded_np, function=log_curve).astype(np.float32)
+                                self.gpu_graded.upload(graded_np)
+                                arr = self.gpu_graded.arr
+
+                    if lut_path and os.path.exists(lut_path):
+                        try:
+                            if lut_path != self.cached_lut_path:
+                                logger.info(f"[Worker] Loading LUT: {os.path.basename(lut_path)}")
+                                lut = utils.load_lut_cached(lut_path)
+                                self.cached_lut_is_3d = isinstance(lut, colour.LUT3D)
+                                if self.cached_lut_is_3d:
+                                    lut_table = np.ascontiguousarray(lut.table.astype(np.float32))
+                                    self.cached_lut_table = lut_table
+                                    self.cached_lut_domain_min = np.ascontiguousarray(lut.domain[0].astype(np.float64))
+                                    self.cached_lut_domain_max = np.ascontiguousarray(lut.domain[1].astype(np.float64))
+                                else:
+                                    self.cached_lut_table = lut
+                                self.cached_lut_path = lut_path
+
+                            if self.cached_lut_is_3d:
+                                apply_lut_inplace(arr,
+                                                  self.cached_lut_table,
+                                                  self.cached_lut_domain_min,
+                                                  self.cached_lut_domain_max)
+                            else:
+                                graded_np = self.gpu_graded.to_numpy()
+                                graded_np = self.cached_lut_table.apply(graded_np).astype(np.float32)
+                                self.gpu_graded.upload(graded_np)
+                        except Exception as e:
+                            logger.error(f"[Worker] LUT error: {e}")
+                            self.cached_lut_path = None
+
+                    if not log_space or log_space == 'None':
+                        M_srgb = colour.matrix_RGB_to_RGB(
+                            colour.RGB_COLOURSPACES['ProPhoto RGB'],
+                            colour.RGB_COLOURSPACES['sRGB'])
+                        apply_matrix_inplace(arr, M_srgb)
+                        linear_to_srgb_inplace(arr)
+
+                    clip_inplace(arr)
+
+                self.last_grading_key = grading_key
+                self.cached_graded_clean = None
+                self._graded_clean_pending = True
 
         except Exception as e:
             logger.error(f"[Worker] Error in dev stages: {e}")
@@ -683,85 +724,7 @@ class ImageProcessor(QThread):
             self.error_occurred.emit(f"Processing error: {str(e)}")
             return
 
-        # --- Stage 8: Grading (Log + LUT + sRGB) ---
-        # Fused path already set last_grading_key and gpu_graded — skip if done
         try:
-            grading_key = (adjustment_key, log_space, lut_path)
-
-            if grading_key != self.last_grading_key:
-                # GPU→GPU copy from cached adjusted result (~1ms vs ~50ms CPU upload)
-                self.gpu_graded.copy_from(self.gpu_adjusted)
-                self.last_grading_key = grading_key
-
-                arr = self.gpu_graded.arr
-
-                if log_space and log_space != 'None':
-                    log_color_space = config.LOG_TO_WORKING_SPACE.get(log_space)
-                    log_curve = config.LOG_ENCODING_MAP.get(log_space, log_space)
-
-                    if log_color_space:
-                        # Color matrix (GPU)
-                        M = colour.matrix_RGB_to_RGB(
-                            colour.RGB_COLOURSPACES['ProPhoto RGB'],
-                            colour.RGB_COLOURSPACES[log_color_space]
-                        )
-                        apply_matrix_inplace(arr, M)
-
-                        # Clamp negatives (GPU)
-                        max_inplace(arr, 1e-6)
-
-                        # Log encoding (GPU)
-                        if not log_encode_gpu(arr, log_curve):
-                            # Fallback to CPU for unsupported curves
-                            graded_np = self.gpu_graded.to_numpy()
-                            graded_np = colour.cctf_encoding(graded_np, function=log_curve).astype(np.float32)
-                            self.gpu_graded.upload(graded_np)
-                            arr = self.gpu_graded.arr
-
-                # LUT (GPU for 3D LUT)
-                if lut_path and os.path.exists(lut_path):
-                    try:
-                        if lut_path != self.cached_lut_path:
-                            logger.info(f"[Worker] Loading LUT: {os.path.basename(lut_path)}")
-                            lut = utils.load_lut_cached(lut_path)
-                            self.cached_lut_is_3d = isinstance(lut, colour.LUT3D)
-                            if self.cached_lut_is_3d:
-                                lut_table = np.ascontiguousarray(lut.table.astype(np.float32))
-                                self.cached_lut_table = lut_table
-                                self.cached_lut_domain_min = np.ascontiguousarray(lut.domain[0].astype(np.float64))
-                                self.cached_lut_domain_max = np.ascontiguousarray(lut.domain[1].astype(np.float64))
-                            else:
-                                self.cached_lut_table = lut
-                            self.cached_lut_path = lut_path
-
-                        if self.cached_lut_is_3d:
-                            apply_lut_inplace(arr,
-                                              self.cached_lut_table,
-                                              self.cached_lut_domain_min,
-                                              self.cached_lut_domain_max)
-                        else:
-                            graded_np = self.gpu_graded.to_numpy()
-                            graded_np = self.cached_lut_table.apply(graded_np).astype(np.float32)
-                            self.gpu_graded.upload(graded_np)
-
-                    except Exception as e:
-                        logger.error(f"[Worker] LUT error: {e}")
-                        self.cached_lut_path = None
-
-                # sRGB (GPU): ProPhoto RGB → sRGB gamut, then sRGB OETF
-                if not log_space or log_space == 'None':
-                    M_srgb = colour.matrix_RGB_to_RGB(
-                        colour.RGB_COLOURSPACES['ProPhoto RGB'],
-                        colour.RGB_COLOURSPACES['sRGB'],
-                    )
-                    apply_matrix_inplace(arr, M_srgb)
-                    linear_to_srgb_inplace(arr)
-
-                # Clip (GPU)
-                clip_inplace(arr)
-
-                # Cache clean grading result for sharpening restore
-                self.cached_graded_clean = self.gpu_graded.to_numpy()
 
             # --- Stage 10: Sharpening (Taichi RL, GPU) ---
             sharpen_strength = params.get('sharpen_strength', 0.0)
