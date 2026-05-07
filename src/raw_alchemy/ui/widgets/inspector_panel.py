@@ -290,53 +290,49 @@ class InspectorPanel(ScrollArea):
         
         self.add_section(tr('adjustments'), self.adj_card)
         
-        # --- AI Denoise ---
+        # --- AI Denoise (disabled — new RAW-to-RAW model in progress) ---
         self.denoise_card = SimpleCardWidget()
         denoise_layout = QVBoxLayout(self.denoise_card)
 
-        # Denoise toggle switch
         self.denoise_switch = SwitchButton()
         self.denoise_switch.setChecked(False)
+        self.denoise_switch.setEnabled(False)
         self.denoise_switch.checkedChanged.connect(self._on_denoise_toggled)
         self._update_denoise_switch_text()
-
         denoise_layout.addWidget(self.denoise_switch)
 
-        # Info label about AI denoise
         self.denoise_info_label = BodyLabel(tr('denoise_info'))
         self.denoise_info_label.setWordWrap(True)
         self.denoise_info_label.setStyleSheet("color: gray; font-size: 11px;")
         denoise_layout.addWidget(self.denoise_info_label)
-        
+
         # Sharpen strength slider (Richardson-Lucy deconvolution)
         sharpen_header_layout = QHBoxLayout()
         self.sharpen_label = BodyLabel(f"{tr('sharpen_strength')}: 0.00")
-        
-        # Revert button for sharpen
+
         self.sharpen_revert_btn = ToolButton(FIF.HISTORY)
         self.sharpen_revert_btn.setFixedSize(24, 24)
         self.sharpen_revert_btn.setToolTip(tr('revert_to_baseline_or_default'))
         self.sharpen_revert_btn.clicked.connect(self._revert_sharpen)
-        
+
         sharpen_header_layout.addWidget(self.sharpen_label)
         sharpen_header_layout.addStretch()
         sharpen_header_layout.addWidget(self.sharpen_revert_btn)
-        
+
         self.sharpen_slider = NoWheelSlider(Qt.Orientation.Horizontal)
-        self.sharpen_slider.setRange(0, 100)  # 0.0 to 1.0
+        self.sharpen_slider.setRange(0, 100)
         self.sharpen_slider.setValue(0)
-        
+
         def update_sharpen_label(val):
-            """Update label and trigger debounced parameter change"""
             real_val = val / 100.0
             self.sharpen_label.setText(f"{tr('sharpen_strength')}: {real_val:.2f}")
             self._on_param_change()
-        
+
         self.sharpen_slider.valueChanged.connect(update_sharpen_label)
-        
+
         denoise_layout.addLayout(sharpen_header_layout)
         denoise_layout.addWidget(self.sharpen_slider)
-        
+
         self.add_section(tr('ai_denoise'), self.denoise_card)
         
         # Filler
