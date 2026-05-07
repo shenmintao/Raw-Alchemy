@@ -115,7 +115,7 @@ a = Analysis(
         'qtpy',
         'test',
         'doctest',
-        'distutils',
+
         'setuptools',
         'wheel',
         'pkg_resources',
