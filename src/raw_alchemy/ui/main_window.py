@@ -688,7 +688,8 @@ class MainWindow(FluentWindow):
         self.loading_label.show()
         
         self.thumb_worker = ThumbnailWorker(folder)
-        self.thumb_worker.thumbnail_ready.connect(self.add_gallery_item)
+        self.thumb_worker.placeholder_ready.connect(self.add_gallery_item)
+        self.thumb_worker.thumbnail_ready.connect(self.update_gallery_item)
         self.thumb_worker.progress_update.connect(self.on_thumbnail_progress)
         self.thumb_worker.finished_scanning.connect(self.on_thumbnail_finished)
         self.thumb_worker.start()
@@ -943,6 +944,15 @@ class MainWindow(FluentWindow):
         item.setText(f"🟢 {name}" if is_marked else name)
         
         self.gallery_list.addItem(item)
+
+    def update_gallery_item(self, path, image):
+        """Replace placeholder thumbnail with actual image."""
+        pixmap = QPixmap.fromImage(image)
+        for i in range(self.gallery_list.count()):
+            item = self.gallery_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                item.setIcon(QIcon(pixmap))
+                break
 
     def on_gallery_item_clicked(self, item):
         if not item: return

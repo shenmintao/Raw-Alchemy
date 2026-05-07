@@ -201,49 +201,55 @@ class ImageProcessor(QThread):
         from raw_alchemy.onnx.denoiser import _apply_flip
 
         with rawpy.imread(path) as raw:
-            # Read raw sensor data (NO postprocess)
-            bayer = raw.raw_image_visible.astype(np.float32)
-            bl = np.array(raw.black_level_per_channel, dtype=np.float32)
-            wl = float(raw.white_level)
-            wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-            rgb_xyz = raw.rgb_xyz_matrix[:3, :3].copy()  # 3x3 Camera->XYZ
-            flip = raw.sizes.flip
-            cfa_pattern = raw.raw_pattern.copy()
+            cfa_pattern = raw.raw_pattern if raw.raw_pattern is not None else None
+            is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
 
-        # Black level subtract + normalize
-        bl_avg = float(bl[0])
-        bayer_norm = np.maximum(bayer - bl_avg, 0) / (wl - bl_avg)
+            if is_bayer:
+                # Bayer sensor: RCD GPU demosaic path
+                bayer = raw.raw_image_visible.astype(np.float32)
+                bl = np.array(raw.black_level_per_channel, dtype=np.float32)
+                wl = float(raw.white_level)
+                wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+                flip = raw.sizes.flip
 
-        # Convert raw_pattern to dcraw filters
-        dcraw_filters = get_dcraw_filters(cfa_pattern)
+        if is_bayer:
+            bl_avg = float(bl[0])
+            bayer_norm = np.maximum(bayer - bl_avg, 0) / (wl - bl_avg)
+            dcraw_filters = get_dcraw_filters(cfa_pattern)
+            rgb = rcd_demosaic(bayer_norm, dcraw_filters)
+            rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
 
-        # RCD demosaic
-        rgb = rcd_demosaic(bayer_norm, dcraw_filters)
+            # Apply white balance
+            g = wb[1] if wb[1] > 0 else 1.0
+            rgb[:, :, 0] *= wb[0] / g
+            rgb[:, :, 2] *= wb[2] / g
 
-        # Apply orientation
-        rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
+            # Derive Camera→ProPhoto matrix
+            with rawpy.imread(path) as _raw:
+                _cam = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+                    output_bps=16, output_color=rawpy.ColorSpace.raw, half_size=True)
+                _pro = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
+                    output_bps=16, output_color=rawpy.ColorSpace.ProPhoto, half_size=True)
+            _cam_f = _cam.astype(np.float64) / 65535.0
+            _pro_f = _pro.astype(np.float64) / 65535.0
+            cam_to_prophoto, _, _, _ = np.linalg.lstsq(
+                _cam_f.reshape(-1, 3), _pro_f.reshape(-1, 3), rcond=None)
+            cam_to_prophoto = cam_to_prophoto.T.astype(np.float64)
+            del _cam, _pro, _cam_f, _pro_f
+            apply_matrix_inplace(rgb, cam_to_prophoto)
 
-        # Apply white balance (normalize by G channel)
-        g = wb[1] if wb[1] > 0 else 1.0
-        rgb[:, :, 0] *= wb[0] / g
-        rgb[:, :, 2] *= wb[2] / g
-
-        # Derive Camera→ProPhoto matrix from rawpy's internal color pipeline.
-        # rawpy's postprocess with half_size is fast (~0.4s) and gives us the
-        # exact color conversion that matches libraw's complex matrix chain.
-        import rawpy as _rawpy
-        with _rawpy.imread(path) as _raw:
-            _cam = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
-                output_bps=16, output_color=_rawpy.ColorSpace.raw, half_size=True)
-            _pro = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
-                output_bps=16, output_color=_rawpy.ColorSpace.ProPhoto, half_size=True)
-        _cam_f = _cam.astype(np.float64) / 65535.0
-        _pro_f = _pro.astype(np.float64) / 65535.0
-        cam_to_prophoto, _, _, _ = np.linalg.lstsq(
-            _cam_f.reshape(-1, 3), _pro_f.reshape(-1, 3), rcond=None)
-        cam_to_prophoto = cam_to_prophoto.T.astype(np.float64)
-        del _cam, _pro, _cam_f, _pro_f
-        apply_matrix_inplace(rgb, cam_to_prophoto)
+        else:
+            # Non-Bayer sensor (Foveon, etc.): fallback to rawpy postprocess
+            logger.info(f"  Non-Bayer sensor, using rawpy postprocess fallback")
+            with rawpy.imread(path) as raw:
+                rgb16 = raw.postprocess(
+                    gamma=(1, 1), no_auto_bright=True, use_camera_wb=True,
+                    use_auto_wb=False, output_bps=16,
+                    output_color=rawpy.ColorSpace.ProPhoto,
+                    bright=1.0, highlight_mode=2,
+                )
+            rgb = (rgb16 / 65535.0).astype(np.float32)
+            del rgb16
 
         # Clip negatives (gamut mapping can produce them)
         np.maximum(rgb, 0.0, out=rgb)
@@ -346,7 +352,10 @@ class ImageProcessor(QThread):
         self.last_grading_key = None
         self.cached_graded_clean = None
         self.gpu_graded.clear()
+        self._gpu_uint8 = None
         self.cached_auto_ev = 0.0
+        # Force immediate GPU memory release
+        gc.collect()
         self.last_metering_key = None
 
     def _release_gpu_buffers(self):

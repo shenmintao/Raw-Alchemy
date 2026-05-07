@@ -468,59 +468,64 @@ def rcd_demosaic(
 
     filters_u32 = np.uint32(filters)
 
-    # Allocate GPU buffers
+    # Allocate GPU buffers — release early to minimize peak VRAM.
+    # Peak: 7 × HW float32 + 1 × HWx3 float32
+    # For 42MP: 7×170MB + 510MB ≈ 1.7GB
     cfa = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    rgb0 = ti.ndarray(dtype=ti.f32, shape=(h, w))  # RED
-    rgb1 = ti.ndarray(dtype=ti.f32, shape=(h, w))  # GREEN
-    rgb2 = ti.ndarray(dtype=ti.f32, shape=(h, w))  # BLUE
+    rgb0 = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    rgb1 = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    rgb2 = ti.ndarray(dtype=ti.f32, shape=(h, w))
     VH_dir = ti.ndarray(dtype=ti.f32, shape=(h, w))
     lpf = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    p_diff = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    q_diff = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    PQ_dir = ti.ndarray(dtype=ti.f32, shape=(h, w))
     out = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
 
-    # Upload input
     cfa.from_numpy(np.ascontiguousarray(bayer, dtype=np.float32))
 
-    # Step 0: Populate
+    # Step 0-3: Green channel interpolation
     _rcd_populate(cfa, cfa, rgb0, rgb1, rgb2, filters_u32)
-
-    # Step 1: VH directional discrimination
     _rcd_step1(cfa, VH_dir, w, h)
-
-    # Step 2: Low-pass filter
     _rcd_step2(cfa, lpf, w, h, filters_u32)
-
-    # Step 3: Green interpolation at R/B
     _rcd_step3(cfa, lpf, rgb1, VH_dir, w, h, filters_u32)
 
-    # Step 4.0: P/Q diagonal high-pass
+    # Free lpf, allocate p_diff and q_diff (reuse lpf slot)
+    del lpf
+    p_diff = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    q_diff = ti.ndarray(dtype=ti.f32, shape=(h, w))
+
+    # Step 4.0-4.1: Diagonal discrimination
     _rcd_step4_0(cfa, p_diff, q_diff, w, h)
 
-    # Step 4.1: P/Q discrimination
+    # Free cfa (no longer needed), allocate PQ_dir
+    del cfa
+    PQ_dir = ti.ndarray(dtype=ti.f32, shape=(h, w))
     _rcd_step4_1(p_diff, q_diff, PQ_dir, w, h, filters_u32)
 
-    # Step 4.2: R/B at R/B positions
-    _rcd_step4_2(rgb0, rgb1, rgb2, PQ_dir, w, h, filters_u32)
+    # Free p_diff, q_diff
+    del p_diff, q_diff
 
-    # Step 4.3: R/B at Green positions
+    # Step 4.2-4.3: R/B interpolation
+    _rcd_step4_2(rgb0, rgb1, rgb2, PQ_dir, w, h, filters_u32)
+    del PQ_dir
     _rcd_step4_3(rgb0, rgb1, rgb2, VH_dir, w, h, filters_u32)
+    del VH_dir
 
     # Step 5: Write output (skip 4-pixel border)
     _rcd_write_output(rgb0, rgb1, rgb2, out, 4)
+    del rgb0, rgb1, rgb2
 
-    # Border: simple bilinear
+    # Border: simple bilinear — reuse rgb0 slot for bayer upload
     bayer_arr = ti.ndarray(dtype=ti.f32, shape=(h, w))
     bayer_arr.from_numpy(np.ascontiguousarray(bayer, dtype=np.float32))
     _border_interpolate(bayer_arr, out, 4, filters_u32)
+    del bayer_arr
 
     result = out.to_numpy()
+    del out
+
+    # Force GPU memory release
+    import gc; gc.collect()
 
     elapsed = time.time() - t0
     logger.info(f"RCD demosaic: {w}x{h} in {elapsed*1000:.0f}ms (GPU)")
-
-    # Free GPU buffers
-    del cfa, rgb0, rgb1, rgb2, VH_dir, lpf, p_diff, q_diff, PQ_dir, out, bayer_arr
 
     return result
