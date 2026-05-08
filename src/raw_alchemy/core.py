@@ -14,6 +14,83 @@ from raw_alchemy.math_ops import log_encode_gpu, apply_matrix_inplace
 
 
 # ==========================================
+#     高光重建 (Segmentation Based, GPU)
+# ==========================================
+
+def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
+    """Segmentation-based highlight reconstruction (GPU-accelerated).
+
+    Taichi GPU kernel computes per-pixel opposing-channel reference averages.
+    scipy.ndimage.label handles connected-component segmentation on CPU.
+    numpy.bincount vectorizes per-segment chrominance (no Python loops over segments).
+    """
+    from scipy.ndimage import binary_closing, label, maximum_filter
+    from raw_alchemy.math_ops import compute_hl_refavg
+
+    H, W = raw_data.shape
+    pat_size = cfa_pattern.shape[0]
+    g = max(float(wb[1]), 1e-6)
+
+    color_map = np.tile(cfa_pattern,
+                        ((H + pat_size - 1) // pat_size,
+                         (W + pat_size - 1) // pat_size))[:H, :W]
+    color_map = np.where(color_map >= 3, 1, color_map).astype(np.int32)
+
+    wb_gains = np.array([wb[0] / g, 1.0, wb[2] / g], dtype=np.float32)
+
+    CLIP = 0.987
+    raw_clips = np.array([CLIP / max(wg, 1e-6) for wg in wb_gains],
+                         dtype=np.float32)
+
+    refavg, clipped = compute_hl_refavg(raw_data, color_map, wb_gains, raw_clips)
+
+    if not np.any(clipped):
+        return
+
+    diff = raw_data - refavg
+    closing_struct = np.ones((7, 7), dtype=bool)
+
+    for c in range(3):
+        clipped_c = clipped & (color_map == c)
+        if not np.any(clipped_c):
+            continue
+
+        closed = binary_closing(clipped_c, structure=closing_struct)
+        labels, num_seg = label(closed)
+        if num_seg == 0:
+            continue
+
+        expanded = maximum_filter(labels, size=7)
+
+        lo = raw_clips[c] * 0.2
+        unclipped_valid = (color_map == c) & ~clipped & (raw_data > lo)
+
+        border = (expanded > 0) & (labels == 0) & unclipped_valid
+        border_labels = expanded[border]
+        border_diffs = diff[border]
+
+        seg_sum = np.bincount(border_labels, weights=border_diffs,
+                              minlength=num_seg + 1)
+        seg_cnt = np.bincount(border_labels, minlength=num_seg + 1)
+
+        global_chroma = 0.0
+        total_cnt = seg_cnt[1:].sum()
+        if total_cnt > 100:
+            global_chroma = seg_sum[1:].sum() / total_cnt
+
+        seg_chroma = np.where(seg_cnt > 10,
+                              seg_sum / np.maximum(seg_cnt, 1),
+                              global_chroma).astype(np.float32)
+
+        target = clipped_c & (labels > 0)
+        target_labels = labels[target]
+        raw_data[target] = np.maximum(
+            raw_data[target],
+            refavg[target] + seg_chroma[target_labels]
+        )
+
+
+# ==========================================
 #              核心处理函数
 # ==========================================
 
@@ -40,6 +117,8 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
 
     bl_avg = float(bl[0])
     raw_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
+
+    highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
 
     if is_bayer:
         dcraw_filters = get_dcraw_filters(cfa_pattern)
@@ -81,7 +160,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     del _cam, _pro, _cam_f, _pro_f
     apply_matrix_inplace(rgb, cam_to_prophoto)
 
-    np.maximum(rgb, 0.0, out=rgb)
+    np.clip(rgb, 0.0, 1.0, out=rgb)
     return rgb
 
 

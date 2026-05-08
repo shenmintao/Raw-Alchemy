@@ -1103,6 +1103,114 @@ def clip_inplace(img):
 
 
 @ti.kernel
+def _highlight_recovery_wb_kernel(
+    img: ti.types.ndarray(dtype=ti.f32, ndim=3),
+    wb_r: ti.f32, wb_b: ti.f32,
+):
+    for y, x in ti.ndrange(img.shape[0], img.shape[1]):
+        r = img[y, x, 0]
+        g = img[y, x, 1]
+        b = img[y, x, 2]
+        m = ti.max(r * wb_r, ti.max(g, b * wb_b))
+        if m > 1.0:
+            scale = 1.0 / m
+            img[y, x, 0] = r * scale
+            img[y, x, 1] = g * scale
+            img[y, x, 2] = b * scale
+
+
+def highlight_recovery_wb(img, wb_r, wb_b):
+    _highlight_recovery_wb_kernel(img, float(wb_r), float(wb_b))
+
+
+@ti.kernel
+def _compute_hl_refavg_kernel(
+    raw: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    color_map: ti.types.ndarray(dtype=ti.i32, ndim=2),
+    wb0: ti.f32, wb1: ti.f32, wb2: ti.f32,
+    clip0: ti.f32, clip1: ti.f32, clip2: ti.f32,
+    refavg_out: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    clipped_out: ti.types.ndarray(dtype=ti.i32, ndim=2),
+):
+    H = raw.shape[0]
+    W = raw.shape[1]
+    wb = ti.Vector([wb0, wb1, wb2])
+    clips = ti.Vector([clip0, clip1, clip2])
+
+    for y, x in ti.ndrange(H, W):
+        color = color_map[y, x]
+        val = raw[y, x]
+        is_clipped = 0
+        if val >= clips[color]:
+            is_clipped = 1
+
+        mean = ti.Vector([0.0, 0.0, 0.0])
+        cnt = ti.Vector([0.0, 0.0, 0.0])
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                ny = ti.max(0, ti.min(H - 1, y + dy))
+                nx = ti.max(0, ti.min(W - 1, x + dx))
+                nv = ti.max(0.0, raw[ny, nx])
+                nc = color_map[ny, nx]
+                mean[nc] += nv
+                cnt[nc] += 1.0
+
+        cbrt_mean = ti.Vector([0.0, 0.0, 0.0])
+        for c in ti.static(range(3)):
+            if cnt[c] > 0.0:
+                cbrt_mean[c] = ti.pow(wb[c] * mean[c] / cnt[c], 1.0 / 3.0)
+
+        opp_cbrt = ti.Vector([
+            0.5 * (cbrt_mean[1] + cbrt_mean[2]),
+            0.5 * (cbrt_mean[0] + cbrt_mean[2]),
+            0.5 * (cbrt_mean[0] + cbrt_mean[1]),
+        ])
+
+        ref = opp_cbrt[color] * opp_cbrt[color] * opp_cbrt[color]
+        if wb[color] > 1e-6:
+            ref /= wb[color]
+
+        refavg_out[y, x] = ref
+        clipped_out[y, x] = is_clipped
+
+
+def compute_hl_refavg(raw_data, color_map, wb_gains, raw_clips):
+    """GPU-accelerated opposing-channel reference average for highlight reconstruction."""
+    H, W = raw_data.shape
+    refavg = np.zeros((H, W), dtype=np.float32)
+    clipped = np.zeros((H, W), dtype=np.int32)
+    _compute_hl_refavg_kernel(
+        raw_data, color_map.astype(np.int32),
+        float(wb_gains[0]), float(wb_gains[1]), float(wb_gains[2]),
+        float(raw_clips[0]), float(raw_clips[1]), float(raw_clips[2]),
+        refavg, clipped,
+    )
+    return refavg, clipped.astype(bool)
+
+
+@ti.kernel
+def _highlight_desaturate_kernel(
+    img: ti.types.ndarray(dtype=ti.f32, ndim=3),
+    threshold: ti.f32,
+):
+    for y, x in ti.ndrange(img.shape[0], img.shape[1]):
+        r = img[y, x, 0]
+        g = img[y, x, 1]
+        b = img[y, x, 2]
+        m = ti.max(r, ti.max(g, b))
+        if m > threshold:
+            blend = ti.min((m - threshold) / (1.0 - threshold), 1.0)
+            white = ti.min(m, 1.0)
+            img[y, x, 0] = r + (white - r) * blend
+            img[y, x, 1] = g + (white - g) * blend
+            img[y, x, 2] = b + (white - b) * blend
+
+
+def highlight_desaturate(img, threshold=0.8):
+    _highlight_desaturate_kernel(img, float(threshold))
+
+
+@ti.kernel
 def _max_inplace_kernel(img: ti.types.ndarray(dtype=ti.f32, ndim=3), min_val: ti.f32):
     """Clamp image values to >= min_val on GPU (like np.maximum)."""
     for y, x in ti.ndrange(img.shape[0], img.shape[1]):
@@ -1781,9 +1889,18 @@ def warmup():
     u8_dst = np.zeros((16, 16, 3), dtype=np.uint8)
     float_to_uint8_gpu(ds_dst, u8_dst)
 
-    # 14. Clip / Max
+    # 14. Clip / Max / Highlight Recovery
     clip_inplace(ds_dst)
     max_inplace(ds_dst, 1e-6)
+    highlight_recovery_wb(ds_dst, 1.2, 0.8)
+    highlight_desaturate(ds_dst, 0.8)
+
+    # 14c. Highlight refavg
+    dummy_raw = np.zeros((16, 16), dtype=np.float32)
+    dummy_cmap = np.zeros((16, 16), dtype=np.int32)
+    compute_hl_refavg(dummy_raw, dummy_cmap,
+                      np.array([1.2, 1.0, 0.8], dtype=np.float32),
+                      np.array([0.8, 0.987, 1.2], dtype=np.float32))
 
     # 15. Geometry (rotate/flip)
     geom_src = np.zeros((16, 16, 3), dtype=np.float32)

@@ -214,15 +214,21 @@ class ImageProcessor(QThread):
                 if is_xtrans:
                     xtrans_pat = cfa_pattern.copy()
 
+        g = wb[1] if wb[1] > 0 else 1.0
+
+        from raw_alchemy.core import highlight_inpaint_opposed
+
         if is_bayer:
             bl_avg = float(bl[0])
             bayer_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
+
+            highlight_inpaint_opposed(bayer_norm, cfa_pattern, wb)
+
             dcraw_filters = get_dcraw_filters(cfa_pattern)
             rgb = rcd_demosaic(bayer_norm, dcraw_filters)
             rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
 
             # Apply white balance
-            g = wb[1] if wb[1] > 0 else 1.0
             rgb[:, :, 0] *= wb[0] / g
             rgb[:, :, 2] *= wb[2] / g
 
@@ -245,10 +251,12 @@ class ImageProcessor(QThread):
 
             bl_avg = float(bl[0])
             raw_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
+
+            highlight_inpaint_opposed(raw_norm, xtrans_pat, wb)
+
             rgb = xtrans_markesteijn_demosaic(raw_norm, xtrans_pat)
             rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
 
-            g = wb[1] if wb[1] > 0 else 1.0
             rgb[:, :, 0] *= wb[0] / g
             rgb[:, :, 2] *= wb[2] / g
 
@@ -278,8 +286,7 @@ class ImageProcessor(QThread):
             rgb = (rgb16 / 65535.0).astype(np.float32)
             del rgb16
 
-        # Clip negatives (gamut mapping can produce them)
-        np.maximum(rgb, 0.0, out=rgb)
+        np.clip(rgb, 0.0, 1.0, out=rgb)
 
         # Extract EXIF via pyexiv2
         exif_data, exif_metadata = extract_lens_exif(path, None)

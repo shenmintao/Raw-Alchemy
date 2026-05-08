@@ -86,6 +86,10 @@ pyexiv2_binaries = pyexiv2_ret[1]
 pyexiv2_hiddenimports = pyexiv2_ret[2]
 binaries_list.extend(pyexiv2_binaries)
 
+taichi_ret = collect_all('taichi')
+taichi_datas = taichi_ret[0]
+taichi_binaries = taichi_ret[1]
+taichi_hiddenimports = taichi_ret[2]
 
 # Determine ONNX Runtime package based on platform
 ort_package = 'onnxruntime' # Default fallback
@@ -101,8 +105,16 @@ a = Analysis(
     ['src/raw_alchemy/main.py'],
     pathex=[],
     binaries=binaries_list,
-    datas=[('src/raw_alchemy/vendor', 'vendor'),('src/raw_alchemy/locales', 'locales'), ('icon.ico', '.'), ('icon.png', '.')],
-    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package],
+    datas=[
+        ('src/raw_alchemy/vendor', 'vendor'),
+        ('src/raw_alchemy/locales', 'locales'),
+        ('icon.ico', '.'), ('icon.png', '.'),
+        ('src/raw_alchemy/math_ops.py', 'raw_alchemy'),
+        ('src/raw_alchemy/demosaic.py', 'raw_alchemy'),
+        ('src/raw_alchemy/xtrans_demosaic.py', 'raw_alchemy'),
+        ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
+    ] + taichi_datas,
+    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'] + taichi_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

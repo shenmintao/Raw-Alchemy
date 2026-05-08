@@ -83,6 +83,16 @@ pyexiv2_binaries = pyexiv2_ret[1]
 pyexiv2_hiddenimports = pyexiv2_ret[2]
 binaries_list.extend(pyexiv2_binaries)
 
+taichi_ret = collect_all('taichi')
+taichi_datas = taichi_ret[0]
+taichi_binaries = taichi_ret[1]
+taichi_hiddenimports = taichi_ret[2]
+
+_taichi_exclude = {'c_api', 'examples'}
+taichi_datas = [(src, dst) for src, dst in taichi_datas
+                if not any(ex in src for ex in _taichi_exclude)]
+taichi_binaries = [(src, dst) for src, dst in taichi_binaries
+                   if not any(ex in src for ex in _taichi_exclude)]
 
 # Determine ONNX Runtime package based on platform
 ort_package = 'onnxruntime' # Default fallback
@@ -100,8 +110,16 @@ a = Analysis(
     ['src/raw_alchemy/main.py'],
     pathex=[],
     binaries=binaries_list,
-    datas=[('src/raw_alchemy/vendor', 'vendor'),('src/raw_alchemy/locales', 'locales'), ('icon.ico', '.'), ('icon.png', '.')],
-    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package],
+    datas=[
+        ('src/raw_alchemy/vendor', 'vendor'),
+        ('src/raw_alchemy/locales', 'locales'),
+        ('icon.ico', '.'), ('icon.png', '.'),
+        ('src/raw_alchemy/math_ops.py', 'raw_alchemy'),
+        ('src/raw_alchemy/demosaic.py', 'raw_alchemy'),
+        ('src/raw_alchemy/xtrans_demosaic.py', 'raw_alchemy'),
+        ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
+    ] + taichi_datas,
+    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'] + taichi_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -114,16 +132,23 @@ a = Analysis(
         'qtpy',
         'test',
         'doctest',
-        'distutils',
         'setuptools',
         'wheel',
         'pkg_resources',
         'Cython',
         'PyInstaller',
+        'matplotlib',
     ],
     noarchive=False,
     optimize=1,
 )
+
+_pyside6_exclude = {'opengl32sw', 'Qt6Quick', 'Qt6Qml', 'Qt6QmlModels', 'Qt6Pdf', 'Qt6VirtualKeyboard'}
+a.binaries = [b for b in a.binaries
+              if not any(ex in b[0] for ex in _pyside6_exclude)]
+a.datas = [d for d in a.datas
+           if not d[0].startswith('PySide6/translations')]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
