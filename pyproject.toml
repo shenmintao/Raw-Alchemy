@@ -20,6 +20,7 @@ dependencies = [
     "tifffile",
     "click",
     "colour-science @ git+https://github.com/colour-science/colour.git@develop",
+    "opencv-python-headless",
     "scipy",
     "Pillow",
     "pillow-heif",

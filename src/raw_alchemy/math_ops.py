@@ -1225,7 +1225,7 @@ def max_inplace(img, min_val):
 
 
 # =========================================================
-# GPU Lens Remap (replaces scipy.map_coordinates)
+# GPU Lens Remap (bicubic, per-channel coords for TCA)
 # =========================================================
 
 @ti.func
@@ -1288,7 +1288,7 @@ def _lens_remap_kernel(
 
 
 def lens_remap_gpu(src_gpu, dst_gpu, coords, oob_mask_np):
-    """GPU lens distortion remap (replaces scipy.map_coordinates).
+    """GPU lens distortion remap, bicubic, per-channel coords for TCA.
 
     Args:
         src_gpu: Source GpuImage (HxWx3 float32)

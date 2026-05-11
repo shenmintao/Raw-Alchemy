@@ -19,8 +19,7 @@ from raw_alchemy.math_ops import (
     perspective_warp_kernel,
     compute_perspective_matrix
 )
-from scipy import ndimage
-
+import cv2
 
 @lru_cache(maxsize=8)
 def load_lut_cached(lut_path: str):
@@ -302,7 +301,7 @@ def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Op
     logger.info(f"  🧬 [Lens] {params.get('camera_maker')} {params.get('camera_model')} + {params.get('lens_model')}")
     
     try:
-        # lensfun_wrapper 内部通常会调用 cv2.remap 或 scipy.map_coordinates
+        # lensfun_wrapper 内部会调用 cv2.remap
         # 这必然返回新图像
         corrected = lf.apply_lens_correction(
             image=image,
@@ -439,13 +438,28 @@ def apply_geometry(img: np.ndarray, rotation: int = 0, flip_h: bool = False, fli
             
     # 2. Arbitrary angle rotation
     else:
-        # ndimage.rotate uses CCW angle, so we use -rotation
-        # reshape=True ensures the whole image is kept
-        # order=3 (cubic) or order=1 (bilinear). Keep order=1 for speed in preview? 
-        # Actually for quality we might want 3, but let's stick to default or 1 for responsiveness first.
-        # User requested "specific angle", so let's allow arbitrary.
-        # Note: This is computationally expensive!
-        out = ndimage.rotate(out, -rotation, reshape=True, order=1, prefilter=False)
+        # cv2.getRotationMatrix2D uses CCW-positive angles. The caller's
+        # ``rotation`` convention is CW-positive, so we negate.
+        h, w = out.shape[:2]
+        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -rotation, 1.0)
+
+        # reshape=True equivalent: compute the new bounding box and shift
+        # the matrix so the rotated image fits exactly.
+        cos = abs(M[0, 0])
+        sin = abs(M[0, 1])
+        # Use ceil so we never crop a pixel at the rotated bbox edge.
+        new_w = int(np.ceil(h * sin + w * cos))
+        new_h = int(np.ceil(h * cos + w * sin))
+        M[0, 2] += new_w / 2.0 - w / 2.0
+        M[1, 2] += new_h / 2.0 - h / 2.0
+
+        # Bilinear is sufficient for interactive preview rotation.
+        out = cv2.warpAffine(
+            out, M, (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
         
     if flip_h:
         out = np.fliplr(out)
