@@ -161,14 +161,16 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
     is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
 
-    raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
-    fix_hot_pixels(raw_norm, cfa_pattern)
-    highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
-
     if is_bayer:
+        raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
+        fix_hot_pixels(raw_norm, cfa_pattern)
+        highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
         dcraw_filters = get_dcraw_filters(cfa_pattern)
         rgb = rcd_demosaic(raw_norm, dcraw_filters)
     elif is_xtrans:
+        raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
+        fix_hot_pixels(raw_norm, cfa_pattern)
+        highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
         from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
         rgb = xtrans_markesteijn_demosaic(raw_norm, cfa_pattern)
     else:
@@ -182,6 +184,8 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
             )
         rgb = (rgb16 / 65535.0).astype(np.float32)
         del rgb16
+        if rgb.ndim == 3 and rgb.shape[2] == 1:
+            rgb = np.repeat(rgb, 3, axis=2)
         np.maximum(rgb, 0.0, out=rgb)
         return rgb
 

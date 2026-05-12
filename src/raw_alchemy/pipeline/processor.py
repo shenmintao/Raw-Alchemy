@@ -270,6 +270,8 @@ class ImageProcessor(QThread):
                 )
             rgb = (rgb16 / 65535.0).astype(np.float32)
             del rgb16
+            if rgb.ndim == 3 and rgb.shape[2] == 1:
+                rgb = np.repeat(rgb, 3, axis=2)
 
         np.clip(rgb, 0.0, 1.0, out=rgb)
 

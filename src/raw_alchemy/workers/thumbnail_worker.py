@@ -108,6 +108,8 @@ class ThumbnailWorker(QThread):
                         )
                     rgb = rgb16.astype(np.float32) / 65535.0
                     del rgb16
+                    if rgb.ndim == 3 and rgb.shape[2] == 1:
+                        rgb = np.repeat(rgb, 3, axis=2)
 
                     np.clip(rgb, 0.0, 1.0, out=rgb)
                     mask = rgb <= 0.0031308
