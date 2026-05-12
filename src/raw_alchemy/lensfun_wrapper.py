@@ -804,35 +804,35 @@ def compute_lens_distortion_map(
     if coords is None:
         return None
 
-    # Auto-crop scale
-    x_min = min(coords[:, :, ch, 0].min() for ch in range(3))
-    x_max = max(coords[:, :, ch, 0].max() for ch in range(3))
-    y_min = min(coords[:, :, ch, 1].min() for ch in range(3))
-    y_max = max(coords[:, :, ch, 1].max() for ch in range(3))
+    # Flatten to (N, 2) for vectorized min/max/scale/clamp/oob
+    all_x = coords[:, :, :, 0].ravel()
+    all_y = coords[:, :, :, 1].ravel()
 
+    x_min, x_max = float(all_x.min()), float(all_x.max())
+    y_min, y_max = float(all_y.min()), float(all_y.max())
+
+    # Auto-crop scale
     if x_min < 0 or y_min < 0 or x_max >= width or y_max >= height:
         x_range = x_max - x_min
         y_range = y_max - y_min
         scale_x = (width - 1) / x_range if x_range > 0 else 1.0
         scale_y = (height - 1) / y_range if y_range > 0 else 1.0
         scale = min(scale_x, scale_y)
-        cx, cy = width / 2.0, height / 2.0
-        for ch in range(3):
-            coords[:, :, ch, 0] = cx + (coords[:, :, ch, 0] - cx) * scale
-            coords[:, :, ch, 1] = cy + (coords[:, :, ch, 1] - cy) * scale
+        cx, cy = float(width) / 2.0, float(height) / 2.0
+        all_x[:] = cx + (all_x - cx) * scale
+        all_y[:] = cy + (all_y - cy) * scale
         logger.info(f"  ⚖️ [Lensfun] Auto-crop scale: {scale:.4f} (src range: x=[{x_min:.1f},{x_max:.1f}] y=[{y_min:.1f},{y_max:.1f}])")
 
-    # Build OOB mask
+    # OOB mask + clamp (single pass over flattened views)
     interp_margin = 2.0
-    oob_mask = np.zeros((height, width), dtype=bool)
-    for ch in range(3):
-        oob_mask |= (coords[:, :, ch, 0] < interp_margin) | (coords[:, :, ch, 0] > width - 1 - interp_margin)
-        oob_mask |= (coords[:, :, ch, 1] < interp_margin) | (coords[:, :, ch, 1] > height - 1 - interp_margin)
+    oob_x = (all_x < interp_margin) | (all_x > width - 1 - interp_margin)
+    oob_y = (all_y < interp_margin) | (all_y > height - 1 - interp_margin)
+    oob_flat = oob_x | oob_y
+    oob_mask = oob_flat.reshape(height, width, 3).any(axis=2)
+    del oob_x, oob_y, oob_flat
 
-    # Clamp coords
-    for ch in range(3):
-        np.clip(coords[:, :, ch, 0], 0, width - 1, out=coords[:, :, ch, 0])
-        np.clip(coords[:, :, ch, 1], 0, height - 1, out=coords[:, :, ch, 1])
+    np.clip(all_x, 0, width - 1, out=all_x)
+    np.clip(all_y, 0, height - 1, out=all_y)
 
     _distortion_map_cache[cache_key] = (coords, oob_mask)
 
