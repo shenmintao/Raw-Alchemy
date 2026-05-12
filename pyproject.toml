@@ -35,6 +35,7 @@ dependencies = [
     "packaging",
     "loguru",
     "pyexiv2",
+    "psutil",
     "onnxruntime-gpu; sys_platform != 'darwin'",
     "onnxruntime; sys_platform == 'darwin'",
 ]

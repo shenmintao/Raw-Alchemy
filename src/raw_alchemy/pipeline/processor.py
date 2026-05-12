@@ -72,7 +72,7 @@ class ImageProcessor(QThread):
         self.current_request_id = 0
 
         # LRU Cache (CPU-side, for RAW decode results)
-        self.cache_manager = ImageCacheManager(max_items=5, max_memory_mb=1500)
+        self.cache_manager = ImageCacheManager()
         self._warmed_up = False
 
         # ===== CPU stage caches =====
@@ -358,7 +358,18 @@ class ImageProcessor(QThread):
 
         # Reset pipeline caches for new image
         if path != self.current_path:
-            self._invalidate_pipeline_caches()
+            if cached_item and cached_item.corrected_data is not None:
+                # Cache hit with lens correction: only invalidate downstream
+                self.last_geo_crop_key = None
+                self.gpu_cropped.clear()
+                self.last_grading_key = None
+                self.cached_graded_clean = None
+                self.gpu_graded.clear()
+                self._gpu_uint8 = None
+                self.last_metering_key = None
+                self.cached_auto_ev = 0.0
+            else:
+                self._invalidate_pipeline_caches()
             self.current_path = path
 
         self.load_complete.emit(path, request.request_id)
@@ -411,6 +422,25 @@ class ImageProcessor(QThread):
     # Processing Pipeline (GPU-resident)
     # =================================================================
 
+    @staticmethod
+    def _make_output_key(params):
+        return (
+            params.get('denoise_enabled', False),
+            params.get('lens_correct'), params.get('custom_db_path'),
+            params.get('rotation', 0),
+            params.get('flip_horizontal', False),
+            params.get('flip_vertical', False),
+            params.get('perspective_corners'),
+            params.get('crop', (0.0, 0.0, 1.0, 1.0)),
+            params.get('exposure_mode'), params.get('exposure', 0.0),
+            params.get('metering_mode', 'matrix'),
+            params.get('wb_temp', 0.0), params.get('wb_tint', 0.0),
+            params.get('highlight', 0.0), params.get('shadow', 0.0),
+            params.get('saturation', 1.0), params.get('contrast', 1.0),
+            params.get('log_space'), params.get('lut_path'),
+            params.get('sharpen_strength', 0.0),
+        )
+
     def _do_process(self, request: ProcessRequest):
         t_start = time.perf_counter()
         logger.debug(f"[Worker] _do_process: {os.path.basename(request.path)}, id={request.request_id}")
@@ -423,6 +453,15 @@ class ImageProcessor(QThread):
                     return
 
             params = request.params
+
+            # Fast path: check if cached output matches current params
+            output_key = self._make_output_key(params)
+            cached_item = self.cache_manager.get(request.path)
+            if cached_item and cached_item.output_key == output_key and cached_item.output_uint8 is not None:
+                logger.info(f"[Worker] Output Cache Hit: {os.path.basename(request.path)}")
+                self.result_ready.emit(cached_item.output_uint8, request.path,
+                                       request.request_id, cached_item.output_ev)
+                return
 
             # --- Stage 0: Denoising (CANS RAW V2, packed RAW → ProPhoto Linear) ---
             # When enabled, replaces rawpy demosaicing entirely.
@@ -797,6 +836,17 @@ class ImageProcessor(QThread):
 
             t_end = time.perf_counter()
             logger.info(f"[Worker] Pipeline: {(t_end - t_start)*1000:.0f}ms total, output: {(t_end - t_out)*1000:.0f}ms")
+
+            # Cache final output for instant switching
+            cached_item = self.cache_manager.get(request.path)
+            if cached_item:
+                old_size = cached_item.size_mb
+                cached_item.output_uint8 = img_uint8.copy()
+                cached_item.output_key = output_key
+                cached_item.output_ev = applied_ev
+                cached_item.update_size()
+                with self.cache_manager.lock:
+                    self.cache_manager.current_memory_mb += cached_item.size_mb - old_size
 
             self.result_ready.emit(img_uint8, request.path,
                                    request.request_id, applied_ev)

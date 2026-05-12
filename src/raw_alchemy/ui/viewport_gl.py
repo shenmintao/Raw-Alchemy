@@ -308,11 +308,45 @@ class ImageViewportGL(QOpenGLWidget):
             self._offset_y = 0.0
             self.update()
 
+    def _clamp_offset(self):
+        if self._img_width <= 0 or self._img_height <= 0:
+            return
+        vp_w, vp_h = self.width(), self.height()
+        if vp_w <= 0 or vp_h <= 0:
+            return
+        img_aspect = self._img_width / self._img_height
+        vp_aspect = vp_w / vp_h
+
+        if img_aspect > vp_aspect:
+            sx, sy = self._zoom, self._zoom * vp_aspect / img_aspect
+        else:
+            sx, sy = self._zoom * img_aspect / vp_aspect, self._zoom
+
+        if sx <= 1.0:
+            self._offset_x = 0.0
+        else:
+            max_off = sx - 1.0
+            self._offset_x = max(-max_off, min(self._offset_x, max_off))
+
+        if sy <= 1.0:
+            self._offset_y = 0.0
+        else:
+            max_off = sy - 1.0
+            self._offset_y = max(-max_off, min(self._offset_y, max_off))
+
     def wheelEvent(self, event: QWheelEvent):
         delta = event.angleDelta().y()
-        zoom_factor = 1.1 if delta > 0 else (1 / 1.1)
-        self._zoom *= zoom_factor
-        self._zoom = max(0.1, min(self._zoom, 50.0))
+        factor = 1.1 if delta > 0 else (1 / 1.1)
+        old_zoom = self._zoom
+        self._zoom = max(0.1, min(self._zoom * factor, 50.0))
+        real_factor = self._zoom / old_zoom
+
+        mx = (event.position().x() / self.width()) * 2.0 - 1.0
+        my = -((event.position().y() / self.height()) * 2.0 - 1.0)
+
+        self._offset_x = mx - (mx - self._offset_x) * real_factor
+        self._offset_y = my - (my - self._offset_y) * real_factor
+        self._clamp_offset()
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -335,6 +369,7 @@ class ImageViewportGL(QOpenGLWidget):
             self._offset_x += dx
             self._offset_y += dy
             self._last_mouse_pos = pos
+            self._clamp_offset()
             self.update()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):

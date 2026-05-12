@@ -931,6 +931,7 @@ class MainWindow(FluentWindow):
     
     def on_thumbnail_finished(self):
         self.loading_label.hide()
+        self._preload_neighbors(0, count=2)
 
     def add_gallery_item(self, path, image):
         name = os.path.basename(path)
@@ -952,6 +953,8 @@ class MainWindow(FluentWindow):
             item = self.gallery_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == path:
                 item.setIcon(QIcon(pixmap))
+                rect = self.gallery_list.visualItemRect(item)
+                self.gallery_list.viewport().update(rect)
                 break
 
     def on_gallery_item_clicked(self, item):
@@ -995,7 +998,10 @@ class MainWindow(FluentWindow):
         
         self.update_mark_button_state()
         self.load_image(path)
-        
+
+        current_row = self.gallery_list.row(item)
+        self._preload_neighbors(current_row)
+
         if path in self.file_baseline_params_cache:
             QTimer.singleShot(25, self.regenerate_baseline_for_current_image)
 
@@ -1003,7 +1009,16 @@ class MainWindow(FluentWindow):
         self.preview_lbl.setText(tr('loading'))
         self.viewport.clear_image()
         self.current_request_id = self.processor.load_image(path)
-        
+
+    def _preload_neighbors(self, current_index, count=2):
+        total = self.gallery_list.count()
+        for offset in range(1, count + 1):
+            for idx in [current_index + offset, current_index - offset]:
+                if 0 <= idx < total:
+                    path = self.gallery_list.item(idx).data(Qt.ItemDataRole.UserRole)
+                    if not self.processor.cache_manager.get(path):
+                        self.processor.preload_image(path)
+
     def on_param_changed(self, params):
         self.update_timer.start()
     
