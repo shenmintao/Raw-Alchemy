@@ -70,6 +70,7 @@ class ImageProcessor(QThread):
         # Request management
         self.pending_request: Optional[ProcessRequest] = None
         self.current_request_id = 0
+        self._preload_queue: list = []
 
         # LRU Cache (CPU-side, for RAW decode results)
         self.cache_manager = ImageCacheManager()
@@ -135,8 +136,8 @@ class ImageProcessor(QThread):
 
     def preload_image(self, path: str):
         with self.lock:
-            if self.pending_request is None:
-                self.pending_request = ProcessRequest(path, {'_preload': True}, -1)
+            if not any(p.path == path for p in self._preload_queue):
+                self._preload_queue.append(ProcessRequest(path, {'_preload': True}, -1))
         if not self.isRunning():
             self.start()
 
@@ -163,6 +164,9 @@ class ImageProcessor(QThread):
                 request = self.pending_request
                 if request:
                     self.pending_request = None
+                    self._preload_queue.clear()
+                elif self._preload_queue:
+                    request = self._preload_queue.pop(0)
 
             if not request:
                 time.sleep(0.05)
@@ -281,7 +285,7 @@ class ImageProcessor(QThread):
         return rgb, exif_data, exif_metadata
 
     def _do_preload(self, request: ProcessRequest):
-        """Preload RAW into CPU cache only."""
+        """Preload RAW into CPU cache with lens correction."""
         path = request.path
         if self.cache_manager.get(path):
             return
@@ -296,8 +300,42 @@ class ImageProcessor(QThread):
                 lens_key=None,
                 exif_metadata=_exif_meta,
             )
+
+            # Precompute lens correction on CPU
+            if exif_data:
+                try:
+                    import cv2
+                    from raw_alchemy.lensfun_wrapper import compute_lens_distortion_map
+
+                    dist_result = compute_lens_distortion_map(
+                        img,
+                        camera_maker=exif_data.get('camera_maker'),
+                        camera_model=exif_data.get('camera_model'),
+                        lens_maker=exif_data.get('lens_maker'),
+                        lens_model=exif_data.get('lens_model'),
+                        focal_length=exif_data.get('focal_length', 0),
+                        aperture=exif_data.get('aperture', 0),
+                        crop_factor=exif_data.get('crop_factor'),
+                    )
+                    if dist_result is not None:
+                        coords, oob_mask, vignette_img = dist_result
+                        corrected = np.empty_like(vignette_img)
+                        for ch in range(3):
+                            map_x = coords[:, :, ch, 0]
+                            map_y = coords[:, :, ch, 1]
+                            corrected[:, :, ch] = cv2.remap(
+                                vignette_img[:, :, ch], map_x, map_y,
+                                cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                        corrected[oob_mask] = 0
+                        new_cache_item.corrected_data = corrected
+                        new_cache_item.lens_key = (True, None, False)
+                        new_cache_item.update_size()
+                except Exception as e:
+                    logger.debug(f"[Worker] Preload lens correction skipped: {e}")
+
             self.cache_manager.put(path, new_cache_item)
-            logger.info(f"[Worker] Preloaded: {os.path.basename(path)} ({img.shape[1]}x{img.shape[0]})")
+            logger.info(f"[Worker] Preloaded: {os.path.basename(path)} ({img.shape[1]}x{img.shape[0]})"
+                         f"{' +lens' if new_cache_item.corrected_data is not None else ''}")
 
         except Exception as e:
             logger.warning(f"Preload failed for {path}: {e}")
@@ -517,8 +555,8 @@ class ImageProcessor(QThread):
             if current_lens_key != self.cached_lens_key or not self.gpu_corrected.valid:
                 logger.debug("[Worker] Lens correction...")
                 if params.get('lens_correct') and self.exif_data:
+                    import cv2
                     from raw_alchemy.lensfun_wrapper import compute_lens_distortion_map
-                    from raw_alchemy.math_ops import lens_remap_gpu
 
                     lf_params = {**self.exif_data}
                     dist_result = compute_lens_distortion_map(
@@ -534,17 +572,16 @@ class ImageProcessor(QThread):
                     )
 
                     if dist_result is not None:
-                        coords, oob_mask, corrected_img = dist_result
-                        # Upload source to GPU, then remap on GPU
-                        self.gpu_corrected.upload(corrected_img)
-                        # Use a temp buffer for remap output
-                        from raw_alchemy.gpu_buffer import GpuImage
-                        gpu_temp = GpuImage()
-                        lens_remap_gpu(self.gpu_corrected, gpu_temp, coords, oob_mask)
-                        # Swap: corrected = remapped result
-                        self.gpu_corrected.copy_from(gpu_temp)
-                        gpu_temp.clear()
-                        self.cpu_corrected = self.gpu_corrected.to_numpy()
+                        coords, oob_mask, vignette_img = dist_result
+                        corrected = np.empty_like(vignette_img)
+                        for ch in range(3):
+                            corrected[:, :, ch] = cv2.remap(
+                                vignette_img[:, :, ch],
+                                coords[:, :, ch, 0], coords[:, :, ch, 1],
+                                cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                        corrected[oob_mask] = 0
+                        self.cpu_corrected = corrected
+                        self.gpu_corrected.upload(corrected)
                     else:
                         self.cpu_corrected = linear_source
                         self.gpu_corrected.upload(self.cpu_corrected)
