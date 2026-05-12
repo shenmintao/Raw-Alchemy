@@ -216,12 +216,11 @@ class ImageProcessor(QThread):
 
         g = wb[1] if wb[1] > 0 else 1.0
 
-        from raw_alchemy.core import highlight_inpaint_opposed
+        from raw_alchemy.core import highlight_inpaint_opposed, subtract_black_level, fix_hot_pixels
 
         if is_bayer:
-            bl_avg = float(bl[0])
-            bayer_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
-
+            bayer_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
+            fix_hot_pixels(bayer_norm, cfa_pattern)
             highlight_inpaint_opposed(bayer_norm, cfa_pattern, wb)
 
             dcraw_filters = get_dcraw_filters(cfa_pattern)
@@ -249,9 +248,8 @@ class ImageProcessor(QThread):
         elif is_xtrans:
             from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
 
-            bl_avg = float(bl[0])
-            raw_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
-
+            raw_norm = subtract_black_level(sensor_raw, bl, wl, xtrans_pat)
+            fix_hot_pixels(raw_norm, xtrans_pat)
             highlight_inpaint_opposed(raw_norm, xtrans_pat, wb)
 
             rgb = xtrans_markesteijn_demosaic(raw_norm, xtrans_pat)

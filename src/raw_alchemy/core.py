@@ -14,6 +14,38 @@ from raw_alchemy.math_ops import log_encode_gpu, apply_matrix_inplace
 
 
 # ==========================================
+#          RAW 预处理
+# ==========================================
+
+def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
+    """Per-channel black level subtraction and normalization to [0, 1]."""
+    pat_size = cfa_pattern.shape[0]
+    result = np.empty_like(sensor_raw)
+    for r in range(pat_size):
+        for c in range(pat_size):
+            color = cfa_pattern[r, c]
+            bl_c = float(bl[min(color, len(bl) - 1)])
+            result[r::pat_size, c::pat_size] = np.maximum(
+                sensor_raw[r::pat_size, c::pat_size] - bl_c, 0
+            ) / (wl - bl_c)
+    return result
+
+
+def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
+    """Detect and replace hot/dead pixels using per-channel median comparison."""
+    from scipy.ndimage import median_filter
+    pat_size = cfa_pattern.shape[0]
+    for r in range(pat_size):
+        for c in range(pat_size):
+            plane = raw_norm[r::pat_size, c::pat_size]
+            med = median_filter(plane, size=3, mode='nearest')
+            diff = np.abs(plane - med)
+            std = max(np.std(diff), 1e-6)
+            hot = diff > threshold * std
+            plane[hot] = med[hot]
+
+
+# ==========================================
 #     高光重建 (Segmentation Based, GPU)
 # ==========================================
 
@@ -115,9 +147,8 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
     is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
 
-    bl_avg = float(bl[0])
-    raw_norm = np.maximum(sensor_raw - bl_avg, 0) / (wl - bl_avg)
-
+    raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
+    fix_hot_pixels(raw_norm, cfa_pattern)
     highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
 
     if is_bayer:
