@@ -83,9 +83,10 @@ try:
     _lensfun = _load_lensfun_library()
 except RuntimeError as e:
     _lensfun = None
-    # 记录更详细的错误信息
     logger.warning(f"  ⚠️ [Lensfun] Warning: {e}")
     logger.warning("  ⚠️ [Lensfun] Lens correction will be disabled.")
+
+_distortion_map_cache = {}
 
 
 # ============================================================================
@@ -781,9 +782,18 @@ def compute_lens_distortion_map(
         if image.dtype != np.float32:
             np.copyto(image, image_f32.astype(image.dtype))
 
-    # Geometry: compute distortion map (CPU, fast ~few ms)
+    # Geometry: compute distortion map
     if not correct_distortion and not correct_tca:
         return None
+
+    # Cache key: same lens + focal + aperture + image size = same distortion map
+    cache_key = (lens_model, focal_length, aperture, crop_factor, width, height,
+                 correct_distortion, correct_tca)
+    cached = _distortion_map_cache.get(cache_key)
+    if cached is not None:
+        logger.info("  ⚡ [Lensfun] Distortion map cache hit")
+        coords, oob_mask = cached
+        return coords, oob_mask, image
 
     if correct_distortion:
         modifier.enable_distortion_correction()
@@ -794,7 +804,7 @@ def compute_lens_distortion_map(
     if coords is None:
         return None
 
-    # Auto-crop scale (same logic as apply_lens_correction)
+    # Auto-crop scale
     x_min = min(coords[:, :, ch, 0].min() for ch in range(3))
     x_max = max(coords[:, :, ch, 0].max() for ch in range(3))
     y_min = min(coords[:, :, ch, 1].min() for ch in range(3))
@@ -823,6 +833,8 @@ def compute_lens_distortion_map(
     for ch in range(3):
         np.clip(coords[:, :, ch, 0], 0, width - 1, out=coords[:, :, ch, 0])
         np.clip(coords[:, :, ch, 1], 0, height - 1, out=coords[:, :, ch, 1])
+
+    _distortion_map_cache[cache_key] = (coords, oob_mask)
 
     return coords, oob_mask, image
 
