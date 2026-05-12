@@ -33,12 +33,13 @@ def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
 
 def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
     """Detect and replace hot/dead pixels using per-channel median comparison."""
-    from scipy.ndimage import median_filter
+    import cv2
     pat_size = cfa_pattern.shape[0]
     for r in range(pat_size):
         for c in range(pat_size):
             plane = raw_norm[r::pat_size, c::pat_size]
-            med = median_filter(plane, size=3, mode='nearest')
+            plane32 = plane.astype(np.float32) if plane.dtype != np.float32 else plane
+            med = cv2.medianBlur(plane32, 3)
             diff = np.abs(plane - med)
             std = max(np.std(diff), 1e-6)
             hot = diff > threshold * std
