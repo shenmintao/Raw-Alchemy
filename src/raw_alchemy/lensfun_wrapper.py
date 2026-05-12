@@ -692,23 +692,24 @@ def apply_lens_correction(
                 oob_mask |= (coords[:, :, ch, 0] < interp_margin) | (coords[:, :, ch, 0] > width - 1 - interp_margin)
                 oob_mask |= (coords[:, :, ch, 1] < interp_margin) | (coords[:, :, ch, 1] > height - 1 - interp_margin)
 
-            # clamp 坐标以便 map_coordinates 不会报错
+            # clamp 坐标以便 remap 不会读到非法地址
             for ch in range(3):
                 np.clip(coords[:, :, ch, 0], 0, width - 1, out=coords[:, :, ch, 0])
                 np.clip(coords[:, :, ch, 1], 0, height - 1, out=coords[:, :, ch, 1])
 
-            from scipy.ndimage import map_coordinates
+            import cv2
 
             for c in range(3):  # R, G, B
-                coords_c = coords[:, :, c, :]
-                coordinates = np.array([coords_c[:, :, 1], coords_c[:, :, 0]])
-
-                output[:, :, c] = map_coordinates(
+                # cv2.remap takes (map_x, map_y) as float32 ndarrays of
+                # shape (out_H, out_W). coords[:,:,c,0] = x, [:,:,c,1] = y.
+                map_x = np.ascontiguousarray(coords[:, :, c, 0], dtype=np.float32)
+                map_y = np.ascontiguousarray(coords[:, :, c, 1], dtype=np.float32)
+                output[:, :, c] = cv2.remap(
                     image[:, :, c],
-                    coordinates,
-                    order=3,
-                    mode='constant',
-                    cval=0.0
+                    map_x, map_y,
+                    interpolation=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0.0,
                 )
 
             # 将越界像素的所有通道统一置零（黑色）

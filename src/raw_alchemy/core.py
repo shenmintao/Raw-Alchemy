@@ -50,13 +50,18 @@ def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
 # ==========================================
 
 def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
-    """Segmentation-based highlight reconstruction (GPU-accelerated).
+    """Segmentation-based highlight reconstruction.
 
-    Taichi GPU kernel computes per-pixel opposing-channel reference averages.
-    scipy.ndimage.label handles connected-component segmentation on CPU.
-    numpy.bincount vectorizes per-segment chrominance (no Python loops over segments).
+    Same semantics as the darktable ``DT_IOP_HIGHLIGHTS_SEGMENTS`` mode:
+    per-pixel opposing-channel reference average + per-segment chroma
+    correction.
+
+    Implementation:
+      * ``compute_hl_refavg`` runs on GPU (Taichi).
+      * Morphology / CCL / max-filter run on CPU via OpenCV (SIMD,
+        operating on packed uint8 with SSE2/AVX2).
     """
-    from scipy.ndimage import binary_closing, label, maximum_filter
+    import cv2
     from raw_alchemy.math_ops import compute_hl_refavg
 
     H, W = raw_data.shape
@@ -69,30 +74,38 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     color_map = np.where(color_map >= 3, 1, color_map).astype(np.int32)
 
     wb_gains = np.array([wb[0] / g, 1.0, wb[2] / g], dtype=np.float32)
-
     CLIP = 0.987
     raw_clips = np.array([CLIP / max(wg, 1e-6) for wg in wb_gains],
                          dtype=np.float32)
 
     refavg, clipped = compute_hl_refavg(raw_data, color_map, wb_gains, raw_clips)
-
     if not np.any(clipped):
         return
 
     diff = raw_data - refavg
-    closing_struct = np.ones((7, 7), dtype=bool)
+    # 7x7 square SE — closes gaps up to 6 px wide.
+    closing_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
 
     for c in range(3):
         clipped_c = clipped & (color_map == c)
         if not np.any(clipped_c):
             continue
 
-        closed = binary_closing(clipped_c, structure=closing_struct)
-        labels, num_seg = label(closed)
+        # Morphological closing (SIMD-accelerated).
+        cc_u8 = clipped_c.astype(np.uint8)
+        closed = cv2.morphologyEx(cc_u8, cv2.MORPH_CLOSE, closing_kernel)
+
+        # Connected components, 8-connectivity. Matches darktable's
+        # segmentation choice; closing has already merged any 4-connected
+        # clusters so the connectivity choice is near-equivalent here.
+        num_seg_plus_one, labels = cv2.connectedComponents(closed, connectivity=8)
+        num_seg = num_seg_plus_one - 1
         if num_seg == 0:
             continue
 
-        expanded = maximum_filter(labels, size=7)
+        # 7x7 max-filter on labels via cv2.dilate(float32) — used to
+        # identify the segment-border zone for chroma estimation.
+        expanded = cv2.dilate(labels.astype(np.float32), closing_kernel).astype(np.int32)
 
         lo = raw_clips[c] * 0.2
         unclipped_valid = (color_map == c) & ~clipped & (raw_data > lo)
