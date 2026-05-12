@@ -211,12 +211,12 @@ class ImageProcessor(QThread):
         from raw_alchemy.exif import extract_lens_exif
         from raw_alchemy.onnx.denoiser import _apply_flip
         from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
-        from raw_alchemy.rawspeed_binding import try_decode, XTRANS_PATTERN
+        from rawspeedpy import try_decode, XTRANS_PATTERN
 
         # Try RawSpeed first (faster decode for supported formats)
         rs = try_decode(path)
 
-        if rs and (rs.is_bayer or rs.is_xtrans):
+        if rs and (rs.is_bayer or rs.is_xtrans) and rs.color_matrix is not None:
             logger.info(f"  [RawSpeed] Decoded: {rs.width}x{rs.height}")
             sensor_raw = rs.bayer.astype(np.float32)
             bl = np.array(rs.black_levels, dtype=np.float32)

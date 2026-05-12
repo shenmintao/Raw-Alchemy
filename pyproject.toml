@@ -36,6 +36,7 @@ dependencies = [
     "loguru",
     "pyexiv2",
     "psutil",
+    "rawspeedpy @ git+https://github.com/shenmintao/rawspeedpy.git",
     "onnxruntime-gpu; sys_platform != 'darwin'",
     "onnxruntime; sys_platform == 'darwin'",
 ]

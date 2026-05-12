@@ -146,11 +146,11 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters, get_cfa_pattern_from_filters
     from raw_alchemy.onnx.denoiser import _apply_flip
     from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
-    from raw_alchemy.rawspeed_binding import try_decode, XTRANS_PATTERN
+    from rawspeedpy import try_decode, XTRANS_PATTERN
 
     rs = try_decode(raw_path)
 
-    if rs and (rs.is_bayer or rs.is_xtrans):
+    if rs and (rs.is_bayer or rs.is_xtrans) and rs.color_matrix is not None:
         sensor_raw = rs.bayer.astype(np.float32)
         bl = np.array(rs.black_levels, dtype=np.float32)
         wl = float(rs.white_level)
