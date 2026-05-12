@@ -220,11 +220,10 @@ class ImageProcessor(QThread):
                 if is_xtrans:
                     xtrans_pat = cfa_pattern.copy()
 
-        g = wb[1] if wb[1] > 0 else 1.0
-
         from raw_alchemy.core import highlight_inpaint_opposed, subtract_black_level, fix_hot_pixels
 
         if is_bayer:
+            g = wb[1] if wb[1] > 0 else 1.0
             bayer_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
             fix_hot_pixels(bayer_norm, cfa_pattern)
             highlight_inpaint_opposed(bayer_norm, cfa_pattern, wb)
@@ -243,6 +242,7 @@ class ImageProcessor(QThread):
             apply_matrix_inplace(rgb, cam_to_prophoto)
 
         elif is_xtrans:
+            g = wb[1] if wb[1] > 0 else 1.0
             from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
 
             raw_norm = subtract_black_level(sensor_raw, bl, wl, xtrans_pat)
