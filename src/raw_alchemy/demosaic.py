@@ -440,6 +440,15 @@ def get_dcraw_filters(cfa_pattern: np.ndarray) -> int:
     return filters
 
 
+def get_cfa_pattern_from_filters(filters: int) -> np.ndarray:
+    """Convert dcraw-style 32-bit filter code to 2x2 CFA pattern array."""
+    pattern = np.zeros((2, 2), dtype=np.uint8)
+    for r in range(2):
+        for c in range(2):
+            pattern[r, c] = (filters >> (((r << 1 & 14) | (c & 1)) << 1)) & 3
+    return pattern
+
+
 # Common CFA filter codes
 FILTERS_RGGB = 0x94949494  # Sony, Canon, Nikon (most common)
 FILTERS_BGGR = 0x16161616

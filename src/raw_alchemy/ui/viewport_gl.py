@@ -284,10 +284,13 @@ class ImageViewportGL(QOpenGLWidget):
         self.set_image(img_uint8)
 
     def clear_image(self):
-        """Clear the displayed image."""
+        """Clear the displayed image and reset zoom."""
         self._has_image = False
         self._pending_data = None
         self._last_image = None
+        self._zoom = 1.0
+        self._offset_x = 0.0
+        self._offset_y = 0.0
         self.update()
 
     # --- Zoom / Pan ---

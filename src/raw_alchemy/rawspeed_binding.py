@@ -298,3 +298,25 @@ class RawSpeedDecoder:
 
     def __exit__(self, *args):
         self.close()
+
+
+# X-Trans 6x6 CFA pattern (universal across all Fuji X-Trans sensors)
+XTRANS_PATTERN = np.array([
+    [1, 1, 0, 1, 1, 2],
+    [1, 1, 2, 1, 1, 0],
+    [2, 0, 1, 0, 2, 1],
+    [1, 1, 2, 1, 1, 0],
+    [1, 1, 0, 1, 1, 2],
+    [0, 2, 1, 2, 0, 1],
+], dtype=np.uint8)
+
+_decoder = None
+
+def try_decode(path: str) -> Optional[RawDecodeResult]:
+    global _decoder
+    try:
+        if _decoder is None:
+            _decoder = RawSpeedDecoder()
+        return _decoder.decode(path)
+    except Exception:
+        return None

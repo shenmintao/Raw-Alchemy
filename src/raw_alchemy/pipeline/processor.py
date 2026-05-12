@@ -191,38 +191,66 @@ class ImageProcessor(QThread):
     # Loading
     # =================================================================
 
-    def _rawpy_to_prophoto(self, path: str):
-        """Decode RAW via rawpy + RCD demosaic -> ProPhoto Linear float32.
+    @staticmethod
+    def _get_flip(path: str) -> int:
+        try:
+            import rawpy
+            with rawpy.imread(path) as raw:
+                return raw.sizes.flip
+        except Exception:
+            return 0
 
-        rawpy is used ONLY for reading raw sensor data and metadata (no postprocess).
+    def _rawpy_to_prophoto(self, path: str):
+        """Decode RAW via RawSpeed (or rawpy fallback) + GPU demosaic -> ProPhoto Linear float32.
 
         Returns:
             (img, exif_data, exif_metadata) where img is (H, W, 3) float32 ProPhoto Linear.
         """
         import rawpy
-        from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters
+        from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters, get_cfa_pattern_from_filters
         from raw_alchemy.exif import extract_lens_exif
         from raw_alchemy.onnx.denoiser import _apply_flip
         from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
+        from raw_alchemy.rawspeed_binding import try_decode, XTRANS_PATTERN
 
-        with rawpy.imread(path) as raw:
-            cfa_pattern = raw.raw_pattern if raw.raw_pattern is not None else None
-            is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
-            is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
+        # Try RawSpeed first (faster decode for supported formats)
+        rs = try_decode(path)
 
-            if is_bayer or is_xtrans:
-                sensor_raw = raw.raw_image_visible.astype(np.float32)
-                bl = np.array(raw.black_level_per_channel, dtype=np.float32)
-                wl = float(raw.white_level)
-                wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-                flip = raw.sizes.flip
-                # XYZ_D65 -> Camera matrix (4x3). Needed for analytic
-                # cam->ProPhoto derivation; replaces the old approach of
-                # calling postprocess() twice + lstsq fit (which was eating
-                # 0.5-3s per image).
-                xyz_to_cam = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
-                if is_xtrans:
-                    xtrans_pat = cfa_pattern.copy()
+        if rs and (rs.is_bayer or rs.is_xtrans):
+            logger.info(f"  [RawSpeed] Decoded: {rs.width}x{rs.height}")
+            sensor_raw = rs.bayer.astype(np.float32)
+            bl = np.array(rs.black_levels, dtype=np.float32)
+            wl = float(rs.white_level)
+            wb = np.array(rs.wb_coeffs, dtype=np.float32)
+            flip = self._get_flip(path)
+            xyz_to_cam = rs.color_matrix.astype(np.float64) if rs.color_matrix is not None else None
+            is_bayer = rs.is_bayer
+            is_xtrans = rs.is_xtrans
+            filters = rs.filters
+            cfa_pattern = get_cfa_pattern_from_filters(filters) if is_bayer else XTRANS_PATTERN
+            xtrans_pat = XTRANS_PATTERN if is_xtrans else None
+        else:
+            # rawpy fallback
+            if rs:
+                logger.info(f"  [RawSpeed] Non-Bayer/X-Trans sensor, falling back to rawpy")
+            else:
+                logger.info(f"  [RawSpeed] Unsupported format, falling back to rawpy")
+
+            with rawpy.imread(path) as raw:
+                cfa_pattern = raw.raw_pattern if raw.raw_pattern is not None else None
+                is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
+                is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
+
+                if is_bayer or is_xtrans:
+                    sensor_raw = raw.raw_image_visible.astype(np.float32)
+                    bl = np.array(raw.black_level_per_channel, dtype=np.float32)
+                    wl = float(raw.white_level)
+                    wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+                    flip = raw.sizes.flip
+                    xyz_to_cam = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
+                    if is_xtrans:
+                        xtrans_pat = cfa_pattern.copy()
+                    filters = None
 
         from raw_alchemy.core import highlight_inpaint_opposed, subtract_black_level, fix_hot_pixels
 
@@ -232,7 +260,7 @@ class ImageProcessor(QThread):
             fix_hot_pixels(bayer_norm, cfa_pattern)
             highlight_inpaint_opposed(bayer_norm, cfa_pattern, wb)
 
-            dcraw_filters = get_dcraw_filters(cfa_pattern)
+            dcraw_filters = filters if filters else get_dcraw_filters(cfa_pattern)
             rgb = rcd_demosaic(bayer_norm, dcraw_filters)
             rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
 

@@ -141,38 +141,58 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
 # ==========================================
 
 def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
-    """Decode RAW via GPU demosaic to ProPhoto Linear float32 (H, W, 3).
-
-    Supports Bayer (RCD) and X-Trans (Markesteijn) sensors.
-    rawpy is used ONLY for reading raw sensor data and metadata (no postprocess).
-    """
+    """Decode RAW via RawSpeed (or rawpy fallback) + GPU demosaic to ProPhoto Linear float32 (H, W, 3)."""
     import rawpy
-    from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters
+    from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters, get_cfa_pattern_from_filters
     from raw_alchemy.onnx.denoiser import _apply_flip
+    from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
+    from raw_alchemy.rawspeed_binding import try_decode, XTRANS_PATTERN
 
-    with rawpy.imread(raw_path) as raw:
-        sensor_raw = raw.raw_image_visible.astype(np.float32)
-        bl = np.array(raw.black_level_per_channel, dtype=np.float32)
-        wl = float(raw.white_level)
-        wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-        flip = raw.sizes.flip
-        cfa_pattern = raw.raw_pattern.copy() if raw.raw_pattern is not None else None
+    rs = try_decode(raw_path)
 
-    is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
-    is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
+    if rs and (rs.is_bayer or rs.is_xtrans):
+        sensor_raw = rs.bayer.astype(np.float32)
+        bl = np.array(rs.black_levels, dtype=np.float32)
+        wl = float(rs.white_level)
+        wb = np.array(rs.wb_coeffs, dtype=np.float32)
+        xyz_to_cam = rs.color_matrix.astype(np.float64) if rs.color_matrix is not None else None
+        is_bayer = rs.is_bayer
+        is_xtrans = rs.is_xtrans
+        filters = rs.filters
+        cfa_pattern = get_cfa_pattern_from_filters(filters) if is_bayer else XTRANS_PATTERN
+        try:
+            import rawpy as _rp
+            with _rp.imread(raw_path) as _r:
+                flip = _r.sizes.flip
+        except Exception:
+            flip = 0
+    else:
+        with rawpy.imread(raw_path) as raw:
+            sensor_raw = raw.raw_image_visible.astype(np.float32)
+            bl = np.array(raw.black_level_per_channel, dtype=np.float32)
+            wl = float(raw.white_level)
+            wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+            flip = raw.sizes.flip
+            cfa_pattern = raw.raw_pattern.copy() if raw.raw_pattern is not None else None
+            xyz_to_cam = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
+
+        is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
+        is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
+        filters = None
 
     if is_bayer:
         raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
         fix_hot_pixels(raw_norm, cfa_pattern)
         highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
-        dcraw_filters = get_dcraw_filters(cfa_pattern)
+        dcraw_filters = filters if filters else get_dcraw_filters(cfa_pattern)
         rgb = rcd_demosaic(raw_norm, dcraw_filters)
     elif is_xtrans:
-        raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
-        fix_hot_pixels(raw_norm, cfa_pattern)
-        highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
+        xtrans_pat = cfa_pattern
+        raw_norm = subtract_black_level(sensor_raw, bl, wl, xtrans_pat)
+        fix_hot_pixels(raw_norm, xtrans_pat)
+        highlight_inpaint_opposed(raw_norm, xtrans_pat, wb)
         from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
-        rgb = xtrans_markesteijn_demosaic(raw_norm, cfa_pattern)
+        rgb = xtrans_markesteijn_demosaic(raw_norm, xtrans_pat)
     else:
         import rawpy as _rawpy
         with _rawpy.imread(raw_path) as _raw:
@@ -195,18 +215,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     rgb[:, :, 0] *= wb[0] / g
     rgb[:, :, 2] *= wb[2] / g
 
-    import rawpy as _rawpy
-    with _rawpy.imread(raw_path) as _raw:
-        _cam = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
-            output_bps=16, output_color=_rawpy.ColorSpace.raw, half_size=True)
-        _pro = _raw.postprocess(gamma=(1,1), no_auto_bright=True, use_camera_wb=True,
-            output_bps=16, output_color=_rawpy.ColorSpace.ProPhoto, half_size=True)
-    _cam_f = _cam.astype(np.float64) / 65535.0
-    _pro_f = _pro.astype(np.float64) / 65535.0
-    cam_to_prophoto, _, _, _ = np.linalg.lstsq(
-        _cam_f.reshape(-1, 3), _pro_f.reshape(-1, 3), rcond=None)
-    cam_to_prophoto = cam_to_prophoto.T.astype(np.float64)
-    del _cam, _pro, _cam_f, _pro_f
+    cam_to_prophoto = cam_to_prophoto_matrix(xyz_to_cam)
     apply_matrix_inplace(rgb, cam_to_prophoto)
 
     np.clip(rgb, 0.0, 1.0, out=rgb)
