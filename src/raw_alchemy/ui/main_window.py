@@ -95,6 +95,7 @@ class MainWindow(FluentWindow):
         self.current_folder = None
         self.current_raw_path = None
         self.marked_files = set()
+        self.gallery_items_by_path = {}
         self.file_params_cache = {}  # path -> params dict
         self.file_baseline_params_cache = {}  # path -> baseline params dict
         
@@ -138,6 +139,17 @@ class MainWindow(FluentWindow):
         self.update_timer.setSingleShot(True)
         self.update_timer.setInterval(150) # 150ms debounce
         self.update_timer.timeout.connect(self.trigger_processing)
+
+        self._preload_neighbors_args = None
+        self._preload_neighbors_timer = QTimer()
+        self._preload_neighbors_timer.setSingleShot(True)
+        self._preload_neighbors_timer.setInterval(350)
+        self._preload_neighbors_timer.timeout.connect(self._run_preload_neighbors)
+
+        self._zoom_update_timer = QTimer()
+        self._zoom_update_timer.setSingleShot(True)
+        self._zoom_update_timer.setInterval(220)
+        self._zoom_update_timer.timeout.connect(self.trigger_processing)
         
         # Load saved settings
         self.load_settings()
@@ -444,7 +456,8 @@ class MainWindow(FluentWindow):
         self.viewport.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.viewport.compare_pressed.connect(self.show_original)
         self.viewport.compare_released.connect(self.show_processed)
-        self.viewport.viewport_resized.connect(self._sync_preview_label_geometry)
+        self.viewport.viewport_resized.connect(self._on_viewport_resized)
+        self.viewport.zoom_changed.connect(self._on_viewport_zoom_changed)
 
         # Overlay label for status text (on top of viewport)
         self.preview_lbl = QLabel(tr('no_image_selected'))
@@ -609,6 +622,7 @@ class MainWindow(FluentWindow):
         """Open a folder: update state, sync tree selection, scan thumbnails"""
         self.current_folder = folder
         self.last_folder_path = folder
+        self.gallery_items_by_path.clear()
         self.gallery_list.clear()
 
         # Start chain-expansion: expand root ancestor, directoryLoaded will chain the rest
@@ -945,17 +959,17 @@ class MainWindow(FluentWindow):
         item.setText(f"🟢 {name}" if is_marked else name)
         
         self.gallery_list.addItem(item)
+        self.gallery_items_by_path[path] = item
 
     def update_gallery_item(self, path, image):
         """Replace placeholder thumbnail with actual image."""
+        item = self.gallery_items_by_path.get(path)
+        if item is None:
+            return
         pixmap = QPixmap.fromImage(image)
-        for i in range(self.gallery_list.count()):
-            item = self.gallery_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == path:
-                item.setIcon(QIcon(pixmap))
-                rect = self.gallery_list.visualItemRect(item)
-                self.gallery_list.viewport().update(rect)
-                break
+        item.setIcon(QIcon(pixmap))
+        rect = self.gallery_list.visualItemRect(item)
+        self.gallery_list.viewport().update(rect)
 
     def on_gallery_item_clicked(self, item):
         if not item: return
@@ -1011,6 +1025,17 @@ class MainWindow(FluentWindow):
         self.current_request_id = self.processor.load_image(path)
 
     def _preload_neighbors(self, current_index, count=2):
+        self._preload_neighbors_args = (current_index, count, self.current_raw_path)
+        self._preload_neighbors_timer.start()
+
+    def _run_preload_neighbors(self):
+        if not self._preload_neighbors_args:
+            return
+        current_index, count, expected_path = self._preload_neighbors_args
+        self._preload_neighbors_args = None
+        if expected_path != self.current_raw_path:
+            return
+
         total = self.gallery_list.count()
         for offset in range(1, count + 1):
             for idx in [current_index + offset, current_index - offset]:
@@ -1021,12 +1046,39 @@ class MainWindow(FluentWindow):
 
     def on_param_changed(self, params):
         self.update_timer.start()
+
+    def _on_viewport_zoom_changed(self, zoom):
+        if not self.current_raw_path:
+            return
+        if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
+            return
+        self._zoom_update_timer.start()
+
+    def _on_viewport_resized(self, w, h):
+        self._sync_preview_label_geometry(w, h)
+        if not self.current_raw_path:
+            return
+        if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
+            return
+        self._zoom_update_timer.start()
+
+    def _add_preview_output_params(self, params):
+        params = params.copy()
+        size = self.viewport.size()
+        params['viewport_size'] = (size.width(), size.height())
+        params['preview_zoom'] = self.viewport.preview_zoom()
+        try:
+            params['device_pixel_ratio'] = float(self.viewport.devicePixelRatioF())
+        except Exception:
+            params['device_pixel_ratio'] = 1.0
+        return params
+
+    def _get_preview_params(self):
+        return self._add_preview_output_params(self.right_panel.get_params())
     
     def trigger_processing(self):
         if not self.current_raw_path: return
-        params = self.right_panel.get_params()
-        size = self.viewport.size()
-        params['viewport_size'] = (size.width(), size.height())
+        params = self._get_preview_params()
         self.current_request_id = self.processor.update_preview(self.current_raw_path, params)
     
     def save_baseline_image(self):
@@ -1037,17 +1089,20 @@ class MainWindow(FluentWindow):
         if self.processor.cpu_linear is not None:
             # Share CPU cache so baseline processor can load from it
             self.baseline_processor.cache_manager = self.processor.cache_manager
-            self.baseline_processor.update_preview(self.current_raw_path, current_params)
+            self.baseline_processor.update_preview(
+                self.current_raw_path,
+                self._add_preview_output_params(current_params),
+            )
 
         InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
     
         
-    def on_baseline_result(self, img_uint8, image_path, request_id, applied_ev):
+    def on_baseline_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
         if image_path != self.current_raw_path: return
         h, w, c = img_uint8.shape
         qimg = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg.copy())
-        self.baseline.update_full(pixmap, None, img_uint8.copy())
+        self.baseline.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
     
     def regenerate_baseline_for_current_image(self):
         if not self.current_raw_path or self.current_raw_path not in self.file_baseline_params_cache: return
@@ -1055,9 +1110,12 @@ class MainWindow(FluentWindow):
 
         baseline_params = self.file_baseline_params_cache[self.current_raw_path]
         self.baseline_processor.cache_manager = self.processor.cache_manager
-        self.baseline_processor.update_preview(self.current_raw_path, baseline_params)
+        self.baseline_processor.update_preview(
+            self.current_raw_path,
+            self._add_preview_output_params(baseline_params),
+        )
 
-    def on_process_result(self, img_uint8, image_path, request_id, applied_ev):
+    def on_process_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
         """Handle processing result"""
         # Close denoise/processing progress dialog
         if self.denoise_progress_dialog:
@@ -1085,24 +1143,22 @@ class MainWindow(FluentWindow):
         img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(img)
 
-        # Update Thumbnail
-        for i in range(self.gallery_list.count()):
-            item = self.gallery_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == image_path:
-                scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
-                item.setIcon(QIcon(scaled))
-                rect = self.gallery_list.visualItemRect(item)
-                self.gallery_list.viewport().update(rect)
-                break
+        # Update thumbnail without scanning the full gallery.
+        item = self.gallery_items_by_path.get(image_path)
+        if item is not None:
+            scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
+            item.setIcon(QIcon(scaled))
+            rect = self.gallery_list.visualItemRect(item)
+            self.gallery_list.viewport().update(rect)
 
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
 
-        self.current.update_full(pixmap, None, img_uint8.copy())
+        self.current.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
         if self.current_raw_path:
              self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
 
         if self.original.full is None:
-            self.original.update_full(pixmap.copy(), None, img_uint8.copy())
+            self.original.update_full(pixmap.copy(), None, img_uint8.copy(), source_size=source_size)
 
         if self.right_panel.auto_exp_radio.isChecked():
             self.right_panel.auto_ev_value = applied_ev
@@ -1116,17 +1172,16 @@ class MainWindow(FluentWindow):
             self.right_panel.exp_slider.valueChanged.connect(self.right_panel.exp_slider_callback)
 
         # Display via OpenGL viewport (priority — show image first)
-        self.viewport.set_image(img_uint8)
+        self.viewport.set_image(img_uint8, source_size=source_size)
         self.preview_lbl.setText("")
 
-        # Defer histogram/waveform to next event loop iteration (async)
+        # Defer visible scope update to the next event loop iteration.
         img_for_hist = img_uint8
         QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
 
     def _update_histogram_async(self, img_uint8):
-        """Deferred histogram/waveform update — runs after viewport display."""
-        self.right_panel.hist_widget.update_data(img_uint8)
-        self.right_panel.waveform_widget.update_data(img_uint8)
+        """Deferred scope update — runs after viewport display."""
+        self.right_panel.update_scope_data(img_uint8)
 
     def on_load_complete(self, image_path, request_id):
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
@@ -1137,9 +1192,7 @@ class MainWindow(FluentWindow):
     
     def _trigger_processing_for_path(self, path):
         if path != self.current_raw_path: return
-        params = self.right_panel.get_params()
-        size = self.viewport.size()
-        params['viewport_size'] = (size.width(), size.height())
+        params = self._get_preview_params()
         self.current_request_id = self.processor.update_preview(path, params)
 
     def on_error(self, msg):
@@ -1181,14 +1234,12 @@ class MainWindow(FluentWindow):
         self.btn_mark.blockSignals(False)
 
     def update_gallery_item_mark_indicator(self, path):
-        for i in range(self.gallery_list.count()):
-            item = self.gallery_list.item(i)
-            item_path = item.data(Qt.ItemDataRole.UserRole)
-            if item_path == path:
-                is_marked = path in self.marked_files
-                name = os.path.basename(path)
-                item.setText(f"🟢 {name}" if is_marked else name)
-                break
+        item = self.gallery_items_by_path.get(path)
+        if item is None:
+            return
+        is_marked = path in self.marked_files
+        name = os.path.basename(path)
+        item.setText(f"🟢 {name}" if is_marked else name)
 
     def delete_image(self):
         if not self.current_raw_path: return
@@ -1206,11 +1257,11 @@ class MainWindow(FluentWindow):
                 
                 
                 current_row = self.gallery_list.currentRow()
-                for i in range(self.gallery_list.count()):
-                    item = self.gallery_list.item(i)
-                    if item.data(Qt.ItemDataRole.UserRole) == self.current_raw_path:
-                        self.gallery_list.takeItem(i)
-                        break
+                item = self.gallery_items_by_path.pop(self.current_raw_path, None)
+                if item is not None:
+                    row = self.gallery_list.row(item)
+                    if row >= 0:
+                        self.gallery_list.takeItem(row)
                 
                 if self.gallery_list.count() > 0:
                     if current_row >= self.gallery_list.count(): current_row = self.gallery_list.count() - 1
@@ -1227,11 +1278,11 @@ class MainWindow(FluentWindow):
                     if self.current_raw_path in self.marked_files: self.marked_files.remove(self.current_raw_path)
                     # ... same cleanup logic ...
                     current_row = self.gallery_list.currentRow()
-                    for i in range(self.gallery_list.count()):
-                        item = self.gallery_list.item(i)
-                        if item.data(Qt.ItemDataRole.UserRole) == self.current_raw_path:
-                            self.gallery_list.takeItem(i)
-                            break
+                    item = self.gallery_items_by_path.pop(self.current_raw_path, None)
+                    if item is not None:
+                        row = self.gallery_list.row(item)
+                        if row >= 0:
+                            self.gallery_list.takeItem(row)
                     if self.gallery_list.count() > 0:
                         if current_row >= self.gallery_list.count(): current_row = self.gallery_list.count() - 1
                         self.gallery_list.setCurrentRow(current_row)
@@ -1247,16 +1298,16 @@ class MainWindow(FluentWindow):
         img_to_show = self.baseline if self.baseline.full else self.original
         if not img_to_show.full: return
         if img_to_show.uint8_data is not None:
-            self.viewport.set_image(img_to_show.uint8_data)
+            self.viewport.set_image(img_to_show.uint8_data, source_size=img_to_show.source_size)
         InfoBar.info(tr('compare_showing_baseline'), "", parent=self)
 
     def show_processed(self):
         if not self.current.full:
             if self.original.uint8_data is not None:
-                self.viewport.set_image(self.original.uint8_data)
+                self.viewport.set_image(self.original.uint8_data, source_size=self.original.source_size)
             return
         if self.current.uint8_data is not None:
-            self.viewport.set_image(self.current.uint8_data)
+            self.viewport.set_image(self.current.uint8_data, source_size=self.current.source_size)
 
     def export_current(self):
         if not self.current_raw_path: return
@@ -1480,10 +1531,16 @@ class MainWindow(FluentWindow):
 
     def closeEvent(self, event):
         self.save_settings()
+        if hasattr(self, '_preload_neighbors_timer'):
+            self._preload_neighbors_timer.stop()
+        if hasattr(self, '_zoom_update_timer'):
+            self._zoom_update_timer.stop()
         if self.thumb_worker and self.thumb_worker.isRunning():
             self.thumb_worker.stop()
             self.thumb_worker.quit()
             self.thumb_worker.wait()
+        if hasattr(self, 'right_panel'):
+            self.right_panel.shutdown_scope_workers()
         self.processor.stop_and_cleanup()
         if hasattr(self, 'baseline_processor'):
             self.baseline_processor.stop_and_cleanup()

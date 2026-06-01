@@ -35,6 +35,7 @@ from raw_alchemy.math_ops import (
     apply_crop_gpu,
     log_encode_gpu,
     float_to_uint8_gpu,
+    resize_float_to_uint8_gpu,
     fused_expose_adjust_grade,
 )
 from raw_alchemy.pipeline.request import ProcessRequest, ProcessorParams
@@ -53,10 +54,10 @@ class ImageProcessor(QThread):
       denoise -> sharpen -> display
 
     Emits:
-      result_ready(img_uint8, path, request_id, applied_ev)
+      result_ready(img_uint8, path, request_id, applied_ev, source_size)
       load_complete(path, request_id)
     """
-    result_ready = Signal(np.ndarray, str, int, float)
+    result_ready = Signal(np.ndarray, str, int, float, object)
     load_complete = Signal(str, int)
     error_occurred = Signal(str)
     denoise_progress = Signal(int, int)
@@ -174,6 +175,10 @@ class ImageProcessor(QThread):
 
             try:
                 if '_preload' in request.params:
+                    with self.lock:
+                        has_user_request = self.pending_request is not None
+                    if has_user_request:
+                        continue
                     self._do_preload(request)
                 elif '_load' in request.params:
                     self._do_load(request)
@@ -505,7 +510,41 @@ class ImageProcessor(QThread):
             params.get('saturation', 1.0), params.get('contrast', 1.0),
             params.get('log_space'), params.get('lut_path'),
             params.get('sharpen_strength', 0.0),
+            params.get('viewport_size'),
+            round(float(params.get('preview_zoom', 1.0) or 1.0), 3),
+            round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2),
         )
+
+    @staticmethod
+    def _make_preview_target_size(src_w: int, src_h: int, params: ProcessorParams):
+        viewport_size = params.get('viewport_size')
+        if not viewport_size or src_w <= 0 or src_h <= 0:
+            return src_w, src_h
+
+        try:
+            vp_w = max(1, int(viewport_size[0]))
+            vp_h = max(1, int(viewport_size[1]))
+        except (TypeError, ValueError, IndexError):
+            return src_w, src_h
+
+        dpr = max(1.0, float(params.get('device_pixel_ratio', 1.0) or 1.0))
+        zoom = max(1.0, float(params.get('preview_zoom', 1.0) or 1.0))
+        target_box_w = vp_w * dpr
+        target_box_h = vp_h * dpr
+
+        fit_scale = min(target_box_w / src_w, target_box_h / src_h, 1.0)
+        target_scale = min(fit_scale * zoom, 1.0)
+
+        target_w = max(1, int(round(src_w * target_scale)))
+        target_h = max(1, int(round(src_h * target_scale)))
+
+        max_preview_pixels = int(params.get('max_preview_pixels', 12_000_000) or 12_000_000)
+        if max_preview_pixels > 0 and target_w * target_h > max_preview_pixels:
+            scale = (max_preview_pixels / float(target_w * target_h)) ** 0.5
+            target_w = max(1, int(target_w * scale))
+            target_h = max(1, int(target_h * scale))
+
+        return target_w, target_h
 
     def _do_process(self, request: ProcessRequest):
         t_start = time.perf_counter()
@@ -526,7 +565,8 @@ class ImageProcessor(QThread):
             if cached_item and cached_item.output_key == output_key and cached_item.output_uint8 is not None:
                 logger.info(f"[Worker] Output Cache Hit: {os.path.basename(request.path)}")
                 self.result_ready.emit(cached_item.output_uint8, request.path,
-                                       request.request_id, cached_item.output_ev)
+                                       request.request_id, cached_item.output_ev,
+                                       cached_item.output_source_size)
                 return
 
             # --- Stage 0: Denoising (CANS RAW V2, packed RAW → ProPhoto Linear) ---
@@ -884,23 +924,32 @@ class ImageProcessor(QThread):
                 elif self.cached_sharpened is not None:
                     self.gpu_graded.upload(self.cached_sharpened)
 
-            # --- Stage 11: Output ---
-            # GPU float32→uint8 on GPU, then single GPU→CPU download
+            # --- Stage 11: Preview Output ---
+            # GPU float32 -> uint8 on GPU, optionally resized to preview target.
             t_out = time.perf_counter()
-            h, w = self.gpu_graded.height, self.gpu_graded.width
+            source_h, source_w = self.gpu_graded.height, self.gpu_graded.width
+            target_w, target_h = self._make_preview_target_size(source_w, source_h, params)
 
             # Pre-allocate GPU uint8 buffer (avoids Taichi's implicit upload of numpy dst)
-            if self._gpu_uint8 is None or self._gpu_uint8.shape != (h, w, 3):
-                self._gpu_uint8 = ti.ndarray(dtype=ti.u8, shape=(h, w, 3))
+            if self._gpu_uint8 is None or self._gpu_uint8.shape != (target_h, target_w, 3):
+                self._gpu_uint8 = ti.ndarray(dtype=ti.u8, shape=(target_h, target_w, 3))
 
             # GPU→GPU kernel (no CPU transfer)
-            float_to_uint8_gpu(self.gpu_graded.arr, self._gpu_uint8)
+            if target_w == source_w and target_h == source_h:
+                float_to_uint8_gpu(self.gpu_graded.arr, self._gpu_uint8)
+            else:
+                resize_float_to_uint8_gpu(self.gpu_graded.arr, self._gpu_uint8)
 
-            # Single GPU→CPU download of uint8 (135MB vs 375MB float32)
+            # Single GPU→CPU download of uint8 preview.
             img_uint8 = self._gpu_uint8.to_numpy()
+            output_source_size = (source_w, source_h)
 
             t_end = time.perf_counter()
-            logger.info(f"[Worker] Pipeline: {(t_end - t_start)*1000:.0f}ms total, output: {(t_end - t_out)*1000:.0f}ms")
+            logger.info(
+                f"[Worker] Pipeline: {(t_end - t_start)*1000:.0f}ms total, "
+                f"output: {(t_end - t_out)*1000:.0f}ms "
+                f"({source_w}x{source_h} -> {target_w}x{target_h})"
+            )
 
             # Cache final output for instant switching
             cached_item = self.cache_manager.get(request.path)
@@ -909,12 +958,14 @@ class ImageProcessor(QThread):
                 cached_item.output_uint8 = img_uint8.copy()
                 cached_item.output_key = output_key
                 cached_item.output_ev = applied_ev
+                cached_item.output_source_size = output_source_size
                 cached_item.update_size()
                 with self.cache_manager.lock:
                     self.cache_manager.current_memory_mb += cached_item.size_mb - old_size
 
             self.result_ready.emit(img_uint8, request.path,
-                                   request.request_id, applied_ev)
+                                   request.request_id, applied_ev,
+                                   output_source_size)
 
         except Exception as e:
             logger.error(f"[Worker] Error in grading/output: {e}")

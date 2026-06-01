@@ -41,6 +41,9 @@ class ProcessorParams(TypedDict, total=False):
     denoise_enabled: bool
     sharpen_strength: float
     viewport_size: Tuple[int, int]
+    preview_zoom: float
+    device_pixel_ratio: float
+    max_preview_pixels: int
     perspective_corners: Optional[list]
 
 @dataclass

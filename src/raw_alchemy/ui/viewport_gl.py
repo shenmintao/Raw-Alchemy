@@ -73,6 +73,7 @@ class ImageViewportGL(QOpenGLWidget):
     """
     # Signal emitted when viewport size changes (for processor to know target size)
     viewport_resized = Signal(int, int)  # width, height
+    zoom_changed = Signal(float)
     # Signals for A/B comparison (right-click hold)
     compare_pressed = Signal()
     compare_released = Signal()
@@ -84,6 +85,8 @@ class ImageViewportGL(QOpenGLWidget):
         # Image state
         self._img_width = 0
         self._img_height = 0
+        self._source_width = 0
+        self._source_height = 0
         self._has_image = False
 
         # Zoom / Pan
@@ -255,7 +258,7 @@ class ImageViewportGL(QOpenGLWidget):
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
 
-    def set_image(self, img_uint8: np.ndarray):
+    def set_image(self, img_uint8: np.ndarray, source_size=None):
         """
         Update the displayed image.
         img_uint8: HxWx3 uint8 numpy array (RGB).
@@ -269,6 +272,12 @@ class ImageViewportGL(QOpenGLWidget):
 
         self._pending_data = img_uint8
         self._last_image = img_uint8
+        if source_size:
+            self._source_width = max(1, int(source_size[0]))
+            self._source_height = max(1, int(source_size[1]))
+        else:
+            self._source_width = img_uint8.shape[1]
+            self._source_height = img_uint8.shape[0]
         self._has_image = True
         self.update()  # Schedule repaint
 
@@ -288,6 +297,8 @@ class ImageViewportGL(QOpenGLWidget):
         self._has_image = False
         self._pending_data = None
         self._last_image = None
+        self._source_width = 0
+        self._source_height = 0
         self._zoom = 1.0
         self._offset_x = 0.0
         self._offset_y = 0.0
@@ -301,15 +312,24 @@ class ImageViewportGL(QOpenGLWidget):
         self._offset_x = 0.0
         self._offset_y = 0.0
         self.update()
+        self.zoom_changed.emit(self._zoom)
 
     def zoom_to_100(self):
         """Zoom to 100% (1 image pixel = 1 screen pixel)."""
-        if self._img_width > 0 and self._img_height > 0:
+        source_w = self._source_width if self._source_width > 0 else self._img_width
+        source_h = self._source_height if self._source_height > 0 else self._img_height
+        if source_w > 0 and source_h > 0:
             vp_w, vp_h = self.width(), self.height()
-            self._zoom = max(self._img_width / vp_w, self._img_height / vp_h)
+            if vp_w <= 0 or vp_h <= 0:
+                return
+            self._zoom = max(source_w / vp_w, source_h / vp_h)
             self._offset_x = 0.0
             self._offset_y = 0.0
             self.update()
+            self.zoom_changed.emit(self._zoom)
+
+    def preview_zoom(self):
+        return self._zoom
 
     def _clamp_offset(self):
         if self._img_width <= 0 or self._img_height <= 0:
@@ -351,6 +371,7 @@ class ImageViewportGL(QOpenGLWidget):
         self._offset_y = my - (my - self._offset_y) * real_factor
         self._clamp_offset()
         self.update()
+        self.zoom_changed.emit(self._zoom)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.RightButton:

@@ -534,6 +534,21 @@ class InspectorPanel(ScrollArea):
             self.hist_widget.show()
         
         self._update_display_mode_switch_text()
+        main_window = self.window()
+        current = getattr(main_window, 'current', None)
+        if current is not None and current.uint8_data is not None:
+            self.update_scope_data(current.uint8_data)
+
+    def update_scope_data(self, img_uint8):
+        """Update only the visible scope."""
+        if self.display_mode_switch.isChecked():
+            self.waveform_widget.update_data(img_uint8)
+        else:
+            self.hist_widget.update_data(img_uint8)
+
+    def shutdown_scope_workers(self):
+        self.hist_widget.shutdown_worker()
+        self.waveform_widget.shutdown_worker()
 
     def _update_exposure_switch_text(self):
         """Update the switch button text based on its state"""

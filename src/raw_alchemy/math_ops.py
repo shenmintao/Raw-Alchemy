@@ -1086,6 +1086,62 @@ def float_to_uint8_gpu(src, dst):
 
 
 @ti.kernel
+def _resize_float_to_uint8_kernel(src: ti.types.ndarray(dtype=ti.f32, ndim=3),
+                                  dst: ti.types.ndarray(dtype=ti.u8, ndim=3)):
+    """Resize float32 [0,1] to uint8 [0,255] with bilinear sampling."""
+    src_h = src.shape[0]
+    src_w = src.shape[1]
+    dst_h = dst.shape[0]
+    dst_w = dst.shape[1]
+
+    scale_y = ti.cast(src_h, ti.f32) / ti.cast(dst_h, ti.f32)
+    scale_x = ti.cast(src_w, ti.f32) / ti.cast(dst_w, ti.f32)
+
+    for y, x in ti.ndrange(dst_h, dst_w):
+        sy = (ti.cast(y, ti.f32) + 0.5) * scale_y - 0.5
+        sx = (ti.cast(x, ti.f32) + 0.5) * scale_x - 0.5
+
+        y0 = ti.cast(ti.floor(sy), ti.i32)
+        x0 = ti.cast(ti.floor(sx), ti.i32)
+        wy = sy - ti.cast(y0, ti.f32)
+        wx = sx - ti.cast(x0, ti.f32)
+
+        if y0 < 0:
+            y0 = 0
+            wy = 0.0
+        if x0 < 0:
+            x0 = 0
+            wx = 0.0
+
+        y1 = y0 + 1
+        x1 = x0 + 1
+        if y1 >= src_h:
+            y1 = src_h - 1
+        if x1 >= src_w:
+            x1 = src_w - 1
+
+        for ch in ti.static(range(3)):
+            v00 = src[y0, x0, ch]
+            v10 = src[y0, x1, ch]
+            v01 = src[y1, x0, ch]
+            v11 = src[y1, x1, ch]
+            top = v00 * (1.0 - wx) + v10 * wx
+            bottom = v01 * (1.0 - wx) + v11 * wx
+            val = top * (1.0 - wy) + bottom * wy
+
+            if val < 0.0:
+                val = 0.0
+            elif val > 1.0:
+                val = 1.0
+            dst[y, x, ch] = ti.cast(val * 255.0 + 0.5, ti.u8)
+
+
+def resize_float_to_uint8_gpu(src, dst):
+    """GPU resize + float32 to uint8 conversion."""
+    _resize_float_to_uint8_kernel(src, dst)
+
+
+@ti.kernel
 def _clip_inplace_kernel(img: ti.types.ndarray(dtype=ti.f32, ndim=3)):
     """Clip image values to [0, 1] on GPU."""
     for y, x in ti.ndrange(img.shape[0], img.shape[1]):
@@ -1888,6 +1944,7 @@ def warmup():
     # 13. Float→Uint8
     u8_dst = np.zeros((16, 16, 3), dtype=np.uint8)
     float_to_uint8_gpu(ds_dst, u8_dst)
+    resize_float_to_uint8_gpu(ds_dst, u8_dst)
 
     # 14. Clip / Max / Highlight Recovery
     clip_inplace(ds_dst)

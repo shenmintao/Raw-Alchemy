@@ -30,6 +30,7 @@ class CachedImage:
         self.output_uint8 = None
         self.output_key = None
         self.output_ev = 0.0
+        self.output_source_size = None
 
         # Calculate approximate size in MB
         self.size_mb = linear_data.nbytes / (1024 * 1024)

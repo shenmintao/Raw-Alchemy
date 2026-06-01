@@ -1,9 +1,31 @@
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtCore import Qt, QTimer, QPointF, QThread, Signal
 from PySide6.QtGui import QPainter, QColor, QPolygonF, QImage
 import numpy as np
 from loguru import logger
 from raw_alchemy import utils
+
+
+class _HistogramWorker(QThread):
+    result_ready = Signal(object, int)
+
+    def __init__(self, img_array, generation, parent=None):
+        super().__init__(parent)
+        self.img_array = img_array
+        self.generation = generation
+
+    def run(self):
+        result = None
+        try:
+            if self.img_array is not None and self.img_array.size != 0:
+                result = utils.compute_histogram_fast(self.img_array, bins=256, sample_rate=4)
+        except BaseException as e:
+            try:
+                logger.error(f"Histogram update error: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+        self.result_ready.emit(result, self.generation)
+
 
 class HistogramWidget(QWidget):
     def __init__(self, parent=None):
@@ -14,18 +36,19 @@ class HistogramWidget(QWidget):
         self._hist_image_size = None  # Cached size for invalidation
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-        # 优化: 添加更新定时器防抖
+        # Debounce rapid preview updates before starting background work.
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
-        self.update_timer.setInterval(25)  # 25ms防抖
+        self.update_timer.setInterval(25)
         self.update_timer.timeout.connect(self._do_update)
         self.pending_data = None
+        self._worker = None
+        self._generation = 0
 
     def update_data(self, img_array):
-        """异步更新直方图数据 - 使用防抖避免频繁计算
+        """Schedule a histogram update without blocking the UI thread.
 
         Accepts both uint8 [0,255] and float32 [0,1] arrays.
-        Copy and conversion are deferred to _do_update to avoid blocking UI.
         """
         if img_array is None:
             return
@@ -33,26 +56,44 @@ class HistogramWidget(QWidget):
         self.update_timer.start()
 
     def _do_update(self):
-        """实际执行直方图计算"""
+        """Run histogram computation off the UI thread."""
         if self.pending_data is None:
+            return
+
+        if self._worker is not None and self._worker.isRunning():
+            self.update_timer.start()
             return
 
         data = self.pending_data
         self.pending_data = None
+        self._generation += 1
 
-        try:
-            if data is None or data.size == 0:
-                return
+        worker = _HistogramWorker(data, self._generation)
+        self._worker = worker
+        worker.result_ready.connect(self._on_worker_result)
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+        worker.start()
 
-            # 使用utils中的快速计算函数
-            self.hist_data = utils.compute_histogram_fast(data, bins=256, sample_rate=4)
-            self._hist_image = None  # Invalidate cache
-            self.update()
-        except BaseException as e:
-            try:
-                logger.error(f"Histogram update error: {type(e).__name__}: {e}")
-            except Exception:
-                pass
+    def _on_worker_result(self, hist_data, generation):
+        if generation != self._generation or hist_data is None:
+            return
+        self.hist_data = hist_data
+        self._hist_image = None  # Invalidate cache
+        self.update()
+
+    def _on_worker_finished(self, worker):
+        if self._worker is worker:
+            self._worker = None
+        worker.deleteLater()
+        if self.pending_data is not None:
+            self.update_timer.start()
+
+    def shutdown_worker(self):
+        self.update_timer.stop()
+        self.pending_data = None
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait(1500)
+            self._worker = None
 
     def _render_hist_image(self, w, h):
         """Pre-render histogram to a QImage with additive blending."""
@@ -66,7 +107,7 @@ class HistogramWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         try:
-            # 忽略两端极值 + 对数缩放
+            # Ignore endpoint spikes and use log scaling.
             display_max_vals = []
             for hist in self.hist_data:
                 if len(hist) > 2:
@@ -91,7 +132,7 @@ class HistogramWidget(QWidget):
             QColor(0, 0, 255, 160)
         ]
 
-        # 加色混合模式
+        # Additive blending.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
 
         for i, hist in enumerate(self.hist_data):

@@ -19,13 +19,16 @@ class ImageState:
         self.display: Optional[QPixmap] = None
         self.float_data: Optional[np.ndarray] = None  # For histogram
         self.uint8_data: Optional[np.ndarray] = None   # For GL viewport
+        self.source_size: Optional[tuple[int, int]] = None
 
     def update_full(self, pixmap: QPixmap, float_data: Optional[np.ndarray] = None,
-                    uint8_data: Optional[np.ndarray] = None):
+                    uint8_data: Optional[np.ndarray] = None,
+                    source_size: Optional[tuple[int, int]] = None):
         """Update the full-size image and clear cached display version"""
         self.full = pixmap
         self.float_data = float_data
         self.uint8_data = uint8_data
+        self.source_size = source_size
         self.display = None  # Invalidate cached display
 
     def get_display(self, size: QSize) -> Optional[QPixmap]:
@@ -47,3 +50,4 @@ class ImageState:
         self.display = None
         self.float_data = None
         self.uint8_data = None
+        self.source_size = None

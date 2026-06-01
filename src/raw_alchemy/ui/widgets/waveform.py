@@ -1,12 +1,33 @@
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPainter, QColor, QPen, QImage
 import numpy as np
 from loguru import logger
 from raw_alchemy import utils
 
+
+class _WaveformWorker(QThread):
+    result_ready = Signal(object, int)
+
+    def __init__(self, img_array, generation, parent=None):
+        super().__init__(parent)
+        self.img_array = img_array
+        self.generation = generation
+
+    def run(self):
+        result = None
+        try:
+            if self.img_array is not None and self.img_array.size != 0:
+                result = utils.compute_waveform_fast(self.img_array, bins=150, sample_rate=8)
+        except (RuntimeError, ValueError, TypeError, OSError, SystemError) as e:
+            logger.warning(f"Waveform update error: {type(e).__name__}: {e}")
+        except BaseException as e:
+            logger.error(f"Waveform update error: {type(e).__name__}: {e}")
+        self.result_ready.emit(result, self.generation)
+
+
 class WaveformWidget(QWidget):
-    """示波器组件 - 显示图像的亮度分布"""
+    """Waveform scope widget for image luminance distribution."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(150)
@@ -14,18 +35,19 @@ class WaveformWidget(QWidget):
         self._waveform_image = None  # Pre-rendered QImage buffer
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-        # 优化: 添加更新定时器防抖
+        # Debounce rapid preview updates before starting background work.
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
-        self.update_timer.setInterval(25)  # 25ms防抖
+        self.update_timer.setInterval(25)
         self.update_timer.timeout.connect(self._do_update)
         self.pending_data = None
+        self._worker = None
+        self._generation = 0
 
     def update_data(self, img_array):
-        """异步更新示波器数据 - 使用防抖避免频繁计算
+        """Schedule a waveform update without blocking the UI thread.
 
         Accepts both uint8 [0,255] and float32 [0,1] arrays.
-        Copy and conversion are deferred to _do_update to avoid blocking UI.
         """
         if img_array is None:
             return
@@ -33,29 +55,44 @@ class WaveformWidget(QWidget):
         self.update_timer.start()
 
     def _do_update(self):
-        """实际执行示波器计算"""
+        """Run waveform computation off the UI thread."""
         if self.pending_data is None:
+            return
+
+        if self._worker is not None and self._worker.isRunning():
+            self.update_timer.start()
             return
 
         data = self.pending_data
         self.pending_data = None
+        self._generation += 1
 
-        try:
-            if data is None or data.size == 0:
-                return
+        worker = _WaveformWorker(data, self._generation)
+        self._worker = worker
+        worker.result_ready.connect(self._on_worker_result)
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+        worker.start()
 
-            # 使用utils中的快速计算函数 - 增加bins数量以提高垂直分辨率
-            waveform_result = utils.compute_waveform_fast(data, bins=150, sample_rate=8)
+    def _on_worker_result(self, waveform_result, generation):
+        if generation != self._generation or waveform_result is None:
+            return
+        self.waveform_data = waveform_result
+        self._render_waveform_image()
+        self.update()
 
-            # 检查结果是否有效
-            if waveform_result is not None:
-                self.waveform_data = waveform_result
-                self._render_waveform_image()
-                self.update()
-        except (RuntimeError, ValueError, TypeError, OSError, SystemError) as e:
-            logger.warning(f"Waveform update error: {type(e).__name__}: {e}")
-        except BaseException as e:
-            logger.error(f"Waveform update error: {type(e).__name__}: {e}")
+    def _on_worker_finished(self, worker):
+        if self._worker is worker:
+            self._worker = None
+        worker.deleteLater()
+        if self.pending_data is not None:
+            self.update_timer.start()
+
+    def shutdown_worker(self):
+        self.update_timer.stop()
+        self.pending_data = None
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait(1500)
+            self._worker = None
 
     def _render_waveform_image(self):
         """Pre-render waveform data to a QImage buffer using numpy (no Python loops)."""
@@ -71,7 +108,7 @@ class WaveformWidget(QWidget):
 
         # Build RGBA image: shape [num_bins, num_cols, 4] (height x width)
         # Flip vertically: bin 0 (low IRE) at bottom, bin N-1 (high IRE) at top
-        # waveform[col, bin] → image pixel at (row=num_bins-1-bin, col)
+        # waveform[col, bin] -> image pixel at (row=num_bins-1-bin, col)
         img_data = waveform.T[::-1, :]  # shape [num_bins, num_cols], flipped vertically
 
         # Non-linear density mapping (gamma 0.6) for visibility
@@ -113,14 +150,14 @@ class WaveformWidget(QWidget):
         w = self.width()
         h = self.height()
 
-        # 填充深色背景
+        # Dark background.
         painter.fillRect(self.rect(), QColor(10, 10, 10))
 
-        # 绘制波形图像（缩放到widget尺寸）
+        # Draw waveform image scaled to widget size.
         if self._waveform_image is not None:
             painter.drawImage(self.rect(), self._waveform_image)
 
-        # 绘制专业网格线（达芬奇风格）
+        # Draw reference IRE grid lines.
         try:
             line_color = QColor(0, 255, 0, 180)
 
@@ -128,25 +165,25 @@ class WaveformWidget(QWidget):
                 normalized = (ire_value - (-4.0)) / 113.0
                 return h - (normalized * h)
 
-            # 109% IRE - 虚线
+            # 109% IRE - dashed.
             painter.setPen(QPen(line_color, 0.5, Qt.PenStyle.DashLine))
             painter.drawLine(0, int(ire_to_y(109)), w, int(ire_to_y(109)))
 
-            # 100% IRE - 实线
+            # 100% IRE - solid.
             painter.setPen(QPen(line_color, 1.0, Qt.PenStyle.SolidLine))
             painter.drawLine(0, int(ire_to_y(100)), w, int(ire_to_y(100)))
 
-            # 50% IRE - 实线
+            # 50% IRE - solid.
             painter.drawLine(0, int(ire_to_y(50)), w, int(ire_to_y(50)))
 
-            # 0% IRE - 实线
+            # 0% IRE - solid.
             painter.drawLine(0, int(ire_to_y(0)), w, int(ire_to_y(0)))
 
-            # -4% IRE - 虚线
+            # -4% IRE - dashed.
             painter.setPen(QPen(line_color, 1.0, Qt.PenStyle.DashLine))
             painter.drawLine(0, int(ire_to_y(-4)), w, int(ire_to_y(-4)))
 
-            # 0-100%之间每10%画虚线
+            # Dashed guides every 10% between 0 and 100%.
             painter.setPen(QPen(line_color, 0.5, Qt.PenStyle.DashLine))
             for ire in [10, 20, 30, 40, 60, 70, 80, 90]:
                 y_ire = ire_to_y(ire)
