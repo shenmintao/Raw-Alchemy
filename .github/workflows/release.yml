@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install .
+          python -m pip install ".[build]"
         env:
           CMAKE_PREFIX_PATH: ''
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,7 +33,7 @@ jobs:
       # CUDA is now downloaded on-demand by users, not bundled in executable
 
       - name: Build executable with PyInstaller
-        run: pyinstaller RawAlchemy.spec
+        run: python -m PyInstaller RawAlchemy.spec
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
@@ -56,14 +56,14 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install .
+          python -m pip install ".[build]"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # CUDA is now downloaded on-demand by users, not bundled in executable
 
       - name: Build executable with PyInstaller
-        run: pyinstaller RawAlchemy.spec
+        run: python -m PyInstaller RawAlchemy.spec
 
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
@@ -105,12 +105,12 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install .
+          python -m pip install ".[build]"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build executable with PyInstaller
-        run: pyinstaller RawAlchemy.spec
+        run: python -m PyInstaller RawAlchemy.spec
 
       - name: Package macOS .app into .dmg
         run: |
