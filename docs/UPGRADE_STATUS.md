@@ -26,7 +26,7 @@ GUI verification.
 - Manual Windows package: `RawAlchemy-0.6.0-pre2-windows-x64.zip`
 - Automated release workflow also publishes platform artifacts from the tag.
 - The manual archive contains `RawAlchemy.exe` plus the `_internal` runtime directory.
-- SHA256: `4CDA7E347A5E51C1BE91C572C20E3D33DCD3D2161C8CEE9CF35D5F62187B997A`
+- SHA256: `C253A53940401B1DB28F60EF98725D073557734EA346BB33CC047FFEDE2A01C8`
 
 ## HDR Scope
 
