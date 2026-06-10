@@ -8,13 +8,17 @@ GUI verification.
 ## Automated Verification
 
 - `python -m compileall src tests`
-- `python -m pytest tests\ -x -q -p no:cacheprovider`: 50 passed
+- `python -m pytest tests\ -x -q -p no:cacheprovider`: 53 passed
 - `uv run ruff check`: passed
 - `python -m raw_alchemy.cli --help`: passed
 - `python -m raw_alchemy.cli --help` includes `hdr-heif`: passed
 - CLI import smoke with `PySide6` blocked: passed
 - PySide boundary: imports are limited to `ui/`, `workers/`, and `main.py`
 - Taichi boundary: direct imports are limited to `backend.py` and `math_ops.py`
+- T1.3 CLI entrypoint and batch orchestrator submission tests: passed
+- T1.3 real RAW CLI single-file smoke: `DSCF0023.RAF` to JPG, passed
+- T1.3 real RAW CLI batch-directory smoke: `DSCF0023.RAF` and `_DSC7822.ARW`
+  to JPG, passed
 - T1.3 GUI cached/full single-image export requests route through the
   `ImageProcessor` worker queue: passed
 - T2.1 sidecar restart restore is covered by UI glue tests for folder scan,
@@ -39,7 +43,6 @@ GUI verification.
 ## Incomplete Or Unproven Acceptance Items
 
 - T1.2/T5.3: full real GUI workflow is not manually accepted yet: image switching, sliders, crop, perspective, single export, and batch export.
-- T1.3: CLI single-file and batch-directory smoke with real RAW files is not proven in this environment.
 - T3.1: 45MP proxy/full preview timing and the `< 1/4` proxy-path target are not measured on target hardware.
 - T6.1: PQ HEIF is implemented and unit-tested, but HDR recognition in Windows Photos/Chrome is not manually verified.
 - T6.1: ISO 21496-1 gain-map JPEG output is researched but not implemented.

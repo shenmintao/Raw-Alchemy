@@ -2,6 +2,16 @@ import click
 from raw_alchemy import lensfun_wrapper as lf
 from raw_alchemy import config, orchestrator
 
+
+def _safe_echo(message):
+    text = str(message)
+    try:
+        click.echo(text)
+    except UnicodeEncodeError:
+        safe_text = text.encode("ascii", errors="replace").decode("ascii")
+        click.echo(safe_text)
+
+
 @click.command()
 @click.argument("input_path", type=click.Path(exists=True))
 @click.argument("output_path", type=click.Path())
@@ -71,7 +81,7 @@ def main(input_path, output_path, log_space, lut_path, exposure, lens_correct, c
             custom_db_path=custom_lensfun_db_path,
             metering_mode=metering,
             jobs=jobs,
-            logger_func=click.echo, # Use click.echo for robust Unicode support
+            logger_func=_safe_echo,
             output_format=output_format,
         )
     except Exception as e:
