@@ -1,6 +1,9 @@
-# Upgrade Status
+# Upgrade Status for `studio-v0.6.0-pre2`
 
-This prerelease build implements the `UPGRADE_PLAN.md` work through Phase 6.
+This prerelease is a validation build for `UPGRADE_PLAN.md`, not final
+acceptance for the whole plan. The main implementation work is present, but
+several acceptance items still require real samples, target hardware, or manual
+GUI verification.
 
 ## Automated Verification
 
@@ -17,13 +20,17 @@ This prerelease build implements the `UPGRADE_PLAN.md` work through Phase 6.
 
 ## Release Asset
 
-- Windows package: `RawAlchemy-0.6.0-pre.1-windows-x64.zip`
-- The archive contains `RawAlchemy.exe` plus the `_internal` runtime directory.
+- Manual Windows package: `RawAlchemy-0.6.0-pre2-windows-x64.zip`
+- Automated release workflow also publishes platform artifacts from the tag.
+- The manual archive contains `RawAlchemy.exe` plus the `_internal` runtime directory.
 - SHA256: `4CDA7E347A5E51C1BE91C572C20E3D33DCD3D2161C8CEE9CF35D5F62187B997A`
 
-## Manual Acceptance Still Needed
+## Incomplete Or Unproven Acceptance Items
 
-- Real RAW folder GUI workflow: image switching, sliders, crop, perspective, single export, batch export.
-- 45MP proxy/full preview performance comparison on target hardware.
-- HDR HEIF recognition in Windows Photos and Chrome.
-- AI denoise with real Bayer and X-Trans model/sample combinations.
+- T1.2/T5.3: full real GUI workflow is not manually accepted yet: image switching, sliders, crop, perspective, single export, and batch export.
+- T1.3: CLI single-file and batch-directory smoke with real RAW files is not proven in this environment.
+- T2.1: sidecar restore after app restart still needs manual verification.
+- T3.1: 45MP proxy/full preview timing and the `< 1/4` proxy-path target are not measured on target hardware.
+- T6.1: PQ HEIF is implemented and unit-tested, but HDR recognition in Windows Photos/Chrome is not manually verified.
+- T6.1: ISO 21496-1 gain-map JPEG output is not implemented.
+- T6.2: denoise toggle regression is covered synthetically, but real Bayer and X-Trans model/sample runs are not proven.
