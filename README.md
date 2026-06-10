@@ -47,7 +47,7 @@ This tool follows these precise color conversion steps:
 -   **Basic Adjustments**: White Balance (Temp/Tint), Saturation, Contrast, Highlights, and Shadows.
 -   **Lens Correction**: Automatic lens distortion correction using Lensfun, with support for custom LCP-converted databases.
 -   **Batch Processing**: Efficiently process entire folders of RAW images.
--   **Multi-Format Output**: Save as 16-bit TIFF, HEIF (10-bit), or JPEG.
+-   **Multi-Format Output**: Save as 16-bit TIFF, HEIF (10-bit), HDR HEIF (BT.2020/PQ), or JPEG.
 
 ## 📸 Samples
 
@@ -120,7 +120,7 @@ The graphical interface provides an intuitive way to process your images.
 #### 3. Export
 *   **Export Current**: Save the currently selected image.
 *   **Export All Marked**: Batch process and save all marked images.
-*   **Formats**: Choose between JPEG, HEIF, or TIFF.
+*   **Formats**: Choose between JPEG, HEIF, HDR HEIF, or TIFF.
 
 ## 🔧 Advanced Usage: Importing Adobe Lens Profiles (LCP)
 
@@ -175,7 +175,9 @@ The CLI uses neutral saturation and contrast defaults (`1.0` / `1.0`). GUI defau
 -   `--lut TEXT`: (Optional) Path to a `.cube` LUT file.
 -   `--exposure FLOAT`: (Optional) Manual exposure adjustment in stops.
 -   `--metering TEXT`: (Optional) Auto exposure mode: `matrix`, `hybrid`, `average`, `center-weighted`, `highlight-safe`.
--   `--format TEXT`: (Optional) Output format: `tif` (default), `heif`, `jpg`.
+-   `--format TEXT`: (Optional) Output format: `tif` (default), `heif`, `hdr-heif`, `jpg`.
+
+`hdr-heif` writes a 10-bit BT.2020/PQ HEIF file. Ultra HDR / ISO 21496-1 gain-map JPEG is not implemented yet; ordinary `jpg` output remains SDR.
 -   `--jobs INTEGER`: (Optional) Number of concurrent jobs for batch processing.
 -   `--lens-correct / --no-lens-correct`: (Optional) Enable/disable lens correction.
 -   `--custom-lensfun-db TEXT`: (Optional) Path to custom Lensfun XML.
