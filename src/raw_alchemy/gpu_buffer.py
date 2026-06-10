@@ -6,10 +6,11 @@ NO CPU copy is made. Data stays on GPU between kernel calls.
 
 Only from_numpy() / to_numpy() cross the CPU-GPU boundary.
 """
-import taichi as ti
 import numpy as np
 from loguru import logger
 from typing import Optional, Tuple
+
+from raw_alchemy.backend import ndarray, ti
 
 
 class GpuImage:
@@ -39,7 +40,7 @@ class GpuImage:
                 and self._channels == channels):
             return
 
-        self._arr = ti.ndarray(dtype=ti.f32, shape=(height, width, channels))
+        self._arr = ndarray(dtype=ti.f32, shape=(height, width, channels))
         self._height = height
         self._width = width
         self._channels = channels

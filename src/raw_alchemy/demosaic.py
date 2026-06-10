@@ -15,9 +15,10 @@ Usage:
     rgb = rcd_demosaic(bayer, filters)
 """
 
-import taichi as ti
 import numpy as np
 from loguru import logger
+
+from raw_alchemy.backend import ndarray as backend_ndarray, ti
 
 EPS = 1e-5
 EPSSQ = 1e-10
@@ -480,13 +481,13 @@ def rcd_demosaic(
     # Allocate GPU buffers — release early to minimize peak VRAM.
     # Peak: 7 × HW float32 + 1 × HWx3 float32
     # For 42MP: 7×170MB + 510MB ≈ 1.7GB
-    cfa = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    rgb0 = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    rgb1 = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    rgb2 = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    VH_dir = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    lpf = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    out = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
+    cfa = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    rgb0 = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    rgb1 = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    rgb2 = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    VH_dir = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    lpf = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    out = backend_ndarray(dtype=ti.f32, shape=(h, w, 3))
 
     cfa.from_numpy(np.ascontiguousarray(bayer, dtype=np.float32))
 
@@ -498,15 +499,15 @@ def rcd_demosaic(
 
     # Free lpf, allocate p_diff and q_diff (reuse lpf slot)
     del lpf
-    p_diff = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    q_diff = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    p_diff = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    q_diff = backend_ndarray(dtype=ti.f32, shape=(h, w))
 
     # Step 4.0-4.1: Diagonal discrimination
     _rcd_step4_0(cfa, p_diff, q_diff, w, h)
 
     # Free cfa (no longer needed), allocate PQ_dir
     del cfa
-    PQ_dir = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    PQ_dir = backend_ndarray(dtype=ti.f32, shape=(h, w))
     _rcd_step4_1(p_diff, q_diff, PQ_dir, w, h, filters_u32)
 
     # Free p_diff, q_diff
@@ -523,7 +524,7 @@ def rcd_demosaic(
     del rgb0, rgb1, rgb2
 
     # Border: simple bilinear — reuse rgb0 slot for bayer upload
-    bayer_arr = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    bayer_arr = backend_ndarray(dtype=ti.f32, shape=(h, w))
     bayer_arr.from_numpy(np.ascontiguousarray(bayer, dtype=np.float32))
     _border_interpolate(bayer_arr, out, 4, filters_u32)
     del bayer_arr

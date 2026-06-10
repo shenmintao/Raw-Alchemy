@@ -4,9 +4,19 @@ import json
 from raw_alchemy.utils import resource_path
 from loguru import logger
 
+def _config_file_path():
+    explicit_file = os.environ.get('RAW_ALCHEMY_CONFIG_FILE')
+    if explicit_file:
+        return os.path.abspath(os.path.expanduser(explicit_file))
+
+    config_dir = os.environ.get('RAW_ALCHEMY_CONFIG_DIR')
+    if not config_dir:
+        config_dir = '~/.raw_alchemy'
+    return os.path.join(os.path.abspath(os.path.expanduser(config_dir)), 'config.json')
+
 class Translator:
     def __init__(self):
-        self.config_file = os.path.expanduser('~/.raw_alchemy/config.json')
+        self.config_file = _config_file_path()
         self.current_lang = self._load_language()
         self.translations = {}
         self._load_translations()
@@ -61,7 +71,8 @@ class Translator:
                     config = json.load(f)
             
             config['language'] = lang
-            
+
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -87,7 +98,8 @@ class Translator:
                     config = json.load(f)
             
             config['app_settings'] = settings
-            
+
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
         except Exception as e:

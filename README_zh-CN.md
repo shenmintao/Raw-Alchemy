@@ -148,6 +148,8 @@ Raw Alchemy Studio 包含一个脚本，用于转换和导入 Adobe LCP 镜头�
 RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_PATH>
 ```
 
+CLI 使用中性饱和度和对比度默认值（`1.0` / `1.0`）；GUI 默认值保持不变。
+
 #### 示例
 
 **1. 基本 Log 转换**

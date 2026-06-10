@@ -77,6 +77,8 @@
     "none": "无 (sRGB Standard)",
     "language": "语言",
     "settings": "设置",
+    "editing": "\u7f16\u8f91",
+    "write_sidecar": "\u5199\u5165 sidecar",
     "english": "英语",
     "chinese": "中文",
     "restart_required": "需要重启",

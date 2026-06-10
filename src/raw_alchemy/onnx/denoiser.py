@@ -634,6 +634,7 @@ def is_available() -> bool:
     try:
         import onnxruntime
         _find_model(BAYER_MODEL)
+        _find_model(XTRANS_MODEL)
         return True
     except (ImportError, FileNotFoundError):
         return False

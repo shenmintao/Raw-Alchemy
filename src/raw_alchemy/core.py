@@ -1,20 +1,21 @@
-import gc
+﻿import gc
 import numpy as np
 import colour
 import os
 from typing import Optional
 
 from raw_alchemy import utils
-from raw_alchemy.config import LOG_TO_WORKING_SPACE, LOG_ENCODING_MAP
 from raw_alchemy.logger import create_logger
-from raw_alchemy.metering import apply_auto_exposure
 from raw_alchemy.file_io import save_image
+from raw_alchemy import config, metering
 from raw_alchemy.onnx.denoiser import denoise_raw
-from raw_alchemy.math_ops import log_encode_gpu, apply_matrix_inplace
+from raw_alchemy.math_ops import apply_matrix_inplace, init_taichi
+from raw_alchemy.pipeline.executor import ExportExecutor
+from raw_alchemy.pipeline.ops import build_op_list
 
 
 # ==========================================
-#          RAW 预处理
+#          RAW 棰勫鐞?
 # ==========================================
 
 def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
@@ -47,7 +48,7 @@ def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
 
 
 # ==========================================
-#     高光重建 (Segmentation Based, GPU)
+#     楂樺厜閲嶅缓 (Segmentation Based, GPU)
 # ==========================================
 
 def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
@@ -84,7 +85,7 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
         return
 
     diff = raw_data - refavg
-    # 7x7 square SE — closes gaps up to 6 px wide.
+    # 7x7 square SE 鈥?closes gaps up to 6 px wide.
     closing_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
 
     for c in range(3):
@@ -104,7 +105,7 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
         if num_seg == 0:
             continue
 
-        # 7x7 max-filter on labels via cv2.dilate(float32) — used to
+        # 7x7 max-filter on labels via cv2.dilate(float32) 鈥?used to
         # identify the segment-border zone for chroma estimation.
         expanded = cv2.dilate(labels.astype(np.float32), closing_kernel).astype(np.int32)
 
@@ -137,7 +138,7 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
 
 
 # ==========================================
-#              核心处理函数
+#              鏍稿績澶勭悊鍑芥暟
 # ==========================================
 
 def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
@@ -145,7 +146,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     import rawpy
     from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters, get_cfa_pattern_from_filters
     from raw_alchemy.onnx.denoiser import _apply_flip
-    from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
+    from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
     from rawspeedpy import try_decode, XTRANS_PATTERN
 
     rs = try_decode(raw_path)
@@ -215,11 +216,97 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     rgb[:, :, 0] *= wb[0] / g
     rgb[:, :, 2] *= wb[2] / g
 
-    cam_to_prophoto = cam_to_prophoto_matrix(xyz_to_cam)
-    apply_matrix_inplace(rgb, cam_to_prophoto)
+    cam_to_working = cam_to_working_space_matrix(xyz_to_cam)
+    apply_matrix_inplace(rgb, cam_to_working)
 
     np.clip(rgb, 0.0, 1.0, out=rgb)
     return rgb
+
+
+def _build_export_params(
+    *,
+    log_space: str,
+    lut_path: Optional[str],
+    exposure: Optional[float],
+    metering_mode: str,
+    wb_temp: float,
+    wb_tint: float,
+    saturation: float,
+    contrast: float,
+    highlight: float,
+    shadow: float,
+    rotation: int,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+    perspective_corners: Optional[tuple],
+    crop: Optional[tuple],
+    lens_correct: bool = False,
+    custom_db_path: Optional[str] = None,
+    denoise_enabled: bool = False,
+    sharpen_strength: float = 0.0,
+    hdr_output: bool = False,
+):
+    return {
+        "denoise_enabled": denoise_enabled,
+        "lens_correct": lens_correct,
+        "custom_db_path": custom_db_path,
+        "rotation": rotation,
+        "flip_horizontal": flip_horizontal,
+        "flip_vertical": flip_vertical,
+        "perspective_corners": perspective_corners,
+        "crop": crop or (0.0, 0.0, 1.0, 1.0),
+        "exposure_mode": "Auto" if exposure is None else "Manual",
+        "exposure": 0.0 if exposure is None else exposure,
+        "metering_mode": metering_mode,
+        "wb_temp": wb_temp,
+        "wb_tint": wb_tint,
+        "highlight": highlight,
+        "shadow": shadow,
+        "saturation": saturation,
+        "contrast": contrast,
+        "log_space": log_space,
+        "lut_path": lut_path,
+        "hdr_output": hdr_output,
+        "sharpen_strength": sharpen_strength,
+    }
+
+
+def _linearize_for_dng(img: np.ndarray, output_path: str, log_space: str, lut_path: Optional[str], logger):
+    color_matrix = None
+    if not output_path.lower().endswith('.dng'):
+        return img, color_matrix
+
+    logger.info("  [Pre-Save] Converting to Linear for DNG export...")
+    try:
+        utils.srgb_to_linear_inplace(img)
+        color_matrix = colour.RGB_COLOURSPACES['sRGB'].matrix_XYZ_to_RGB
+    except Exception as e:
+        logger.warning(f"  Linearization failed: {e}. Saving as is.")
+    return img, color_matrix
+
+
+def _run_export_executor(
+    source_img: np.ndarray,
+    params: dict,
+    metering_source: np.ndarray | None = None,
+    lens_corrector=None,
+) -> np.ndarray:
+    def auto_gain_resolver(_img: np.ndarray, mode: str) -> float:
+        source_cs = colour.RGB_COLOURSPACES[config.WORKING_SPACE]
+        if callable(metering_source):
+            source = metering_source()
+        else:
+            source = metering_source
+        if source is None:
+            source = source_img
+        return metering.get_metering_strategy(mode).calculate_gain(source, source_cs)
+
+    executor = ExportExecutor(
+        auto_gain_resolver=auto_gain_resolver,
+        lens_corrector=lens_corrector,
+    )
+    ops = build_op_list(params)
+    return executor.run(ops, source_img)
 
 
 def process_image(
@@ -243,200 +330,95 @@ def process_image(
     rotation: int = 0,
     flip_horizontal: bool = False,
     flip_vertical: bool = False,
+    perspective_corners: Optional[tuple] = None,
     crop: Optional[tuple] = None,
     # Denoising
     denoise_enabled: bool = False,
     # Sharpening (Richardson-Lucy)
     sharpen_strength: float = 0.0,
+    # HDR output
+    hdr_output: bool = False,
 ):
     filename = os.path.basename(raw_path)
     
-    # 创建统一的日志处理器
+    # 鍒涘缓缁熶竴鐨勬棩蹇楀鐞嗗櫒
     logger = create_logger(log_queue, filename)
     
-    logger.info(f"🧪 [Raw Alchemy] Processing: {raw_path}")
+    logger.info(f"馃И [Raw Alchemy] Processing: {raw_path}")
+    init_taichi()
 
-    # --- Step 1: 解码 RAW (rawpy + RCD demosaic -> ProPhoto RGB Linear) ---
     from raw_alchemy.exif import extract_lens_exif
 
     exif_data, exif_metadata = extract_lens_exif(raw_path, None)
 
     if denoise_enabled:
-        # CANS RAW V2: packed RAW → ProPhoto Linear RGB (replaces demosaicing)
-        logger.info(f"  🔹 [Step 1] CANS RAW V2 denoise + demosaic...")
+        logger.info("  [Step 1] CANS RAW V2 denoise + demosaic...")
         try:
             img = denoise_raw(raw_path, exposure_ratio=1.0)
-            logger.info("  ✅ CANS denoise complete")
         except Exception as e:
-            logger.error(f"  ❌ CANS denoise failed, falling back to rawpy+RCD: {e}")
+            logger.error(f"  CANS denoise failed, falling back to rawpy+RCD: {e}")
             img = _rawpy_decode_to_prophoto(raw_path)
     else:
-        logger.info(f"  🔹 [Step 1] Decoding RAW (rawpy + RCD)...")
+        logger.info("  [Step 1] Decoding RAW (rawpy + RCD)...")
         img = _rawpy_decode_to_prophoto(raw_path)
 
-    source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
+    lens_state = {"corrected": img}
 
-    # --- Step 2: 曝光控制 ---
-    if exposure is not None:
-        # 路径 A: 手动曝光
-        logger.info(f"  🔹 [Step 2] Manual Exposure Override ({exposure:+.2f} stops)")
-        gain = 2.0 ** exposure
-        utils.apply_gain_inplace(img, gain)
-    else:
-        # 路径 B: 自动测光（使用策略模式）
-        logger.info(f"  🔹 [Step 2] Auto Exposure ({metering_mode})")
-        img, applied_gain = apply_auto_exposure(img, source_cs, metering_mode, target_gray=0.18)
-
-
-    # --- Step 3: 基础校正 (WB, Lens, HL/SH) ---
-    
-    # 3.1 镜头校正
-    if lens_correct:
-        logger.info("  🔹 [Step 3.1] Lens Correction...")
-        img = utils.apply_lens_correction(
-            img,
+    def lens_corrector(src: np.ndarray) -> np.ndarray:
+        logger.info("  [Step 2] Lens Correction...")
+        corrected = utils.apply_lens_correction(
+            src,
             exif_data=exif_data,
-            custom_db_path=custom_db_path
+            custom_db_path=custom_db_path,
         )
-            
-    # 3.1.5 几何变换
-    if rotation != 0 or flip_horizontal or flip_vertical:
-        logger.info(f"  🔹 [Step 3.1.5] Geometry (Rot:{rotation}, FlipH:{flip_horizontal}, FlipV:{flip_vertical})...")
-        img = utils.apply_geometry(img, rotation, flip_horizontal, flip_vertical)
-    
-    # 3.1.6 裁切
-    if crop and crop != (0.0, 0.0, 1.0, 1.0):
-        logger.info(f"  🔹 [Step 3.1.6] Cropping {crop}...")
-        img = utils.apply_crop(img, crop)
-    
-    # 3.2 白平衡
-    if wb_temp != 0.0 or wb_tint != 0.0:
-        logger.info(f"  🔹 [Step 3.2] White Balance (T:{wb_temp}, t:{wb_tint})...")
-        utils.apply_white_balance(img, wb_temp, wb_tint)
+        lens_state["corrected"] = corrected
+        return corrected
 
-    # 3.3 高光/阴影
-    if highlight != 0.0 or shadow != 0.0:
-        logger.info(f"  🔹 [Step 3.3] Highlight/Shadow (H:{highlight}, S:{shadow})...")
-        utils.apply_highlight_shadow(img, highlight, shadow, colourspace=source_cs)
+    params = _build_export_params(
+        log_space=log_space,
+        lut_path=lut_path,
+        exposure=exposure,
+        metering_mode=metering_mode,
+        wb_temp=wb_temp,
+        wb_tint=wb_tint,
+        saturation=saturation,
+        contrast=contrast,
+        highlight=highlight,
+        shadow=shadow,
+        rotation=rotation,
+        flip_horizontal=flip_horizontal,
+        flip_vertical=flip_vertical,
+        perspective_corners=perspective_corners,
+        crop=crop,
+        lens_correct=lens_correct,
+        custom_db_path=custom_db_path,
+        denoise_enabled=False,
+        sharpen_strength=sharpen_strength,
+        hdr_output=hdr_output,
+    )
 
-    # 3.4 饱和度/对比度
-    logger.info(f"  🔹 [Step 3.4] Saturation/Contrast (S:{saturation:.2f}, C:{contrast:.2f})...")
-    img = utils.apply_saturation_and_contrast(img, saturation=saturation, contrast=contrast, colourspace=source_cs)
+    img = _run_export_executor(
+        img,
+        params,
+        metering_source=lambda: lens_state["corrected"],
+        lens_corrector=lens_corrector if lens_correct else None,
+    )
+    img, color_matrix = _linearize_for_dng(img, output_path, log_space, lut_path, logger)
 
-    # --- Step 4: 色彩空间转换 (ProPhoto Linear -> Log 或 sRGB Standard) ---
-    if log_space and log_space != 'None':
-        log_color_space_name = LOG_TO_WORKING_SPACE.get(log_space)
-        log_curve_name = LOG_ENCODING_MAP.get(log_space, log_space)
-        
-        if not log_color_space_name:
-             raise ValueError(f"Unknown Log Space: {log_space}")
+    logger.info(f"  Saving to {os.path.basename(output_path)}...")
+    save_image(
+        img,
+        output_path,
+        logger,
+        exif_metadata=exif_metadata,
+        exif_dict=exif_data,
+        color_matrix=color_matrix,
+        hdr_output=hdr_output,
+    )
 
-        logger.info(f"  🔹 [Step 4] Color Transform (ProPhoto -> {log_color_space_name} -> {log_curve_name})")
-
-        # 4.1 Gamut 变换 (矩阵运算)
-        M = colour.matrix_RGB_to_RGB(
-            colour.RGB_COLOURSPACES['ProPhoto RGB'],
-            colour.RGB_COLOURSPACES[log_color_space_name],
-        )
-        if not img.flags['C_CONTIGUOUS']:
-            img = np.ascontiguousarray(img)
-        if img.dtype != np.float32:
-            img = img.astype(np.float32)
-        utils.apply_matrix_inplace(img, M)
-        
-        # 4.2 Log 编码
-        # Log 函数无法处理负值，需裁剪微小底噪
-        np.maximum(img, 1e-6, out=img)
-        if not log_encode_gpu(img, log_curve_name):
-            img = colour.cctf_encoding(img, function=log_curve_name)
-    else:
-        logger.info("  🔹 [Step 4] Applying sRGB Standard Transform (ProPhoto -> sRGB -> sRGB OETF)")
-        # 4.1 Gamut: ProPhoto RGB → sRGB
-        M = colour.matrix_RGB_to_RGB(
-            colour.RGB_COLOURSPACES['ProPhoto RGB'],
-            colour.RGB_COLOURSPACES['sRGB'],
-        )
-        if not img.flags['C_CONTIGUOUS']:
-            img = np.ascontiguousarray(img)
-        if img.dtype != np.float32:
-            img = img.astype(np.float32)
-        utils.apply_matrix_inplace(img, M)
-        # 4.2 sRGB OETF
-        utils.linear_to_srgb_inplace(img)
-
-    # --- Step 5: 应用 LUT ---
-    if lut_path:
-        logger.info(f"  🔹 [Step 5] Applying LUT {os.path.basename(lut_path)}...")
-        try:
-            lut = utils.load_lut_cached(lut_path)
-            
-            # 3D LUT 使用 Taichi 加速
-            if isinstance(lut, colour.LUT3D):
-                if not img.flags['C_CONTIGUOUS']:
-                    img = np.ascontiguousarray(img)
-                if img.dtype != np.float32:
-                    img = img.astype(np.float32)
-                
-                # Ensure LUT table is float32 and C-contiguous
-                lut_table = lut.table
-                if lut_table.dtype != np.float32:
-                    lut_table = lut_table.astype(np.float32)
-                if not lut_table.flags['C_CONTIGUOUS']:
-                    lut_table = np.ascontiguousarray(lut_table)
-                
-                # Ensure domains are float64 and C-contiguous
-                domain_min = lut.domain[0].astype(np.float64)
-                domain_max = lut.domain[1].astype(np.float64)
-                if not domain_min.flags['C_CONTIGUOUS']:
-                    domain_min = np.ascontiguousarray(domain_min)
-                if not domain_max.flags['C_CONTIGUOUS']:
-                    domain_max = np.ascontiguousarray(domain_max)
-                
-                utils.apply_lut_inplace(img, lut_table, domain_min, domain_max)
-            else:
-                # 1D LUT 使用 colour 库默认方法
-                img = lut.apply(img)
-            
-        except Exception as e:
-            logger.error(f"  ❌ applying LUT: {e}")
-
-    # --- Step 5.6: Sharpening (Richardson-Lucy, after denoise) ---
-    if sharpen_strength > 0:
-        logger.info(f"  🔹 [Step 5.6] Applying RL sharpening (strength={sharpen_strength:.2f})...")
-        try:
-            from raw_alchemy.math_ops import sharpen
-            img = sharpen(img, strength=sharpen_strength, sigma=1.0)
-            logger.info("  ✅ Sharpening complete")
-        except Exception as e:
-            logger.error(f"  ❌ Sharpening failed: {e}")
-
-    # --- Step 5.6: DNG 线性化处理 ---
-    # 如果保存为 DNG，必须确保数据是线性的 (Linear Raw)。
-    # 前面的 Log 变换或 sRGB 转换可能已经应用了 Gamma/Log 曲线，需要逆转。
-    color_matrix = None
-    if output_path.lower().endswith('.dng'):
-        logger.info("  🔹 [Pre-Save] Converting to Linear for DNG export...")
-        try:
-            if log_space and log_space != 'None' and not lut_path:
-                # Log 模式：逆转 Log 曲线
-                log_color_space_name = LOG_TO_WORKING_SPACE.get(log_space)
-                color_matrix = colour.RGB_COLOURSPACES['sRGB'].matrix_XYZ_to_RGB
-                log_curve_name = LOG_ENCODING_MAP.get(log_space, log_space)
-                utils.srgb_to_linear_inplace(img)
-            else:
-                # 标准模式：逆转 sRGB 曲线 (sRGB EOTF)
-                utils.srgb_to_linear_inplace(img)
-                color_matrix = colour.RGB_COLOURSPACES['sRGB'].matrix_XYZ_to_RGB
-        except Exception as e:
-            logger.warning(f"  ⚠️  Linearization failed: {e}. Saving as is.")
-
-    # --- Step 6: 保存（使用模块化的文件保存功能）---
-    logger.info(f"  💾 Saving to {os.path.basename(output_path)}...")
-    save_image(img, output_path, logger, exif_metadata=exif_metadata, exif_dict=exif_data, color_matrix=color_matrix)
-    
-    # --- 最终清理 ---
     del img
     gc.collect()
+    return
 
 
 def export_from_cache(
@@ -458,143 +440,58 @@ def export_from_cache(
     rotation: int = 0,
     flip_horizontal: bool = False,
     flip_vertical: bool = False,
+    perspective_corners: Optional[tuple] = None,
     crop: Optional[tuple] = None,
     sharpen_strength: float = 0.0,
+    hdr_output: bool = False,
 ):
     """Export using cached ProPhoto Linear data (after demosaic + lens correction + denoise).
 
-    Skips RAW decode, demosaicing, lens correction and denoising — reuses the
+    Skips RAW decode, demosaicing, lens correction and denoising 鈥?reuses the
     preview pipeline's cached result.  Everything from geometry onward is
     identical to process_image().
     """
     filename = os.path.basename(output_path)
     logger = create_logger(log_queue, filename)
-    logger.info(f"🧪 [Raw Alchemy] Export from cache -> {output_path}")
+    logger.info(f"馃И [Raw Alchemy] Export from cache -> {output_path}")
+    init_taichi()
 
-    img = cached_img.copy()
-    source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
+    params = _build_export_params(
+        log_space=log_space,
+        lut_path=lut_path,
+        exposure=exposure,
+        metering_mode=metering_mode,
+        wb_temp=wb_temp,
+        wb_tint=wb_tint,
+        saturation=saturation,
+        contrast=contrast,
+        highlight=highlight,
+        shadow=shadow,
+        rotation=rotation,
+        flip_horizontal=flip_horizontal,
+        flip_vertical=flip_vertical,
+        perspective_corners=perspective_corners,
+        crop=crop,
+        lens_correct=False,
+        denoise_enabled=False,
+        sharpen_strength=sharpen_strength,
+        hdr_output=hdr_output,
+    )
 
-    # --- Step 2: Exposure ---
-    if exposure is not None:
-        logger.info(f"  🔹 [Step 2] Manual Exposure Override ({exposure:+.2f} stops)")
-        gain = 2.0 ** exposure
-        utils.apply_gain_inplace(img, gain)
-    else:
-        logger.info(f"  🔹 [Step 2] Auto Exposure ({metering_mode})")
-        img, _ = apply_auto_exposure(img, source_cs, metering_mode, target_gray=0.18)
+    img = _run_export_executor(cached_img.copy(), params, metering_source=cached_img)
+    img, color_matrix = _linearize_for_dng(img, output_path, log_space, lut_path, logger)
 
-    # --- Step 3.1.5: Geometry ---
-    if rotation != 0 or flip_horizontal or flip_vertical:
-        logger.info(f"  🔹 [Step 3.1.5] Geometry (Rot:{rotation}, FlipH:{flip_horizontal}, FlipV:{flip_vertical})...")
-        img = utils.apply_geometry(img, rotation, flip_horizontal, flip_vertical)
-
-    # --- Step 3.1.6: Crop ---
-    if crop and crop != (0.0, 0.0, 1.0, 1.0):
-        logger.info(f"  🔹 [Step 3.1.6] Cropping {crop}...")
-        img = utils.apply_crop(img, crop)
-
-    # --- Step 3.2: White Balance ---
-    if wb_temp != 0.0 or wb_tint != 0.0:
-        logger.info(f"  🔹 [Step 3.2] White Balance (T:{wb_temp}, t:{wb_tint})...")
-        utils.apply_white_balance(img, wb_temp, wb_tint)
-
-    # --- Step 3.3: Highlight / Shadow ---
-    if highlight != 0.0 or shadow != 0.0:
-        logger.info(f"  🔹 [Step 3.3] Highlight/Shadow (H:{highlight}, S:{shadow})...")
-        utils.apply_highlight_shadow(img, highlight, shadow, colourspace=source_cs)
-
-    # --- Step 3.4: Saturation / Contrast ---
-    logger.info(f"  🔹 [Step 3.4] Saturation/Contrast (S:{saturation:.2f}, C:{contrast:.2f})...")
-    img = utils.apply_saturation_and_contrast(img, saturation=saturation, contrast=contrast, colourspace=source_cs)
-
-    # --- Step 4: Color Space Transform ---
-    if log_space and log_space != 'None':
-        log_color_space_name = LOG_TO_WORKING_SPACE.get(log_space)
-        log_curve_name = LOG_ENCODING_MAP.get(log_space, log_space)
-        if not log_color_space_name:
-            raise ValueError(f"Unknown Log Space: {log_space}")
-        logger.info(f"  🔹 [Step 4] Color Transform (ProPhoto -> {log_color_space_name} -> {log_curve_name})")
-        M = colour.matrix_RGB_to_RGB(
-            colour.RGB_COLOURSPACES['ProPhoto RGB'],
-            colour.RGB_COLOURSPACES[log_color_space_name],
-        )
-        if not img.flags['C_CONTIGUOUS']:
-            img = np.ascontiguousarray(img)
-        if img.dtype != np.float32:
-            img = img.astype(np.float32)
-        utils.apply_matrix_inplace(img, M)
-        np.maximum(img, 1e-6, out=img)
-        if not log_encode_gpu(img, log_curve_name):
-            img = colour.cctf_encoding(img, function=log_curve_name)
-    else:
-        logger.info("  🔹 [Step 4] Applying sRGB Standard Transform (ProPhoto -> sRGB -> sRGB OETF)")
-        # Gamut: ProPhoto RGB → sRGB
-        M = colour.matrix_RGB_to_RGB(
-            colour.RGB_COLOURSPACES['ProPhoto RGB'],
-            colour.RGB_COLOURSPACES['sRGB'],
-        )
-        if not img.flags['C_CONTIGUOUS']:
-            img = np.ascontiguousarray(img)
-        if img.dtype != np.float32:
-            img = img.astype(np.float32)
-        utils.apply_matrix_inplace(img, M)
-        # sRGB OETF
-        utils.linear_to_srgb_inplace(img)
-
-    # --- Step 5: LUT ---
-    if lut_path:
-        logger.info(f"  🔹 [Step 5] Applying LUT {os.path.basename(lut_path)}...")
-        try:
-            lut = utils.load_lut_cached(lut_path)
-            if isinstance(lut, colour.LUT3D):
-                if not img.flags['C_CONTIGUOUS']:
-                    img = np.ascontiguousarray(img)
-                if img.dtype != np.float32:
-                    img = img.astype(np.float32)
-                lut_table = lut.table
-                if lut_table.dtype != np.float32:
-                    lut_table = lut_table.astype(np.float32)
-                if not lut_table.flags['C_CONTIGUOUS']:
-                    lut_table = np.ascontiguousarray(lut_table)
-                domain_min = lut.domain[0].astype(np.float64)
-                domain_max = lut.domain[1].astype(np.float64)
-                if not domain_min.flags['C_CONTIGUOUS']:
-                    domain_min = np.ascontiguousarray(domain_min)
-                if not domain_max.flags['C_CONTIGUOUS']:
-                    domain_max = np.ascontiguousarray(domain_max)
-                utils.apply_lut_inplace(img, lut_table, domain_min, domain_max)
-            else:
-                img = lut.apply(img)
-        except Exception as e:
-            logger.error(f"  ❌ applying LUT: {e}")
-
-    # --- Step 5.6: Sharpening ---
-    if sharpen_strength > 0:
-        logger.info(f"  🔹 [Step 5.6] Applying RL sharpening (strength={sharpen_strength:.2f})...")
-        try:
-            from raw_alchemy.math_ops import sharpen
-            img = sharpen(img, strength=sharpen_strength, sigma=1.0)
-            logger.info("  ✅ Sharpening complete")
-        except Exception as e:
-            logger.error(f"  ❌ Sharpening failed: {e}")
-
-    # --- DNG linearization ---
-    color_matrix = None
-    if output_path.lower().endswith('.dng'):
-        logger.info("  🔹 [Pre-Save] Converting to Linear for DNG export...")
-        try:
-            if log_space and log_space != 'None' and not lut_path:
-                color_matrix = colour.RGB_COLOURSPACES['sRGB'].matrix_XYZ_to_RGB
-                utils.srgb_to_linear_inplace(img)
-            else:
-                utils.srgb_to_linear_inplace(img)
-                color_matrix = colour.RGB_COLOURSPACES['sRGB'].matrix_XYZ_to_RGB
-        except Exception as e:
-            logger.warning(f"  ⚠️  Linearization failed: {e}. Saving as is.")
-
-    # --- Save ---
-    logger.info(f"  💾 Saving to {filename}...")
-    save_image(img, output_path, logger, exif_metadata=exif_metadata, exif_dict=exif_data, color_matrix=color_matrix)
+    logger.info(f"  Saving to {filename}...")
+    save_image(
+        img,
+        output_path,
+        logger,
+        exif_metadata=exif_metadata,
+        exif_dict=exif_data,
+        color_matrix=color_matrix,
+        hdr_output=hdr_output,
+    )
 
     del img
     gc.collect()
+    return

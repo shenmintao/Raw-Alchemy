@@ -77,6 +77,8 @@
     "none": "None (sRGB Standard)",
     "language": "Language",
     "settings": "Settings",
+    "editing": "Editing",
+    "write_sidecar": "Write sidecar",
     "english": "English",
     "chinese": "Chinese",
     "restart_required": "Restart Required",

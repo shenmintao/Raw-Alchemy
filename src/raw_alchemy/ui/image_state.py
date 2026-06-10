@@ -1,7 +1,9 @@
-from PySide6.QtGui import QPixmap
-from PySide6.QtCore import QSize, Qt
-import numpy as np
 from typing import Optional
+
+import numpy as np
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QPixmap
+
 
 class ImageState:
     """
@@ -14,25 +16,30 @@ class ImageState:
     - current: processed with current params
     - baseline: saved baseline (optional)
     """
+
     def __init__(self):
         self.full: Optional[QPixmap] = None
         self.display: Optional[QPixmap] = None
-        self.float_data: Optional[np.ndarray] = None  # For histogram
-        self.uint8_data: Optional[np.ndarray] = None   # For GL viewport
+        self.float_data: Optional[np.ndarray] = None
+        self.uint8_data: Optional[np.ndarray] = None
         self.source_size: Optional[tuple[int, int]] = None
 
-    def update_full(self, pixmap: QPixmap, float_data: Optional[np.ndarray] = None,
-                    uint8_data: Optional[np.ndarray] = None,
-                    source_size: Optional[tuple[int, int]] = None):
-        """Update the full-size image and clear cached display version"""
+    def update_full(
+        self,
+        pixmap: QPixmap,
+        float_data: Optional[np.ndarray] = None,
+        uint8_data: Optional[np.ndarray] = None,
+        source_size: Optional[tuple[int, int]] = None,
+    ):
+        """Update the full-size image and clear cached display version."""
         self.full = pixmap
         self.float_data = float_data
         self.uint8_data = uint8_data
         self.source_size = source_size
-        self.display = None  # Invalidate cached display
+        self.display = None
 
     def get_display(self, size: QSize) -> Optional[QPixmap]:
-        """Get display-sized version, caching the result"""
+        """Get display-sized version, caching the result."""
         if not self.full:
             return None
 
@@ -40,12 +47,12 @@ class ImageState:
             self.display = self.full.scaled(
                 size,
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
+                Qt.TransformationMode.SmoothTransformation,
             )
         return self.display
 
     def clear(self):
-        """Clear all cached data"""
+        """Clear all cached data."""
         self.full = None
         self.display = None
         self.float_data = None

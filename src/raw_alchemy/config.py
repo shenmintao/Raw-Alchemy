@@ -1,22 +1,30 @@
-"""[config.py](src/raw_alchemy/config.py)
-Raw Alchemy 配置文件
-包含 Log 空间映射、编码映射、测光模式定义和 GUI 配置
+﻿"""[config.py](src/raw_alchemy/config.py)
+Raw Alchemy 閰嶇疆鏂囦欢
+鍖呭惈 Log 绌洪棿鏄犲皠銆佺紪鐮佹槧灏勩€佹祴鍏夋ā寮忓畾涔夊拰 GUI 閰嶇疆
 """
 
 # ==========================================
-#           文件类型支持
+#           鏂囦欢绫诲瀷鏀寔
 # ==========================================
 
-# 缩略图/扫描等功能支持的 RAW 扩展名（小写，包含点号）
+# 缂╃暐鍥?鎵弿绛夊姛鑳芥敮鎸佺殑 RAW 鎵╁睍鍚嶏紙灏忓啓锛屽寘鍚偣鍙凤級
 SUPPORTED_RAW_EXTENSIONS = {
 '.dng', '.cr2', '.cr3', '.nef', '.arw', '.rw2', '.raf', '.orf', '.pef', '.srw', '.x3f', '.fff', '.3fr'
 }
 
+WORKING_SPACE_PROPHOTO = 'ProPhoto RGB'
+WORKING_SPACE_ACESCG = 'ACEScg'
+WORKING_SPACE = WORKING_SPACE_PROPHOTO
+HDR_OUTPUT_COLOURSPACE = 'ITU-R BT.2020'
+HDR_PQ_TRANSFER_FUNCTION = 'ST 2084'
+HDR_PEAK_NITS = 1000.0
+HDR_PQ_MASTERING_NITS = 10000.0
+
 # ==========================================
-#           核心处理配置
+#           鏍稿績澶勭悊閰嶇疆
 # ==========================================
 
-# 映射：Log 空间名称 -> 对应的线性色域 (Linear Gamut)
+# 鏄犲皠锛歀og 绌洪棿鍚嶇О -> 瀵瑰簲鐨勭嚎鎬ц壊鍩?(Linear Gamut)
 LOG_TO_WORKING_SPACE = {
     'F-Log': 'F-Gamut',
     'F-Log2': 'F-Gamut',
@@ -34,49 +42,49 @@ LOG_TO_WORKING_SPACE = {
     'D-Log': 'DJI D-Gamut',
 }
 
-# 映射：复合名称 -> colour 库识别的 Log 编码函数名称
+# 鏄犲皠锛氬鍚堝悕绉?-> colour 搴撹瘑鍒殑 Log 缂栫爜鍑芥暟鍚嶇О
 LOG_ENCODING_MAP = {
     'S-Log3.Cine': 'S-Log3',
     'F-Log2C': 'F-Log2',
 }
 
-# 测光模式选项
+# 娴嬪厜妯″紡閫夐」
 METERING_MODES = [
-    'average',        # 几何平均 (默认)
-    'center-weighted',# 中央重点
-    'highlight-safe', # 高光保护 (ETTR)
-    'hybrid',         # 混合 (平均 + 高光限制)
-    'matrix',         # 矩阵/评价测光
+    'average',        # 鍑犱綍骞冲潎 (榛樿)
+    'center-weighted',# 涓ぎ閲嶇偣
+    'highlight-safe', # 楂樺厜淇濇姢 (ETTR)
+    'hybrid',         # 娣峰悎 (骞冲潎 + 楂樺厜闄愬埗)
+    'matrix',         # 鐭╅樀/璇勪环娴嬪厜
 ]
 
 # ==========================================
-#           GUI 配置
+#           GUI 閰嶇疆
 # ==========================================
 
-# GUI 窗口配置
+# GUI 绐楀彛閰嶇疆
 GUI_WINDOW_WIDTH = 1000
 GUI_WINDOW_HEIGHT = 950
 GUI_WINDOW_TITLE = "Raw Alchemy"
 
-# GUI 更新间隔（毫秒）
+# GUI 鏇存柊闂撮殧锛堟绉掞級
 GUI_QUEUE_UPDATE_INTERVAL = 50
 GUI_INITIAL_UPDATE_INTERVAL = 100
 
-# 默认值
+# 榛樿鍊?
 DEFAULT_CPU_THREADS = 4
 DEFAULT_OUTPUT_FORMAT = 'tif'
 DEFAULT_METERING_MODE = 'matrix'
 DEFAULT_EXPOSURE_STOPS = 0.0
 DEFAULT_LENS_CORRECTION = True
 
-# 曝光调整范围
+# 鏇濆厜璋冩暣鑼冨洿
 EXPOSURE_MIN = -5.0
 EXPOSURE_MAX = 5.0
 
-# 日志字体
+# 鏃ュ織瀛椾綋
 LOG_FONT_FAMILY = "Consolas"
 LOG_FONT_SIZE = 9
 
-# 进度条配置
+# 杩涘害鏉￠厤缃?
 PROGRESS_BAR_LENGTH = 400
 PROGRESS_LABEL_WIDTH = 16

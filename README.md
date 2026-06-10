@@ -148,6 +148,8 @@ The conversion script, `lensfun-convert-lcp`, can be found in the `src/raw_alche
 RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_PATH>
 ```
 
+The CLI uses neutral saturation and contrast defaults (`1.0` / `1.0`). GUI defaults are unchanged.
+
 #### Examples
 
 **1. Basic Log Conversion**

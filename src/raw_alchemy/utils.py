@@ -1,23 +1,23 @@
-import os
+﻿import os
 import sys
 from functools import lru_cache
 from typing import Optional, Tuple, Dict
 import numpy as np
 import colour
 from loguru import logger
-from raw_alchemy import lensfun_wrapper as lf
+from raw_alchemy import config, lensfun_wrapper as lf
 from raw_alchemy.math_ops import (
     apply_matrix_inplace,
     apply_lut_inplace,
     apply_saturation_contrast_inplace,
-    apply_white_balance_inplace,
     apply_highlight_shadow_inplace,
     apply_gain_inplace,
     linear_to_srgb_inplace,
     srgb_to_linear_inplace,
     bt709_to_srgb_inplace,
     perspective_warp_kernel,
-    compute_perspective_matrix
+    compute_perspective_matrix,
+    white_balance_matrix,
 )
 import cv2
 
@@ -30,28 +30,28 @@ def load_lut_cached(lut_path: str):
 
 def resource_path(relative_path):
     """
-    获取资源的绝对路径，兼容 Dev, PyInstaller, 和 Nuitka (Onefile & Standalone).
+    鑾峰彇璧勬簮鐨勭粷瀵硅矾寰勶紝鍏煎 Dev, PyInstaller, 鍜?Nuitka (Onefile & Standalone).
     """
-    # 1. 处理 PyInstaller (它把资源解压到 _MEIPASS)
+    # 1. 澶勭悊 PyInstaller (瀹冩妸璧勬簮瑙ｅ帇鍒?_MEIPASS)
     if hasattr(sys, '_MEIPASS'):
         base_path = sys._MEIPASS
     
-    # 2. 处理 Nuitka 和 普通 Python 脚本
-    # Nuitka 会巧妙地处理 __file__，使其指向解压后的临时目录(Onefile)或发布目录(Standalone)
+    # 2. 澶勭悊 Nuitka 鍜?鏅€?Python 鑴氭湰
+    # Nuitka 浼氬阀濡欏湴澶勭悊 __file__锛屼娇鍏舵寚鍚戣В鍘嬪悗鐨勪复鏃剁洰褰?Onefile)鎴栧彂甯冪洰褰?Standalone)
     else:
-        # 获取当前脚本所在的目录
+        # 鑾峰彇褰撳墠鑴氭湰鎵€鍦ㄧ殑鐩綍
         base_path = os.path.dirname(os.path.abspath(__file__))
 
     return os.path.join(base_path, relative_path)
 
 # =========================================================
-# Taichi 加速核函数 (In-Place / 无内存分配)
+# Taichi 鍔犻€熸牳鍑芥暟 (In-Place / 鏃犲唴瀛樺垎閰?
 # =========================================================
 
 
 def compute_histogram_fast(img_array, bins=100, sample_rate=4):
     """
-    快速计算 RGB 三通道直方图
+    蹇€熻绠?RGB 涓夐€氶亾鐩存柟鍥?
 
     Args:
         img_array: HxWx3 numpy array, uint8 [0,255] or float32 [0,1]
@@ -62,31 +62,31 @@ def compute_histogram_fast(img_array, bins=100, sample_rate=4):
         list of 3 histogram arrays (R, G, B) as float arrays
     """
     try:
-        # 数据验证
+        # 鏁版嵁楠岃瘉
         if img_array is None or img_array.size == 0:
             return None
 
         if len(img_array.shape) != 3 or img_array.shape[2] != 3:
             return None
 
-        # 子采样先，再转换（避免全图copy+转换）
+        # 瀛愰噰鏍峰厛锛屽啀杞崲锛堥伩鍏嶅叏鍥綾opy+杞崲锛?
         sample = img_array[::sample_rate, ::sample_rate, :].copy()
 
-        # uint8 → float32 [0,1]（仅对子采样后的小数据）
+        # uint8 鈫?float32 [0,1]锛堜粎瀵瑰瓙閲囨牱鍚庣殑灏忔暟鎹級
         if sample.dtype == np.uint8:
             sample = sample.astype(np.float32) * (1.0 / 255.0)
         elif sample.dtype != np.float32:
             sample = sample.astype(np.float32)
 
-        # 确保数据在有效范围内
+        # 纭繚鏁版嵁鍦ㄦ湁鏁堣寖鍥村唴
         sample = np.clip(sample, 0.0, 1.0)
         
         hist_data = []
         for channel in range(3):
-            # 展平通道数据 - 使用copy()确保连续内存
+            # 灞曞钩閫氶亾鏁版嵁 - 浣跨敤copy()纭繚杩炵画鍐呭瓨
             channel_data = sample[:, :, channel].ravel().copy()
             
-            # 确保是C连续数组
+            # 纭繚鏄疌杩炵画鏁扮粍
             if not channel_data.flags['C_CONTIGUOUS']:
                 channel_data = np.ascontiguousarray(channel_data)
             
@@ -96,26 +96,26 @@ def compute_histogram_fast(img_array, bins=100, sample_rate=4):
         
         return hist_data
     except Exception as e:
-        # 记录错误但不抛出异常
+        # 璁板綍閿欒浣嗕笉鎶涘嚭寮傚父
         logger.warning(f"Histogram computation failed: {type(e).__name__}: {e}")
         return None
 
 
 def compute_waveform_fast(img_array, bins=100, sample_rate=4):
     """
-    快速计算亮度波形图数据
-    类似达芬奇的波形图，显示图像的亮度分布
+    蹇€熻绠椾寒搴︽尝褰㈠浘鏁版嵁
+    绫讳技杈捐姮濂囩殑娉㈠舰鍥撅紝鏄剧ず鍥惧儚鐨勪寒搴﹀垎甯?
 
     Args:
         img_array: HxWx3 numpy array, uint8 [0,255] or float32 [0,1]
-        bins: number of vertical bins (亮度级别)
-        sample_rate: horizontal subsample rate (水平采样率)
+        bins: number of vertical bins (浜害绾у埆)
+        sample_rate: horizontal subsample rate (姘村钩閲囨牱鐜?
 
     Returns:
-        numpy array of shape [sampled_width, bins] - 亮度波形数据
+        numpy array of shape [sampled_width, bins] - 浜害娉㈠舰鏁版嵁
     """
     try:
-        # 数据验证
+        # 鏁版嵁楠岃瘉
         if img_array is None or img_array.size == 0:
             return None
 
@@ -124,16 +124,16 @@ def compute_waveform_fast(img_array, bins=100, sample_rate=4):
 
         h, w, c = img_array.shape
 
-        # 水平方向采样以提高性能
+        # 姘村钩鏂瑰悜閲囨牱浠ユ彁楂樻€ц兘
         sampled_width = w // sample_rate
         if sampled_width == 0:
             sampled_width = 1
 
-        # 垂直也子采样（与histogram一致），避免全图计算
+        # 鍨傜洿涔熷瓙閲囨牱锛堜笌histogram涓€鑷达級锛岄伩鍏嶅叏鍥捐绠?
         v_step = max(1, sample_rate // 2)
         img_sub = img_array[::v_step, :, :]
 
-        # uint8 → float32 [0,1]（仅对子采样后的小数据）
+        # uint8 鈫?float32 [0,1]锛堜粎瀵瑰瓙閲囨牱鍚庣殑灏忔暟鎹級
         if img_sub.dtype == np.uint8:
             img_f = img_sub.astype(np.float32) * (1.0 / 255.0)
         elif img_sub.dtype != np.float32:
@@ -143,20 +143,20 @@ def compute_waveform_fast(img_array, bins=100, sample_rate=4):
 
         img_f = np.clip(img_f, 0.0, 1.0)
 
-        # 计算亮度（使用 Rec.709 系数）
+        # 璁＄畻浜害锛堜娇鐢?Rec.709 绯绘暟锛?
         # Y = 0.2126*R + 0.7152*G + 0.0722*B
         luma = (img_f[:, :, 0] * 0.2126 +
                 img_f[:, :, 1] * 0.7152 +
                 img_f[:, :, 2] * 0.0722).astype(np.float32)
         
-        # 确保是C连续数组
+        # 纭繚鏄疌杩炵画鏁扮粍
         if not luma.flags['C_CONTIGUOUS']:
             luma = np.ascontiguousarray(luma)
         
-        # 创建波形输出数组
+        # 鍒涘缓娉㈠舰杈撳嚭鏁扮粍
         waveform = np.zeros((sampled_width, bins), dtype=np.float32)
         
-        # 确保输出数组也是C连续的
+        # 纭繚杈撳嚭鏁扮粍涔熸槸C杩炵画鐨?
         if not waveform.flags['C_CONTIGUOUS']:
             waveform = np.ascontiguousarray(waveform)
         
@@ -167,49 +167,52 @@ def compute_waveform_fast(img_array, bins=100, sample_rate=4):
             bin_indices = np.clip((col_data * bins).astype(np.int32), 0, bins - 1)
             np.add.at(waveform[col_idx], bin_indices, 1.0)
         
-        # 归一化
+        # 褰掍竴鍖?
         max_val = np.max(waveform)
         if max_val > 0:
             waveform = waveform / max_val
         
         return waveform
     except Exception as e:
-        # 记录错误但不抛出异常
+        # 璁板綍閿欒浣嗕笉鎶涘嚭寮傚父
         logger.warning(f"Waveform computation failed: {type(e).__name__}: {e}")
         return None
 
 # =========================================================
-# 辅助计算函数 (用于测光)
+# 杈呭姪璁＄畻鍑芥暟 (鐢ㄤ簬娴嬪厜)
 # =========================================================
 
 def get_luminance_coeffs(colourspace):
-    """从 colour 空间对象中提取 RGB -> Y (Luminance) 的系数"""
-    # RGB_to_XYZ 矩阵的第二行就是 Y 通道的系数 [Lr, Lg, Lb]
+    """Return RGB luminance coefficients from a colour-science RGB space."""
     return colourspace.matrix_RGB_to_XYZ[1, :]
+
+
+def get_working_colourspace():
+    return colour.RGB_COLOURSPACES[config.WORKING_SPACE]
 
 def get_subsampled_view(img, target_size=1024):
     """
-    获取图像的下采样视图。
-    对于测光来说，分析 1000px 宽的缩略图和分析 8000px 的原图，结果差异可忽略不计。
+    鑾峰彇鍥惧儚鐨勪笅閲囨牱瑙嗗浘銆?
+    瀵逛簬娴嬪厜鏉ヨ锛屽垎鏋?1000px 瀹界殑缂╃暐鍥惧拰鍒嗘瀽 8000px 鐨勫師鍥撅紝缁撴灉宸紓鍙拷鐣ヤ笉璁°€?
     """
     h, w, _ = img.shape
-    # 计算步长，使得长边大约为 target_size
+    # 璁＄畻姝ラ暱锛屼娇寰楅暱杈瑰ぇ绾︿负 target_size
     step = max(1, max(h, w) // target_size)
-    # Numpy切片是视图(View)，不占用新内存
+    # Numpy鍒囩墖鏄鍥?View)锛屼笉鍗犵敤鏂板唴瀛?
     return img[::step, ::step, :]
 
 # =========================================================
-# 业务逻辑函数 (优化版)
+# 涓氬姟閫昏緫鍑芥暟 (浼樺寲鐗?
 # =========================================================
 
 def apply_saturation_and_contrast(img_linear, saturation=1.25, contrast=1.10, colourspace=None):
     """
-    In-Place 应用饱和度和对比度。
+    In-Place 搴旂敤楗卞拰搴﹀拰瀵规瘮搴︺€?
     """
     import colour
     
     if colourspace is None:
-        colourspace = colour.RGB_COLOURSPACES['ProPhoto RGB']
+        colourspace = get_working_colourspace()
     
     luma_coeffs = get_luminance_coeffs(colourspace).astype(np.float32)
     
@@ -231,30 +234,10 @@ def apply_white_balance(img_linear, temp=0.0, tint=0.0):
     temp: -100 to 100 (Blue <-> Amber)
     tint: -100 to 100 (Green <-> Magenta)
     """
-    # Simple gain calculation
-    # Temp > 0: Warm (R+, B-)
-    # Temp < 0: Cool (R-, B+)
-    # Tint > 0: Magenta (G-)  -- Wait, usually tint + is magenta?
-    # Let's define: Tint > 0 (Magenta/Purple), Tint < 0 (Green)
-    # Standard: Tint slider usually goes Green (-) to Magenta (+)
-    
-    r_gain = 1.0
-    g_gain = 1.0
-    b_gain = 1.0
-    
-    # Temperature (strength factor 0.01 per unit)
-    t_val = temp * 0.005 # Sensitivity
-    r_gain += t_val
-    b_gain -= t_val
-    
-    # Tint
-    g_val = tint * 0.005
-    g_gain -= g_val # Tint + (Magenta) means Green decreases
-    
     if not img_linear.flags['C_CONTIGUOUS']:
         img_linear = np.ascontiguousarray(img_linear)
-        
-    apply_white_balance_inplace(img_linear, float(r_gain), float(g_gain), float(b_gain))
+
+    apply_matrix_inplace(img_linear, white_balance_matrix(temp, tint))
     return img_linear
 
 def apply_highlight_shadow(img_linear, highlight=0.0, shadow=0.0, colourspace=None):
@@ -264,7 +247,7 @@ def apply_highlight_shadow(img_linear, highlight=0.0, shadow=0.0, colourspace=No
     """
     import colour
     if colourspace is None:
-        colourspace = colour.RGB_COLOURSPACES['ProPhoto RGB']
+        colourspace = get_working_colourspace()
     luma_coeffs = get_luminance_coeffs(colourspace).astype(np.float32)
 
     # Normalize inputs to -1.0 to 1.0 roughly
@@ -277,32 +260,32 @@ def apply_highlight_shadow(img_linear, highlight=0.0, shadow=0.0, colourspace=No
     apply_highlight_shadow_inplace(img_linear, float(h_val), float(s_val), luma_coeffs)
     return img_linear
 
-# ----------------- 镜头校正 (保持逻辑，优化注释) -----------------
+# ----------------- 闀滃ご鏍℃ (淇濇寔閫昏緫锛屼紭鍖栨敞閲? -----------------
 
 def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Optional[str] = None, **kwargs) -> np.ndarray:
     """
-    镜头校正通常需要几何变换，很难完全 In-Place。
-    这是整个流程中少数几个必然会产生内存拷贝的地方。
+    闀滃ご鏍℃閫氬父闇€瑕佸嚑浣曞彉鎹紝寰堥毦瀹屽叏 In-Place銆?
+    杩欐槸鏁翠釜娴佺▼涓皯鏁板嚑涓繀鐒朵細浜х敓鍐呭瓨鎷疯礉鐨勫湴鏂广€?
     """
     # exif_data is now passed directly
     
-    # 简单的字典合并
+    # 绠€鍗曠殑瀛楀吀鍚堝苟
     params = {**exif_data, **kwargs}
     
-    # 必要的 key 检查
+    # 蹇呰鐨?key 妫€鏌?
     if not params.get('camera_model') or not params.get('lens_model'):
-        logger.warning("  ⚠️  [Lens] Missing camera model info, skipping.")
+        logger.warning("  鈿狅笍  [Lens] Missing camera model info, skipping.")
         return image
     
     if not params.get('focal_length') or not params.get('aperture'):
-        logger.warning("  ⚠️  [Lens] Missing optical info, skipping.")
+        logger.warning("  鈿狅笍  [Lens] Missing optical info, skipping.")
         return image
     
-    logger.info(f"  🧬 [Lens] {params.get('camera_maker')} {params.get('camera_model')} + {params.get('lens_model')}")
+    logger.info(f"  馃К [Lens] {params.get('camera_maker')} {params.get('camera_model')} + {params.get('lens_model')}")
     
     try:
-        # lensfun_wrapper 内部会调用 cv2.remap
-        # 这必然返回新图像
+        # lensfun_wrapper 鍐呴儴浼氳皟鐢?cv2.remap
+        # 杩欏繀鐒惰繑鍥炴柊鍥惧儚
         corrected = lf.apply_lens_correction(
             image=image,
             camera_maker=params.get('camera_maker'),
@@ -319,13 +302,13 @@ def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Op
             custom_db_path=custom_db_path,
         )
         
-        # 显式帮助 GC (虽然 Python 会自动处理，但在大内存压力下 explicit is better)
-        # 这里原来的 image 引用计数会减少，如果外面没有引用，旧内存会被释放
+        # 鏄惧紡甯姪 GC (铏界劧 Python 浼氳嚜鍔ㄥ鐞嗭紝浣嗗湪澶у唴瀛樺帇鍔涗笅 explicit is better)
+        # 杩欓噷鍘熸潵鐨?image 寮曠敤璁℃暟浼氬噺灏戯紝濡傛灉澶栭潰娌℃湁寮曠敤锛屾棫鍐呭瓨浼氳閲婃斁
         return corrected
         
     except Exception as e:
-        logger.error(f"  ❌ [Lens Error] {e}")
-        return image # 失败则返回原图
+        logger.error(f"  鉂?[Lens Error] {e}")
+        return image # 澶辫触鍒欒繑鍥炲師鍥?
 
 def extract_lens_exif(raw_path: str, raw=None) -> Tuple[dict, Optional[Dict[str, dict]]]:
     """
@@ -349,27 +332,27 @@ def compute_denoise_normalization_gain(img_linear: np.ndarray,
                                         max_gain: float = 64.0,
                                         target_gray: float = 0.18) -> float:
     """
-    根据图像实际亮度计算降噪归一化增益。
+    鏍规嵁鍥惧儚瀹為檯浜害璁＄畻闄嶅櫔褰掍竴鍖栧鐩娿€?
 
-    用于降噪前的亮度归一化：先将暗图提亮到标准水平（18% gray），
-    降噪后再除回，这样标准降噪器就能正常工作。
+    鐢ㄤ簬闄嶅櫔鍓嶇殑浜害褰掍竴鍖栵細鍏堝皢鏆楀浘鎻愪寒鍒版爣鍑嗘按骞筹紙18% gray锛夛紝
+    闄嶅櫔鍚庡啀闄ゅ洖锛岃繖鏍锋爣鍑嗛檷鍣櫒灏辫兘姝ｅ父宸ヤ綔銆?
 
-    直接基于图像内容计算，不依赖 EXIF（EXIF 无法提供场景亮度信息）。
-    使用几何平均亮度，与 metering.py 的 AverageMeteringStrategy 一致。
+    鐩存帴鍩轰簬鍥惧儚鍐呭璁＄畻锛屼笉渚濊禆 EXIF锛圗XIF 鏃犳硶鎻愪緵鍦烘櫙浜害淇℃伅锛夈€?
+    浣跨敤鍑犱綍骞冲潎浜害锛屼笌 metering.py 鐨?AverageMeteringStrategy 涓€鑷淬€?
 
     Args:
-        img_linear: 线性 ProPhoto RGB 图像，float32 [0, 1]
-        max_gain: 最大增益倍数（默认 64.0，即 +6 档）
-        target_gray: 目标灰度（默认 0.18，标准 18% gray）
+        img_linear: 绾挎€?ProPhoto RGB 鍥惧儚锛宖loat32 [0, 1]
+        max_gain: 鏈€澶у鐩婂€嶆暟锛堥粯璁?64.0锛屽嵆 +6 妗ｏ級
+        target_gray: 鐩爣鐏板害锛堥粯璁?0.18锛屾爣鍑?18% gray锛?
 
     Returns:
-        归一化增益（>= 1.0）。若图像已足够亮则返回 1.0。
+        褰掍竴鍖栧鐩婏紙>= 1.0锛夈€傝嫢鍥惧儚宸茶冻澶熶寒鍒欒繑鍥?1.0銆?
     """
     import math
 
     try:
         sample = get_subsampled_view(img_linear)
-        source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
+        source_cs = get_working_colourspace()
         coeffs = get_luminance_coeffs(source_cs)
         luminance = np.dot(sample, coeffs)
 
@@ -382,17 +365,17 @@ def compute_denoise_normalization_gain(img_linear: np.ndarray,
 
         gain = target_gray / avg_lum
 
-        # 仅提亮不压暗，且限幅
+        # 浠呮彁浜笉鍘嬫殫锛屼笖闄愬箙
         gain = max(1.0, min(gain, max_gain))
 
         if gain > 1.0:
             ev_stops = math.log2(gain)
-            logger.info(f"  📐 [Denoise Norm] avg_lum={avg_lum:.6f}, gain={gain:.2f}x (+{ev_stops:.1f} stops)")
+            logger.info(f"  馃搻 [Denoise Norm] avg_lum={avg_lum:.6f}, gain={gain:.2f}x (+{ev_stops:.1f} stops)")
 
         return gain
 
     except Exception as e:
-        logger.warning(f"  ⚠️ [Denoise Norm] Failed to compute gain: {e}")
+        logger.warning(f"  鈿狅笍 [Denoise Norm] Failed to compute gain: {e}")
         return 1.0
 
 
@@ -405,12 +388,12 @@ def get_version_info():
         version = "0.0.0"
     
     current_year = "2025"
-    license_info = f"Copyright © {current_year} MinQ.\nAGPL-V3 License."
+    license_info = f"Copyright 漏 {current_year} MinQ.\nAGPL-V3 License."
     return version, license_info
 
 def apply_geometry(img: np.ndarray, rotation: int = 0, flip_h: bool = False, flip_v: bool = False) -> np.ndarray:
     """
-    应用几何变换（旋转和翻转）
+    搴旂敤鍑犱綍鍙樻崲锛堟棆杞拰缈昏浆锛?
     rotation: degrees clockwise. If divisible by 90, uses fast numpy.rot90, 
               otherwise uses higher quality interpolation.
     """
@@ -490,7 +473,11 @@ def apply_perspective(img: np.ndarray, corners: Tuple[Tuple[float, float], ...] 
     # Default corners (no transformation)
     default_corners = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
     
-    if corners is None or corners == default_corners:
+    if corners is None:
+        return img
+
+    corners = tuple(tuple(point) for point in corners)
+    if corners == default_corners:
         return img
     
     # Validate corners

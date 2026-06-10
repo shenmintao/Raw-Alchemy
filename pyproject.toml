@@ -14,21 +14,19 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "rawpy @ git+https://github.com/shenmintao/rawpy.git",
+    "rawpy @ git+https://github.com/shenmintao/rawpy.git@f857909f2f308d827065691725df0ec5402210c4",
     "numpy",
     "requests",
     "tifffile",
     "click",
-    "colour-science @ git+https://github.com/colour-science/colour.git@develop",
+    "colour-science @ git+https://github.com/colour-science/colour.git@4ee3b72a2c6205c1d0cd964075621ec19290d571",
     "opencv-python-headless",
     "scipy",
     "Pillow",
     "pillow-heif",
-    "pyinstaller",
     "zstandard",
     "ordered-set",
     "taichi",
-    "matplotlib",
     "PyOpenGL",
     "PySide6-Fluent-Widgets",
     "Send2Trash",
@@ -36,10 +34,22 @@ dependencies = [
     "loguru",
     "pyexiv2",
     "psutil",
-    "rawspeedpy @ git+https://github.com/shenmintao/rawspeedpy.git",
+    "rawspeedpy @ git+https://github.com/shenmintao/rawspeedpy.git@b3eff714300da7092864a3c35179d31baf97f799",
     "onnxruntime-gpu; sys_platform != 'darwin'",
     "onnxruntime; sys_platform == 'darwin'",
 ]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller",
+]
+test = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
 
 [project.urls]
 "Homepage" = "https://github.com/shenmintao/raw-alchemy"

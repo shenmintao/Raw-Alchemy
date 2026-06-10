@@ -49,9 +49,9 @@ from raw_alchemy import config, orchestrator
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(['tif', 'heif', 'jpg'], case_sensitive=False),
+    type=click.Choice(['tif', 'heif', 'hdr-heif', 'jpg'], case_sensitive=False),
     default='tif',
-    help="Output file format. Default is 'tif'.",
+    help="Output file format. Use hdr-heif for BT.2020/PQ HEIF. Default is 'tif'.",
 )
 def main(input_path, output_path, log_space, lut_path, exposure, lens_correct, custom_lensfun_db_path, metering, jobs, output_format):
     """

@@ -62,6 +62,8 @@ class InspectorPanel(ScrollArea):
         self._update_display_mode_switch_text()
         
         display_mode_layout.addWidget(self.display_mode_switch)
+        self.scope_source_label = BodyLabel("Scopes: full")
+        display_mode_layout.addWidget(self.scope_source_label)
         
         self.add_section(tr('histogram_waveform'), display_mode_card)
         self.v_layout.addWidget(self.hist_widget)
@@ -296,7 +298,7 @@ class InspectorPanel(ScrollArea):
 
         self.denoise_switch = SwitchButton()
         self.denoise_switch.setChecked(False)
-        self.denoise_switch.setEnabled(False)
+        self.denoise_switch.setEnabled(self._denoise_available())
         self.denoise_switch.checkedChanged.connect(self._on_denoise_toggled)
         self._update_denoise_switch_text()
         denoise_layout.addWidget(self.denoise_switch)
@@ -546,6 +548,10 @@ class InspectorPanel(ScrollArea):
         else:
             self.hist_widget.update_data(img_uint8)
 
+    def update_scope_source(self, source_name):
+        source_name = "proxy" if source_name == "proxy" else "full"
+        self.scope_source_label.setText(f"Scopes: {source_name}")
+
     def shutdown_scope_workers(self):
         self.hist_widget.shutdown_worker()
         self.waveform_widget.shutdown_worker()
@@ -742,6 +748,15 @@ class InspectorPanel(ScrollArea):
         self._on_param_change()
         
         InfoBar.success(tr('reset_to_default'), tr('reset_to_default_message'), parent=self)
+
+    @staticmethod
+    def _denoise_available():
+        try:
+            from raw_alchemy.onnx.denoiser import is_available
+
+            return is_available()
+        except Exception:
+            return False
 
     def _revert_denoise(self):
         """Revert denoise toggle to baseline or default"""
