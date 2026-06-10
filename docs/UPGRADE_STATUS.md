@@ -8,13 +8,15 @@ GUI verification.
 ## Automated Verification
 
 - `python -m compileall src tests`
-- `python -m pytest tests\ -x -q -p no:cacheprovider`: 47 passed
+- `python -m pytest tests\ -x -q -p no:cacheprovider`: 48 passed
 - `uv run ruff check`: passed
 - `python -m raw_alchemy.cli --help`: passed
 - `python -m raw_alchemy.cli --help` includes `hdr-heif`: passed
 - CLI import smoke with `PySide6` blocked: passed
 - PySide boundary: imports are limited to `ui/`, `workers/`, and `main.py`
 - Taichi boundary: direct imports are limited to `backend.py` and `math_ops.py`
+- T1.3 GUI cached/full single-image export requests route through the
+  `ImageProcessor` worker queue: passed
 - GUI offscreen constructor smoke: passed
 - PyInstaller onedir build: passed
 - Packaged `RawAlchemy.exe` launch smoke: stayed alive for 12 seconds

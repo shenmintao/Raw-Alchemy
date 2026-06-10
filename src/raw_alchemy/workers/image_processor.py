@@ -152,7 +152,18 @@ class ImageProcessor(QThread):
             self.current_request_id += 1
             request_id = self.current_request_id
             self._full_refine_request = None
-            params = {'_export': True, 'export': export_params}
+            params = {'_export': True, 'export_kind': 'cache', 'export': export_params}
+            self._export_queue.append(ProcessRequest(path, params, request_id))
+        if not self.isRunning():
+            self.start()
+        return request_id
+
+    def export_path(self, path: str, export_params: dict):
+        with self.lock:
+            self.current_request_id += 1
+            request_id = self.current_request_id
+            self._full_refine_request = None
+            params = {'_export': True, 'export_kind': 'path', 'export': export_params}
             self._export_queue.append(ProcessRequest(path, params, request_id))
         if not self.isRunning():
             self.start()
@@ -546,10 +557,16 @@ class ImageProcessor(QThread):
 
     def _do_export(self, request: ProcessRequest):
         payload = request.params.get('export', {})
+        export_kind = request.params.get('export_kind', 'cache')
         try:
-            from raw_alchemy.core import export_from_cache
+            if export_kind == 'path':
+                from raw_alchemy import orchestrator
 
-            export_from_cache(**payload)
+                orchestrator.process_path(**payload)
+            else:
+                from raw_alchemy.core import export_from_cache
+
+                export_from_cache(**payload)
             self.export_finished.emit(True, "")
         except Exception as e:
             logger.error(f"[Worker] Export failed: {e}")

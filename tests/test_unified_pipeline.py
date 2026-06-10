@@ -388,3 +388,47 @@ def test_image_processor_cached_export_request_uses_worker_handler(monkeypatch):
     assert emitted == [(True, "")]
     expected = ExportExecutor().run(build_op_list(_base_params()), source.copy())
     np.testing.assert_allclose(captured["img"], expected, rtol=1e-6, atol=1e-6)
+
+
+def test_image_processor_full_export_request_uses_worker_handler(monkeypatch):
+    from raw_alchemy import orchestrator
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    payload = {
+        "input_path": "synthetic.raw",
+        "output_path": "out.tif",
+        "log_space": "None",
+        "lut_path": None,
+        "exposure": 0.0,
+        "lens_correct": False,
+        "custom_db_path": None,
+        "metering_mode": "matrix",
+        "jobs": 1,
+        "logger_func": lambda _msg: None,
+        "output_format": "tif",
+    }
+    captured = {}
+    processor = ImageProcessor()
+    emitted = []
+    processor.export_finished.connect(lambda success, msg: emitted.append((success, msg)))
+    monkeypatch.setattr(processor, "isRunning", lambda: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "process_path",
+        lambda **kwargs: captured.setdefault("payload", kwargs.copy()),
+    )
+
+    request_id = processor.export_path("synthetic.raw", payload)
+
+    with processor.lock:
+        request = processor._export_queue.pop(0)
+
+    assert request.request_id == request_id
+    assert request.params["_export"] is True
+    assert request.params["export_kind"] == "path"
+
+    processor._do_export(request)
+
+    assert emitted == [(True, "")]
+    assert captured["payload"]["input_path"] == "synthetic.raw"
+    assert captured["payload"]["output_path"] == "out.tif"

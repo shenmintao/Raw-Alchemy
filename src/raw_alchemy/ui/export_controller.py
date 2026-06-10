@@ -1,6 +1,5 @@
 import os
 
-from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QFileDialog
 from qfluentwidgets import (
     BodyLabel,
@@ -11,7 +10,6 @@ from qfluentwidgets import (
     SubtitleLabel,
 )
 
-from raw_alchemy import orchestrator
 from raw_alchemy.exporting import resolve_export_exposure
 from raw_alchemy.i18n import tr
 
@@ -208,6 +206,15 @@ class ExportControllerMixin:
             else:
                 InfoBar.error(tr("export_failed"), msg, parent=self)
 
+        previous_handler = getattr(self, "_processor_export_finished_handler", None)
+        if previous_handler is not None:
+            try:
+                self.processor.export_finished.disconnect(previous_handler)
+            except (TypeError, RuntimeError):
+                pass
+        self._processor_export_finished_handler = on_finish
+        self.processor.export_finished.connect(on_finish)
+
         if cached_img is not None:
             export_payload = {
                 "cached_img": cached_img,
@@ -232,53 +239,33 @@ class ExportControllerMixin:
                 "sharpen_strength": p.get("sharpen_strength", 0.0),
                 "hdr_output": hdr_output,
             }
-
-            previous_handler = getattr(self, "_processor_export_finished_handler", None)
-            if previous_handler is not None:
-                try:
-                    self.processor.export_finished.disconnect(previous_handler)
-                except (TypeError, RuntimeError):
-                    pass
-            self._processor_export_finished_handler = on_finish
-            self.processor.export_finished.connect(on_finish)
             self.processor.export_from_cache(input_path, export_payload)
             return
 
-        class ExportThread(QThread):
-            finished_sig = Signal(bool, str)
-
-            def run(self):
-                try:
-                    orchestrator.process_path(
-                        input_path=input_path,
-                        output_path=output_path,
-                        log_space=p.get("log_space"),
-                        lut_path=p.get("lut_path"),
-                        exposure=_full_path_exposure,
-                        lens_correct=p.get("lens_correct", True),
-                        custom_db_path=p.get("custom_db_path"),
-                        metering_mode=p.get("metering_mode", "matrix"),
-                        jobs=1,
-                        logger_func=lambda msg: None,
-                        output_format="hdr-heif" if hdr_output else ext,
-                        wb_temp=p.get("wb_temp", 0.0),
-                        wb_tint=p.get("wb_tint", 0.0),
-                        saturation=p.get("saturation", 1.0),
-                        contrast=p.get("contrast", 1.0),
-                        highlight=p.get("highlight", 0.0),
-                        shadow=p.get("shadow", 0.0),
-                        rotation=p.get("rotation", 0),
-                        flip_horizontal=p.get("flip_horizontal", False),
-                        flip_vertical=p.get("flip_vertical", False),
-                        perspective_corners=_perspective_corners,
-                        crop=p.get("crop", (0.0, 0.0, 1.0, 1.0)),
-                        denoise_enabled=p.get("denoise_enabled", False),
-                        sharpen_strength=p.get("sharpen_strength", 0.0),
-                    )
-                    self.finished_sig.emit(True, "")
-                except Exception as e:
-                    self.finished_sig.emit(False, str(e))
-
-        self.export_thread = ExportThread()
-        self.export_thread.finished_sig.connect(on_finish)
-        self.export_thread.start()
+        export_payload = {
+            "input_path": input_path,
+            "output_path": output_path,
+            "log_space": p.get("log_space"),
+            "lut_path": p.get("lut_path"),
+            "exposure": _full_path_exposure,
+            "lens_correct": p.get("lens_correct", True),
+            "custom_db_path": p.get("custom_db_path"),
+            "metering_mode": p.get("metering_mode", "matrix"),
+            "jobs": 1,
+            "logger_func": lambda msg: None,
+            "output_format": "hdr-heif" if hdr_output else ext,
+            "wb_temp": p.get("wb_temp", 0.0),
+            "wb_tint": p.get("wb_tint", 0.0),
+            "saturation": p.get("saturation", 1.0),
+            "contrast": p.get("contrast", 1.0),
+            "highlight": p.get("highlight", 0.0),
+            "shadow": p.get("shadow", 0.0),
+            "rotation": p.get("rotation", 0),
+            "flip_horizontal": p.get("flip_horizontal", False),
+            "flip_vertical": p.get("flip_vertical", False),
+            "perspective_corners": _perspective_corners,
+            "crop": p.get("crop", (0.0, 0.0, 1.0, 1.0)),
+            "denoise_enabled": p.get("denoise_enabled", False),
+            "sharpen_strength": p.get("sharpen_strength", 0.0),
+        }
+        self.processor.export_path(input_path, export_payload)
