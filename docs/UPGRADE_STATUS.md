@@ -1,13 +1,9 @@
-# Upgrade Status for `feat/phase0-upgrade-plan`
+# Upgrade Status for `studio-v0.6.0-pre2`
 
-This branch is the active validation line for `UPGRADE_PLAN.md`, not final
+This prerelease is the active validation build for `UPGRADE_PLAN.md`, not final
 acceptance for the whole plan. The main implementation work is present, but
 several acceptance items still require target hardware or manual GUI
 verification.
-
-`studio-v0.6.0-pre2` was published from commit `5a06821`. Later commits on this
-branch include additional CLI/HDR fixes and require a new package before EXE
-acceptance.
 
 ## Automated Verification
 
@@ -52,11 +48,11 @@ acceptance.
 ## Release Asset
 
 - Manual Windows package: `RawAlchemy-0.6.0-pre2-windows-x64.zip`
-- Built from tag `studio-v0.6.0-pre2` at commit `5a06821`.
-- Does not include post-pre2 commits on this branch.
+- Built from tag `studio-v0.6.0-pre2`; includes runtime fixes through commit
+  `b28ea9f`.
 - Automated release workflow also publishes platform artifacts from the tag.
 - The manual archive contains `RawAlchemy.exe` plus the `_internal` runtime directory.
-- SHA256: `547D82252819F490B6BBBFB4C5521303CCF5E3253174D998432D1A6CEB95F65D`
+- SHA256: `EEE868D66609976C8E3CDC8DE9C788AA417B47CDC00355A6BE21A22C8A8AC9E5`
 
 ## HDR Scope
 
