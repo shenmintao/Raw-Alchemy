@@ -34,6 +34,8 @@ Checked in the current Windows development environment:
 - `Pillow 12.2.0`: available for ordinary JPEG writing.
 - `pyexiv2 2.15.5`: available for EXIF/XMP metadata writes.
 - `ultrahdr`: not installed.
+- `pip index versions ultrahdr` and `pip index versions libultrahdr` both
+  returned no matching Python distributions in the current environment.
 
 `pillow-heif` does not provide a gain-map JPEG encoder. Pillow can write JPEG
 pixels but does not assemble the MPF auxiliary image and gain-map metadata
@@ -65,4 +67,3 @@ References:
 
 - Android Ultra HDR image format: https://developer.android.com/media/platform/hdr-image-format
 - Google libultrahdr: https://github.com/google/libultrahdr
-

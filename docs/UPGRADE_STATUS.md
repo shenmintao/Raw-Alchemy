@@ -25,6 +25,8 @@ GUI verification.
   gallery selection, per-image params, and marked state: passed
 - T3.1 proxy/full timing on real `DSC03687.ARW` (9568x6376): proxy result
   775 ms, full compute estimate 6051 ms, ratio 0.128 (< 0.25)
+- T6.1 real RAW `hdr-heif` smoke with `DSCF0023.RAF`: readback is 10-bit
+  BT.2020/PQ HEIF (`nclx` primaries 9, transfer 16, matrix 9)
 - T6.2 real CANS RAW V2 denoise smoke with Bayer `_DSC7822.ARW`: passed
 - T6.2 real CANS RAW V2 denoise smoke with X-Trans `DSCF0023.RAF`: passed
 - GUI offscreen constructor smoke: passed
@@ -48,5 +50,5 @@ GUI verification.
 
 - T1.2/T5.3: full real GUI workflow is not manually accepted yet: image switching, sliders, crop, perspective, single export, and batch export.
 - T3.1: slider-drag smoothness still needs manual GUI acceptance.
-- T6.1: PQ HEIF is implemented and unit-tested, but HDR recognition in Windows Photos/Chrome is not manually verified.
+- T6.1: PQ HEIF local metadata readback passed, but HDR recognition in Windows Photos/Chrome is not manually verified.
 - T6.1: ISO 21496-1 gain-map JPEG output is researched but not implemented.

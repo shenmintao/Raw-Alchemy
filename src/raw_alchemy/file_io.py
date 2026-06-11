@@ -137,7 +137,7 @@ def _save_hdr_heif_pq(img: np.ndarray, output_path: str, logger: Logger):
         bit_depth=10,
         save_nclx_profile=True,
         color_primaries=9,
-        transfer_characteristic=16,
+        transfer_characteristics=16,
         matrix_coefficients=9,
         full_range_flag=1,
         chroma="420",

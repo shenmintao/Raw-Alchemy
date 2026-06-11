@@ -27,5 +27,11 @@ def test_save_hdr_heif_writes_readable_10_bit_pq_file():
         heif = pillow_heif.open_heif(output, convert_hdr_to_8bit=False)
         assert heif.size == (8, 8)
         assert heif.mode == "RGB;16"
+        assert heif.info["bit_depth"] == 10
+        assert heif.info["chroma"] == 420
+        assert heif.info["nclx_profile"]["color_primaries"] == 9
+        assert heif.info["nclx_profile"]["transfer_characteristics"] == 16
+        assert heif.info["nclx_profile"]["matrix_coefficients"] == 9
+        assert heif.info["nclx_profile"]["full_range_flag"] == 1
     finally:
         output.unlink(missing_ok=True)
