@@ -1,17 +1,23 @@
-# Upgrade Status for `studio-v0.6.0-pre2`
+# Upgrade Status for `feat/phase0-upgrade-plan`
 
-This prerelease is a validation build for `UPGRADE_PLAN.md`, not final
+This branch is the active validation line for `UPGRADE_PLAN.md`, not final
 acceptance for the whole plan. The main implementation work is present, but
-several acceptance items still require real samples, target hardware, or manual
-GUI verification.
+several acceptance items still require target hardware or manual GUI
+verification.
+
+`studio-v0.6.0-pre2` was published from commit `5a06821`. Later commits on this
+branch include additional CLI/HDR fixes and require a new package before EXE
+acceptance.
 
 ## Automated Verification
 
 - `python -m compileall src tests`
-- `python -m pytest tests\ -x -q -p no:cacheprovider`: 57 passed
+- `python -m pytest tests\ -x -q -p no:cacheprovider`: 61 passed
 - `uv run ruff check`: passed
 - `python -m raw_alchemy.cli --help`: passed
 - `python -m raw_alchemy.cli --help` includes `hdr-heif`: passed
+- CLI supports optional `--log-space None`, `--no-lens-correct`,
+  legacy `--lens-correct false`, and `--format dng`: passed
 - CLI import smoke with `PySide6` blocked: passed
 - PySide boundary: imports are limited to `ui/`, `workers/`, and `main.py`
 - Taichi boundary: direct imports are limited to `backend.py` and `math_ops.py`
@@ -34,6 +40,9 @@ GUI verification.
   and cancels stale full-refine requests during slider-style bursts: passed
 - T6.1 real RAW `hdr-heif` smoke with `DSCF0023.RAF`: readback is 10-bit
   BT.2020/PQ HEIF (`nclx` primaries 9, transfer 16, matrix 9)
+- T6.1 `hdr_output` ignores Log/LUT ops and always routes to `pq_out`: passed
+- T6.1 real RAW CLI `hdr-heif` smoke without `--log-space`: `DSCF0023.RAF`
+  to 10-bit BT.2020/PQ HEIF, passed
 - T6.2 real CANS RAW V2 denoise smoke with Bayer `_DSC7822.ARW`: passed
 - T6.2 real CANS RAW V2 denoise smoke with X-Trans `DSCF0023.RAF`: passed
 - GUI offscreen constructor smoke: passed
@@ -43,6 +52,8 @@ GUI verification.
 ## Release Asset
 
 - Manual Windows package: `RawAlchemy-0.6.0-pre2-windows-x64.zip`
+- Built from tag `studio-v0.6.0-pre2` at commit `5a06821`.
+- Does not include post-pre2 commits on this branch.
 - Automated release workflow also publishes platform artifacts from the tag.
 - The manual archive contains `RawAlchemy.exe` plus the `_internal` runtime directory.
 - SHA256: `547D82252819F490B6BBBFB4C5521303CCF5E3253174D998432D1A6CEB95F65D`

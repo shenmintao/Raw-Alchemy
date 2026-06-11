@@ -94,8 +94,9 @@ def build_op_list(params: ProcessorParams) -> list[Op]:
     if saturation != 1.0 or contrast != 1.0:
         ops.append(Op("sat_contrast", (saturation, contrast, working_space)))
 
+    hdr_output = bool(params.get("hdr_output", False))
     log_space = params.get("log_space")
-    if log_space and log_space != "None":
+    if not hdr_output and log_space and log_space != "None":
         ops.append(
             Op(
                 "log_transform",
@@ -109,25 +110,24 @@ def build_op_list(params: ProcessorParams) -> list[Op]:
         )
 
     lut_path = params.get("lut_path")
-    if lut_path:
+    if not hdr_output and lut_path:
         ops.append(Op("lut", (str(lut_path),)))
 
-    if not log_space or log_space == "None":
-        if params.get("hdr_output", False):
-            ops.append(
-                Op(
-                    "pq_out",
-                    (
-                        working_space,
-                        config.HDR_OUTPUT_COLOURSPACE,
-                        config.HDR_PQ_TRANSFER_FUNCTION,
-                        config.HDR_PEAK_NITS,
-                        config.HDR_PQ_MASTERING_NITS,
-                    ),
-                )
+    if hdr_output:
+        ops.append(
+            Op(
+                "pq_out",
+                (
+                    working_space,
+                    config.HDR_OUTPUT_COLOURSPACE,
+                    config.HDR_PQ_TRANSFER_FUNCTION,
+                    config.HDR_PEAK_NITS,
+                    config.HDR_PQ_MASTERING_NITS,
+                ),
             )
-        else:
-            ops.append(Op("srgb_out", (working_space,)))
+        )
+    elif not log_space or log_space == "None":
+        ops.append(Op("srgb_out", (working_space,)))
 
     sharpen_strength = _float_param(params, "sharpen_strength", 0.0)
     if sharpen_strength > 0.0:

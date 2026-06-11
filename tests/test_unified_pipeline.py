@@ -98,6 +98,23 @@ def test_build_op_list_uses_pq_output_for_hdr_export():
     )
 
 
+def test_build_op_list_hdr_export_ignores_log_and_lut_for_pq_output():
+    ops = build_op_list(
+        _case(
+            {
+                "hdr_output": True,
+                "log_space": "F-Log",
+                "lut_path": str(IDENTITY_CUBE),
+            }
+        )
+    )
+
+    op_names = [op.name for op in ops]
+    assert "log_transform" not in op_names
+    assert "lut" not in op_names
+    assert op_names[-1] == "pq_out"
+
+
 def test_export_executor_white_balance_op_uses_cat_matrix():
     src = np.array(
         [

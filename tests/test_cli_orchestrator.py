@@ -55,6 +55,91 @@ def test_cli_single_file_forwards_entrypoint_options(monkeypatch):
     assert captured["output_format"] == "hdr-heif"
 
 
+def test_cli_supports_dng_format_and_no_lens_correct_flag(monkeypatch):
+    from raw_alchemy import cli
+
+    scratch = _scratch_dir("dng-no-lens")
+    input_path = scratch / "image.dng"
+    output_path = scratch / "out.dng"
+    input_path.write_bytes(b"raw")
+    captured = {}
+
+    monkeypatch.setattr(cli.orchestrator, "process_path", lambda **kwargs: captured.update(kwargs))
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            str(input_path),
+            str(output_path),
+            "--log-space",
+            "F-Log",
+            "--format",
+            "dng",
+            "--no-lens-correct",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["output_format"] == "dng"
+    assert captured["lens_correct"] is False
+
+
+def test_cli_hdr_heif_can_omit_log_space(monkeypatch):
+    from raw_alchemy import cli
+
+    scratch = _scratch_dir("hdr-no-log")
+    input_path = scratch / "image.dng"
+    output_path = scratch / "out.hdr.heif"
+    input_path.write_bytes(b"raw")
+    captured = {}
+
+    monkeypatch.setattr(cli.orchestrator, "process_path", lambda **kwargs: captured.update(kwargs))
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            str(input_path),
+            str(output_path),
+            "--format",
+            "hdr-heif",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["log_space"] == "None"
+    assert captured["output_format"] == "hdr-heif"
+
+
+def test_cli_legacy_lens_correct_boolean_remains_supported(monkeypatch):
+    from raw_alchemy import cli
+
+    scratch = _scratch_dir("legacy-lens-bool")
+    input_path = scratch / "image.dng"
+    output_path = scratch / "out.jpg"
+    input_path.write_bytes(b"raw")
+    captured = {}
+
+    monkeypatch.setattr(cli.orchestrator, "process_path", lambda **kwargs: captured.update(kwargs))
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            str(input_path),
+            str(output_path),
+            "--log-space",
+            "F-Log",
+            "--format",
+            "jpg",
+            "--lens-correct",
+            "false",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["output_format"] == "jpg"
+    assert captured["lens_correct"] is False
+
+
 def test_cli_safe_echo_falls_back_for_legacy_console(monkeypatch):
     from raw_alchemy import cli
 
