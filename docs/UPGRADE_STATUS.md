@@ -8,7 +8,7 @@ GUI verification.
 ## Automated Verification
 
 - `python -m compileall src tests`
-- `python -m pytest tests\ -x -q -p no:cacheprovider`: 56 passed
+- `python -m pytest tests\ -x -q -p no:cacheprovider`: 57 passed
 - `uv run ruff check`: passed
 - `python -m raw_alchemy.cli --help`: passed
 - `python -m raw_alchemy.cli --help` includes `hdr-heif`: passed
@@ -30,6 +30,8 @@ GUI verification.
   gallery selection, per-image params, and marked state: passed
 - T3.1 proxy/full timing on real `DSC03687.ARW` (9568x6376): proxy result
   775 ms, full compute estimate 6051 ms, ratio 0.128 (< 0.25)
+- T3.1 high-frequency preview update scheduling keeps latest-wins semantics
+  and cancels stale full-refine requests during slider-style bursts: passed
 - T6.1 real RAW `hdr-heif` smoke with `DSCF0023.RAF`: readback is 10-bit
   BT.2020/PQ HEIF (`nclx` primaries 9, transfer 16, matrix 9)
 - T6.2 real CANS RAW V2 denoise smoke with Bayer `_DSC7822.ARW`: passed

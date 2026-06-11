@@ -296,6 +296,45 @@ def test_image_processor_proxy_preview_schedules_full_refinement(monkeypatch):
     assert emitted[-1][4] == (proxy.shape[1], proxy.shape[0])
 
 
+def test_image_processor_high_frequency_preview_updates_are_latest_wins(monkeypatch):
+    from raw_alchemy.pipeline.request import ProcessRequest
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    processor = ImageProcessor()
+    monkeypatch.setattr(processor, "isRunning", lambda: True)
+
+    processor._full_refine_request = ProcessRequest(
+        "synthetic.raw",
+        {"_force_full_preview": True, "exposure": 0.0},
+        1,
+    )
+
+    for idx in range(40):
+        request_id = processor.update_preview(
+            "synthetic.raw",
+            _case(
+                {
+                    "viewport_size": (1600, 1000),
+                    "preview_zoom": 1.0,
+                    "exposure": idx / 10.0,
+                    "saturation": 1.0 + idx / 100.0,
+                }
+            ),
+        )
+
+    with processor.lock:
+        pending = processor.pending_request
+        stale_refine = processor._full_refine_request
+
+    assert request_id == 40
+    assert stale_refine is None
+    assert pending is not None
+    assert pending.request_id == 40
+    assert pending.path == "synthetic.raw"
+    assert pending.params["exposure"] == 3.9
+    assert np.isclose(pending.params["saturation"], 1.39)
+
+
 def test_image_processor_denoise_toggle_has_no_residual_state(monkeypatch):
     from raw_alchemy.pipeline.cache_manager import CachedImage
     from raw_alchemy.pipeline.request import ProcessRequest
