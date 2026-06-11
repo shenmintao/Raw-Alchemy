@@ -168,7 +168,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico',
+    icon='icon.icns' if sys.platform == 'darwin' else 'icon.ico',
 )
 
 coll = COLLECT(
@@ -180,3 +180,11 @@ coll = COLLECT(
     upx_exclude=[],
     name='RawAlchemy',
 )
+
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='RawAlchemy.app',
+        icon='icon.icns',
+        bundle_identifier='com.rawalchemy.studio',
+    )

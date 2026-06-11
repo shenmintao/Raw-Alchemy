@@ -19,6 +19,9 @@ from raw_alchemy.i18n import tr
 from raw_alchemy.ui.widgets.histogram import HistogramWidget
 from raw_alchemy.ui.widgets.waveform import WaveformWidget
 
+DENOISE_UI_ENABLED = False
+
+
 class InspectorPanel(ScrollArea):
     """Right side control panel"""
     param_changed = Signal(dict)
@@ -435,7 +438,9 @@ class InspectorPanel(ScrollArea):
         
         # Denoise
         if 'denoise_enabled' in params:
-            self.denoise_switch.setChecked(params['denoise_enabled'])
+            self.denoise_switch.setChecked(
+                bool(params['denoise_enabled']) and self._denoise_available()
+            )
             self._update_denoise_switch_text()
         
         # Sharpen
@@ -690,7 +695,7 @@ class InspectorPanel(ScrollArea):
             params[key] = slider.value() / scale
         
         # Add denoise toggle
-        params['denoise_enabled'] = self.denoise_switch.isChecked()
+        params['denoise_enabled'] = self.denoise_switch.isEnabled() and self.denoise_switch.isChecked()
         
         # Add sharpen strength
         params['sharpen_strength'] = self.sharpen_slider.value() / 100.0
@@ -751,6 +756,8 @@ class InspectorPanel(ScrollArea):
 
     @staticmethod
     def _denoise_available():
+        if not DENOISE_UI_ENABLED:
+            return False
         try:
             from raw_alchemy.onnx.denoiser import is_available
 
@@ -761,7 +768,9 @@ class InspectorPanel(ScrollArea):
     def _revert_denoise(self):
         """Revert denoise toggle to baseline or default"""
         if self.saved_baseline_params and 'denoise_enabled' in self.saved_baseline_params:
-            self.denoise_switch.setChecked(self.saved_baseline_params['denoise_enabled'])
+            self.denoise_switch.setChecked(
+                bool(self.saved_baseline_params['denoise_enabled']) and self._denoise_available()
+            )
         else:
             self.denoise_switch.setChecked(False)
         self._update_denoise_switch_text()
@@ -769,6 +778,10 @@ class InspectorPanel(ScrollArea):
 
     def _on_denoise_toggled(self):
         """Handle denoise switch toggle"""
+        if not self._denoise_available() and self.denoise_switch.isChecked():
+            self.denoise_switch.blockSignals(True)
+            self.denoise_switch.setChecked(False)
+            self.denoise_switch.blockSignals(False)
         self._update_denoise_switch_text()
         self._on_param_change()
 

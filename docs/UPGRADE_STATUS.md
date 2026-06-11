@@ -8,7 +8,7 @@ verification.
 ## Automated Verification
 
 - `python -m compileall src tests`
-- `python -m pytest tests\ -x -q -p no:cacheprovider`: 61 passed
+- `python -m pytest tests\ -x -q -p no:cacheprovider`: 62 passed
 - `uv run ruff check`: passed
 - `python -m raw_alchemy.cli --help`: passed
 - `python -m raw_alchemy.cli --help` includes `hdr-heif`: passed
@@ -41,18 +41,27 @@ verification.
   to 10-bit BT.2020/PQ HEIF, passed
 - T6.2 real CANS RAW V2 denoise smoke with Bayer `_DSC7822.ARW`: passed
 - T6.2 real CANS RAW V2 denoise smoke with X-Trans `DSCF0023.RAF`: passed
+- CANS / AI demosaic-denoise remains disabled in the GUI even if a sidecar
+  requests it: passed
 - GUI offscreen constructor smoke: passed
 - PyInstaller onedir build: passed
 - Packaged `RawAlchemy.exe` launch smoke: stayed alive for 12 seconds
 
 ## Release Assets
 
-- Built by GitHub Actions from tag `studio-v0.6.0-pre2`; includes runtime fixes through commit
-  `b28ea9f`.
+- Built by GitHub Actions from tag `studio-v0.6.0-pre2`; includes runtime fixes
+  through the current pre2 tag commit.
 - Published assets:
-  - `RawAlchemyStudio-studio-v0.6.0-pre2-windows.exe`
-  - `RawAlchemyStudio-studio-v0.6.0-pre2-linux`
+  - `RawAlchemyStudio-studio-v0.6.0-pre2-windows-x64-portable.zip`
+  - `RawAlchemyStudio-studio-v0.6.0-pre2-linux-x64-portable.tar.gz`
   - `RawAlchemyStudio-studio-v0.6.0-pre2-macos.dmg`
+- Windows, Linux, and macOS builds use PyInstaller onedir packaging to avoid
+  onefile self-extraction during startup. The Windows artifact is a portable
+  zip, Linux is a portable tarball, and macOS remains a DMG containing
+  `RawAlchemy.app`.
+- macOS Gatekeeper note for unsigned builds: after dragging the app to
+  `/Applications`, run
+  `xattr -dr com.apple.quarantine /Applications/RawAlchemy.app` if needed.
 
 ## HDR Scope
 

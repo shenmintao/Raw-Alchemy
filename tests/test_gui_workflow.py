@@ -99,6 +99,16 @@ def _scratch_dir(name):
     return root
 
 
+def _ensure_qapp(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
 class _FakeRightPanel:
     def __init__(self, params):
         self.params = params.copy()
@@ -406,3 +416,20 @@ def test_gui_crop_and_perspective_modes_reset_preview_then_persist_params():
     assert window.right_panel.set_updates[-1]["perspective_corners"] == corners
     assert window.scheduled_sidecar_writes == 2
     assert window.triggered == 2
+
+
+def test_inspector_panel_keeps_cans_denoise_ui_disabled(monkeypatch):
+    _ensure_qapp(monkeypatch)
+
+    from raw_alchemy.ui.widgets import inspector_panel
+
+    assert inspector_panel.DENOISE_UI_ENABLED is False
+    panel = inspector_panel.InspectorPanel()
+    try:
+        assert panel.denoise_switch.isEnabled() is False
+        panel.set_params({"denoise_enabled": True})
+        assert panel.denoise_switch.isChecked() is False
+        assert panel.get_params()["denoise_enabled"] is False
+    finally:
+        panel.shutdown_scope_workers()
+        panel.deleteLater()
