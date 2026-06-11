@@ -8,7 +8,7 @@ GUI verification.
 ## Automated Verification
 
 - `python -m compileall src tests`
-- `python -m pytest tests\ -x -q -p no:cacheprovider`: 53 passed
+- `python -m pytest tests\ -x -q -p no:cacheprovider`: 56 passed
 - `uv run ruff check`: passed
 - `python -m raw_alchemy.cli --help`: passed
 - `python -m raw_alchemy.cli --help` includes `hdr-heif`: passed
@@ -21,6 +21,11 @@ GUI verification.
   to JPG, passed
 - T1.3 GUI cached/full single-image export requests route through the
   `ImageProcessor` worker queue: passed
+- T1.2/T5.3 GUI controller workflow smoke covers cached/full single export,
+  batch export with per-image params and LUT override, plus crop/perspective
+  parameter persistence: passed
+- Real RAW CLI format smoke from `C:\Users\shenmintao\Downloads\Photo`: DNG,
+  CR3, RW2, and X3F to JPG, passed
 - T2.1 sidecar restart restore is covered by UI glue tests for folder scan,
   gallery selection, per-image params, and marked state: passed
 - T3.1 proxy/full timing on real `DSC03687.ARW` (9568x6376): proxy result
@@ -48,7 +53,7 @@ GUI verification.
 
 ## Incomplete Or Unproven Acceptance Items
 
-- T1.2/T5.3: full real GUI workflow is not manually accepted yet: image switching, sliders, crop, perspective, single export, and batch export.
+- T1.2/T5.3: GUI controller flow is automated, but live real GUI interaction and visual inspection are not manually accepted yet: image switching, sliders, crop, perspective, single export, and batch export through the running app.
 - T3.1: slider-drag smoothness still needs manual GUI acceptance.
 - T6.1: PQ HEIF local metadata readback passed, but HDR recognition in Windows Photos/Chrome is not manually verified.
 - T6.1: ISO 21496-1 gain-map JPEG output is researched but not implemented.
