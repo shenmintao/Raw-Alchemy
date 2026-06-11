@@ -23,6 +23,8 @@ GUI verification.
   `ImageProcessor` worker queue: passed
 - T2.1 sidecar restart restore is covered by UI glue tests for folder scan,
   gallery selection, per-image params, and marked state: passed
+- T6.2 real CANS RAW V2 denoise smoke with Bayer `_DSC7822.ARW`: passed
+- T6.2 real CANS RAW V2 denoise smoke with X-Trans `DSCF0023.RAF`: passed
 - GUI offscreen constructor smoke: passed
 - PyInstaller onedir build: passed
 - Packaged `RawAlchemy.exe` launch smoke: stayed alive for 12 seconds
@@ -46,4 +48,3 @@ GUI verification.
 - T3.1: 45MP proxy/full preview timing and the `< 1/4` proxy-path target are not measured on target hardware.
 - T6.1: PQ HEIF is implemented and unit-tested, but HDR recognition in Windows Photos/Chrome is not manually verified.
 - T6.1: ISO 21496-1 gain-map JPEG output is researched but not implemented.
-- T6.2: denoise toggle regression is covered synthetically, but real Bayer and X-Trans model/sample runs are not proven.
