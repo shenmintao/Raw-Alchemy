@@ -31,6 +31,16 @@ class ImageState:
         self.source_size = source_size
         self.display = None  # Invalidate cached display
 
+    def update_data(self, float_data: Optional[np.ndarray] = None,
+                    uint8_data: Optional[np.ndarray] = None,
+                    source_size: Optional[tuple[int, int]] = None):
+        """Update array-backed state without creating a QPixmap."""
+        self.full = None
+        self.display = None
+        self.float_data = float_data
+        self.uint8_data = uint8_data
+        self.source_size = source_size
+
     def get_display(self, size: QSize) -> Optional[QPixmap]:
         """Get display-sized version, caching the result"""
         if not self.full:

@@ -37,6 +37,7 @@ from raw_alchemy.math_ops import (
     float_to_uint8_gpu,
     resize_float_to_uint8_gpu,
     fused_expose_adjust_grade,
+    downsample_gpu,
 )
 from raw_alchemy.pipeline.request import ProcessRequest, ProcessorParams
 from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
@@ -84,11 +85,13 @@ class ImageProcessor(QThread):
         # ===== GPU Buffers (3 total — immutable source + temp + output) =====
         self.gpu_corrected = GpuImage()    # Lens-corrected, uploaded once
         self.gpu_cropped = GpuImage()      # After geo+crop (immutable ProPhoto Linear source)
-        self.gpu_graded = GpuImage()       # Output: always rebuilt from gpu_cropped
+        self.gpu_preview_source = GpuImage()  # Viewport-sized linear source for interactive grading
+        self.gpu_graded = GpuImage()       # Output: always rebuilt from a clean linear source
 
         # ===== Cache Keys =====
         self.cached_lens_key = None
         self.last_geo_crop_key = None   # Combined geometry+perspective+crop
+        self.last_preview_source_key = None
         self.last_grading_key = None    # Combined exposure+adjust+grading
 
         # Metering Cache
@@ -150,6 +153,11 @@ class ImageProcessor(QThread):
         if not self.isRunning():
             self.start()
         return request_id
+
+    def _has_newer_pending_request(self, request: ProcessRequest) -> bool:
+        with self.lock:
+            pending = self.pending_request
+            return pending is not None and pending.request_id > request.request_id
 
     def run(self):
         # Initialize Taichi on this thread so CUDA context is valid here (once only)
@@ -433,6 +441,8 @@ class ImageProcessor(QThread):
                 # Cache hit with lens correction: only invalidate downstream
                 self.last_geo_crop_key = None
                 self.gpu_cropped.clear()
+                self.last_preview_source_key = None
+                self.gpu_preview_source.clear()
                 self.last_grading_key = None
                 self.cached_graded_clean = None
                 self.gpu_graded.clear()
@@ -452,6 +462,8 @@ class ImageProcessor(QThread):
         self.gpu_corrected.clear()
         self.last_geo_crop_key = None
         self.gpu_cropped.clear()
+        self.last_preview_source_key = None
+        self.gpu_preview_source.clear()
         self.last_grading_key = None
         self.cached_graded_clean = None
         self.gpu_graded.clear()
@@ -466,6 +478,7 @@ class ImageProcessor(QThread):
         try:
             self.gpu_corrected.clear()
             self.gpu_cropped.clear()
+            self.gpu_preview_source.clear()
             self.gpu_graded.clear()
             self._gpu_uint8 = None
             logger.debug("[Worker] GPU buffers released.")
@@ -513,6 +526,7 @@ class ImageProcessor(QThread):
             params.get('viewport_size'),
             round(float(params.get('preview_zoom', 1.0) or 1.0), 3),
             round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2),
+            int(params.get('max_preview_pixels', 12_000_000) or 0),
         )
 
     @staticmethod
@@ -538,7 +552,8 @@ class ImageProcessor(QThread):
         target_w = max(1, int(round(src_w * target_scale)))
         target_h = max(1, int(round(src_h * target_scale)))
 
-        max_preview_pixels = int(params.get('max_preview_pixels', 12_000_000) or 12_000_000)
+        raw_max_preview_pixels = params.get('max_preview_pixels', 12_000_000)
+        max_preview_pixels = 12_000_000 if raw_max_preview_pixels is None else int(raw_max_preview_pixels)
         if max_preview_pixels > 0 and target_w * target_h > max_preview_pixels:
             scale = (max_preview_pixels / float(target_w * target_h)) ** 0.5
             target_w = max(1, int(target_w * scale))
@@ -555,6 +570,8 @@ class ImageProcessor(QThread):
             if self.cpu_linear is None or self.current_path != request.path:
                 self._do_load(ProcessRequest(request.path, {'_load': True}, request.request_id))
                 if self.cpu_linear is None:
+                    return
+                if self._has_newer_pending_request(request):
                     return
 
             params = request.params
@@ -662,6 +679,8 @@ class ImageProcessor(QThread):
                 # Invalidate downstream caches
                 self.last_geo_crop_key = None
                 self.gpu_cropped.clear()
+                self.last_preview_source_key = None
+                self.gpu_preview_source.clear()
                 self.last_grading_key = None
 
                 # Update CPU cache
@@ -713,7 +732,48 @@ class ImageProcessor(QThread):
 
                 # GPU-resident: no CPU download needed
                 self.last_geo_crop_key = geo_crop_key
+                self.last_preview_source_key = None
                 self.last_grading_key = None
+
+            if self._has_newer_pending_request(request):
+                return
+
+            # Build/reuse a viewport-sized linear source before color grading.
+            # Slider changes should not run exposure/color/LUT kernels over the
+            # full RAW resolution when only a screen-sized preview is needed.
+            full_source_h, full_source_w = self.gpu_cropped.height, self.gpu_cropped.width
+            preview_target_w, preview_target_h = self._make_preview_target_size(
+                full_source_w, full_source_h, params)
+            preview_source_key = (
+                self.last_geo_crop_key,
+                preview_target_w,
+                preview_target_h,
+            )
+
+            if preview_target_w == full_source_w and preview_target_h == full_source_h:
+                grading_source = self.gpu_cropped
+                self.last_preview_source_key = preview_source_key
+                if self.gpu_preview_source.valid:
+                    self.gpu_preview_source.clear()
+            else:
+                if (preview_source_key != self.last_preview_source_key
+                        or not self.gpu_preview_source.valid):
+                    logger.debug(
+                        "[Worker] Downsampling preview source: "
+                        f"{full_source_w}x{full_source_h} -> "
+                        f"{preview_target_w}x{preview_target_h}"
+                    )
+                    self.gpu_preview_source._allocate(preview_target_h, preview_target_w, 3)
+                    downsample_gpu(
+                        self.gpu_cropped.arr,
+                        self.gpu_preview_source.arr,
+                        full_source_h,
+                        full_source_w,
+                        preview_target_h,
+                        preview_target_w,
+                    )
+                    self.last_preview_source_key = preview_source_key
+                grading_source = self.gpu_preview_source
 
             # --- Stage 5: Auto Exposure ---
             current_metering_key = (
@@ -748,8 +808,8 @@ class ImageProcessor(QThread):
             self.last_applied_ev = applied_ev
 
             # --- Stage 6-8: Exposure + Adjustments + Grading ---
-            # Always start from gpu_cropped (immutable ProPhoto Linear source).
-            # Every parameter change re-processes from this clean source.
+            # Always start from a clean ProPhoto Linear source. For interactive
+            # preview, that source is already downsampled to the viewport target.
             log_space = params.get('log_space')
             lut_path = params.get('lut_path')
             wb_temp = params.get('wb_temp', 0.0)
@@ -760,7 +820,7 @@ class ImageProcessor(QThread):
             con = params.get('contrast', 1.0)
 
             grading_key = (
-                self.last_geo_crop_key,
+                preview_source_key,
                 final_exposure_gain,
                 wb_temp, wb_tint,
                 highlight, shadow,
@@ -782,10 +842,10 @@ class ImageProcessor(QThread):
                     g_val = wb_tint * 0.005
 
                     self.gpu_graded._allocate(
-                        self.gpu_cropped.height, self.gpu_cropped.width, 3)
+                        grading_source.height, grading_source.width, 3)
 
                     fused_expose_adjust_grade(
-                        self.gpu_cropped.arr, self.gpu_graded.arr,
+                        grading_source.arr, self.gpu_graded.arr,
                         gain=float(final_exposure_gain),
                         wb_r=float(1.0 + t_val),
                         wb_g=float(1.0 - g_val),
@@ -801,8 +861,8 @@ class ImageProcessor(QThread):
                     )
 
                 else:
-                    # Non-fused: copy from gpu_cropped, apply each step in-place
-                    self.gpu_graded.copy_from(self.gpu_cropped)
+                    # Non-fused: copy from grading_source, apply each step in-place
+                    self.gpu_graded.copy_from(grading_source)
                     arr = self.gpu_graded.arr
 
                     # Exposure
@@ -900,6 +960,9 @@ class ImageProcessor(QThread):
 
         try:
 
+            if self._has_newer_pending_request(request):
+                return
+
             # --- Stage 10: Sharpening (Taichi RL, GPU) ---
             sharpen_strength = params.get('sharpen_strength', 0.0)
             sharpen_key = (grading_key, sharpen_strength)
@@ -928,7 +991,7 @@ class ImageProcessor(QThread):
             # GPU float32 -> uint8 on GPU, optionally resized to preview target.
             t_out = time.perf_counter()
             source_h, source_w = self.gpu_graded.height, self.gpu_graded.width
-            target_w, target_h = self._make_preview_target_size(source_w, source_h, params)
+            target_w, target_h = source_w, source_h
 
             # Pre-allocate GPU uint8 buffer (avoids Taichi's implicit upload of numpy dst)
             if self._gpu_uint8 is None or self._gpu_uint8.shape != (target_h, target_w, 3):
@@ -942,7 +1005,7 @@ class ImageProcessor(QThread):
 
             # Single GPU→CPU download of uint8 preview.
             img_uint8 = self._gpu_uint8.to_numpy()
-            output_source_size = (source_w, source_h)
+            output_source_size = (full_source_w, full_source_h)
 
             t_end = time.perf_counter()
             logger.info(
