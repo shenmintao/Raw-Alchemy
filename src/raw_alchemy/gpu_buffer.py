@@ -39,6 +39,12 @@ class GpuImage:
                 and self._channels == channels):
             return
 
+        if self._arr is not None:
+            try:
+                ti.sync()
+            except Exception:
+                pass
+
         self._arr = ti.ndarray(dtype=ti.f32, shape=(height, width, channels))
         self._height = height
         self._width = width
@@ -100,6 +106,7 @@ class GpuImage:
         """Release GPU memory immediately."""
         if self._arr is not None:
             try:
+                ti.sync()
                 del self._arr
             except Exception:
                 pass

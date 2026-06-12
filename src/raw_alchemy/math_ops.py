@@ -1690,6 +1690,22 @@ def apply_crop_gpu(src_buf, dst_buf, crop_rect):
     _crop_kernel(src_buf.arr, dst_buf.arr, cx, cy)
 
 
+def apply_crop_pixels_gpu(src_buf, dst_buf, x: int, y: int, width: int, height: int):
+    """GPU crop using integer source pixel coordinates."""
+    if width <= 0 or height <= 0:
+        dst_buf.copy_from(src_buf)
+        return
+
+    src_h, src_w = src_buf.height, src_buf.width
+    cx = max(0, min(int(x), src_w - 1))
+    cy = max(0, min(int(y), src_h - 1))
+    cw = max(1, min(int(width), src_w - cx))
+    ch = max(1, min(int(height), src_h - cy))
+
+    dst_buf._allocate(ch, cw, 3)
+    _crop_kernel(src_buf.arr, dst_buf.arr, cx, cy)
+
+
 # =========================================================
 # GPU Log Encoding
 # =========================================================

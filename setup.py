@@ -24,6 +24,20 @@ class CustomBuildPy(build_py):
         self.download_and_extract_lensfun()
         super().run()
 
+    def lensfun_vendor_complete(self, vendor_dir, system):
+        """Return True when the vendored Lensfun runtime and database exist."""
+        if system == "windows":
+            runtime = vendor_dir / "lib" / "lensfun.dll"
+        elif system == "linux":
+            runtime = vendor_dir / "lib" / "liblensfun.so"
+        elif system == "darwin":
+            runtime = vendor_dir / "lib" / "liblensfun.dylib"
+        else:
+            return False
+
+        db_dir = vendor_dir / "share" / "lensfun" / "version_2"
+        return runtime.exists() and db_dir.is_dir() and any(db_dir.glob("*.xml"))
+
     def get_download_url(self, asset_name):
         """Gets the download URL for a given asset from the latest GitHub release."""
         api_url = "https://api.github.com/repos/shenmintao/lensfun/releases/latest"
@@ -51,6 +65,11 @@ class CustomBuildPy(build_py):
         vendor_dir.mkdir(parents=True, exist_ok=True)
 
         system = platform.system().lower()
+        force_download = os.environ.get("RAW_ALCHEMY_FORCE_LENSFUN_DOWNLOAD") == "1"
+        if not force_download and self.lensfun_vendor_complete(vendor_dir, system):
+            print(f"Using existing vendored Lensfun for {system}.")
+            return
+
         if system == "windows":
             asset_name = "lensfun-windows.zip"
         elif system == "linux":

@@ -44,6 +44,10 @@ class ProcessorParams(TypedDict, total=False):
     preview_zoom: float
     device_pixel_ratio: float
     max_preview_pixels: int
+    tile_preview_pixels: int
+    tile_preview_threshold: int
+    tile_overlap_pixels: int
+    _detail_preview: bool
     perspective_corners: Optional[list]
 
 @dataclass

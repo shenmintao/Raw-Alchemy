@@ -130,10 +130,6 @@ class MainWindow(FluentWindow):
         # Denoise progress dialog
         self.denoise_progress_dialog = None
         
-        # Baseline processor
-        self.baseline_processor = ImageProcessor()
-        self.baseline_processor.result_ready.connect(self.on_baseline_result)
-        
         # Processing Debounce
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
@@ -141,10 +137,17 @@ class MainWindow(FluentWindow):
         self.update_timer.timeout.connect(self.trigger_processing)
         self._preview_interaction_active = False
         self._interactive_preview_max_pixels = 4_000_000
+        self._detail_preview_max_pixels = 0
         self._needs_detail_after_preview = False
         self._interactive_dirty = False
         self._pending_preview_request_id = None
         self._pending_detail_request_id = None
+        self._pending_preview_content_key = None
+        self._pending_detail_content_key = None
+        self._last_preview_content_key = None
+        self._last_detail_content_key = None
+        self._last_preview_request_time = 0.0
+        self._interactive_preview_min_interval_ms = 140
 
         self._preload_neighbors_args = None
         self._preload_neighbors_timer = QTimer()
@@ -154,8 +157,12 @@ class MainWindow(FluentWindow):
 
         self._zoom_update_timer = QTimer()
         self._zoom_update_timer.setSingleShot(True)
-        self._zoom_update_timer.setInterval(220)
+        self._zoom_update_timer.setInterval(650)
         self._zoom_update_timer.timeout.connect(lambda: self.trigger_processing(detail=True))
+
+        self._interactive_update_timer = QTimer()
+        self._interactive_update_timer.setSingleShot(True)
+        self._interactive_update_timer.timeout.connect(self._run_interactive_preview_update)
 
         self._detail_update_timer = QTimer()
         self._detail_update_timer.setSingleShot(True)
@@ -1080,12 +1087,16 @@ class MainWindow(FluentWindow):
         current_row = self.gallery_list.row(item)
         self._preload_neighbors(current_row)
 
-        if path in self.file_baseline_params_cache:
-            QTimer.singleShot(25, self.regenerate_baseline_for_current_image)
-
     def load_image(self, path):
         self.preview_lbl.setText(tr('loading'))
         self.viewport.clear_image()
+        self._pending_preview_request_id = None
+        self._pending_detail_request_id = None
+        self._pending_preview_content_key = None
+        self._pending_detail_content_key = None
+        self._last_preview_content_key = None
+        self._last_detail_content_key = None
+        self._interactive_update_timer.stop()
         self.current_request_id = self.processor.load_image(path)
 
     def _preload_neighbors(self, current_index, count=2):
@@ -1112,10 +1123,7 @@ class MainWindow(FluentWindow):
         if self._preview_interaction_active:
             self.update_timer.stop()
             self._detail_update_timer.stop()
-            if self._pending_preview_request_id is None:
-                self.trigger_processing()
-            else:
-                self._interactive_dirty = True
+            self._schedule_interactive_preview_update()
         else:
             self._needs_detail_after_preview = True
             self._detail_update_timer.stop()
@@ -1127,11 +1135,13 @@ class MainWindow(FluentWindow):
         self._interactive_dirty = False
         self.update_timer.stop()
         self._detail_update_timer.stop()
+        self._interactive_update_timer.stop()
 
     def on_param_interaction_finished(self, params):
         self._preview_interaction_active = False
         self._interactive_dirty = False
         self._needs_detail_after_preview = True
+        self._interactive_update_timer.stop()
         self.update_timer.start()
         self._detail_update_timer.stop()
 
@@ -1140,6 +1150,8 @@ class MainWindow(FluentWindow):
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
             return
+        if self._detail_display_is_current():
+            return
         self._zoom_update_timer.start()
 
     def _on_viewport_resized(self, w, h):
@@ -1147,6 +1159,8 @@ class MainWindow(FluentWindow):
         if not self.current_raw_path:
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
+            return
+        if self._detail_display_is_current():
             return
         self._zoom_update_timer.start()
 
@@ -1164,55 +1178,131 @@ class MainWindow(FluentWindow):
         return params
 
     def _get_preview_params(self, detail=False):
-        max_pixels = 0 if detail else self._interactive_preview_max_pixels
-        return self._add_preview_output_params(
+        max_pixels = self._detail_preview_max_pixels if detail else self._interactive_preview_max_pixels
+        params = self._add_preview_output_params(
             self.right_panel.get_params(),
             max_preview_pixels=max_pixels,
         )
+        params['_detail_preview'] = bool(detail)
+        return params
+
+    @staticmethod
+    def _freeze_param_value(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, MainWindow._freeze_param_value(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(MainWindow._freeze_param_value(v) for v in value)
+        return value
+
+    def _detail_content_key(self, params):
+        ignored = {
+            'viewport_size',
+            'preview_zoom',
+            'device_pixel_ratio',
+            'max_preview_pixels',
+            'tile_preview_pixels',
+            'tile_preview_threshold',
+            'tile_overlap_pixels',
+            '_detail_preview',
+        }
+        return (
+            self.current_raw_path,
+            tuple(sorted(
+                (k, self._freeze_param_value(v))
+                for k, v in params.items()
+                if k not in ignored
+            )),
+        )
+
+    def _preview_content_key(self, params):
+        return (
+            self.current_raw_path,
+            tuple(sorted(
+                (k, self._freeze_param_value(v))
+                for k, v in params.items()
+            )),
+        )
+
+    def _detail_display_is_current(self):
+        if not self.viewport.display_is_full_resolution():
+            return False
+        params = self._get_preview_params(detail=True)
+        return self._last_detail_content_key == self._detail_content_key(params)
+
+    def _schedule_interactive_preview_update(self):
+        self._interactive_dirty = True
+        if self._pending_preview_request_id is not None:
+            return
+
+        elapsed_ms = (time.perf_counter() - self._last_preview_request_time) * 1000.0
+        delay_ms = max(0, int(self._interactive_preview_min_interval_ms - elapsed_ms))
+        if delay_ms <= 0:
+            self._run_interactive_preview_update()
+        elif not self._interactive_update_timer.isActive():
+            self._interactive_update_timer.start(delay_ms)
+
+    def _run_interactive_preview_update(self):
+        if not self.current_raw_path or not self._preview_interaction_active:
+            return
+        if self._pending_preview_request_id is not None:
+            self._interactive_dirty = True
+            return
+        self._interactive_dirty = False
+        self.trigger_processing(detail=False)
     
     def trigger_processing(self, detail=False):
         if not self.current_raw_path: return
         if detail and self._preview_interaction_active:
             return
         params = self._get_preview_params(detail=detail)
+        detail_key = self._detail_content_key(params)
+        if detail:
+            if (self._pending_preview_request_id is not None
+                    or self.update_timer.isActive()
+                    or self._interactive_update_timer.isActive()
+                    or self._interactive_dirty):
+                self._needs_detail_after_preview = True
+                self._detail_update_timer.start()
+                return
+            if (self._pending_detail_request_id is not None
+                    and self._pending_detail_content_key == detail_key):
+                return
+            if self._last_detail_content_key == detail_key and self.viewport.display_is_full_resolution():
+                return
+        else:
+            preview_key = self._preview_content_key(params)
+            if (self._pending_preview_request_id is not None
+                    and self._pending_preview_content_key == preview_key):
+                return
+            if self._last_preview_content_key == preview_key:
+                return
+            if self._last_detail_content_key != detail_key:
+                self._last_detail_content_key = None
+            self._pending_detail_request_id = None
+            self._pending_detail_content_key = None
+
         request_id = self.processor.update_preview(self.current_raw_path, params)
         self.current_request_id = request_id
         if detail:
             self._pending_detail_request_id = request_id
+            self._pending_detail_content_key = detail_key
             self._needs_detail_after_preview = False
         else:
             self._pending_preview_request_id = request_id
+            self._pending_preview_content_key = preview_key
+            self._last_preview_request_time = time.perf_counter()
     
     def save_baseline_image(self):
         if not self.current_raw_path: return
         current_params = self.right_panel.get_params()
         self.file_baseline_params_cache[self.current_raw_path] = current_params.copy()
 
-        if self.processor.cpu_linear is not None:
-            # Share CPU cache so baseline processor can load from it
-            self.baseline_processor.cache_manager = self.processor.cache_manager
-            self.baseline_processor.update_preview(
-                self.current_raw_path,
-                self._add_preview_output_params(current_params),
+        if self.current.uint8_data is not None:
+            self.baseline.update_data(
+                None,
+                self.current.uint8_data.copy(),
+                source_size=self.current.source_size,
             )
-
-        InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
-    
-        
-    def on_baseline_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
-        if image_path != self.current_raw_path: return
-        self.baseline.update_data(None, img_uint8, source_size=source_size)
-    
-    def regenerate_baseline_for_current_image(self):
-        if not self.current_raw_path or self.current_raw_path not in self.file_baseline_params_cache: return
-        if not self.processor.cpu_linear is not None: return
-
-        baseline_params = self.file_baseline_params_cache[self.current_raw_path]
-        self.baseline_processor.cache_manager = self.processor.cache_manager
-        self.baseline_processor.update_preview(
-            self.current_raw_path,
-            self._add_preview_output_params(baseline_params),
-        )
 
     def on_process_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
         """Handle processing result"""
@@ -1240,7 +1330,13 @@ class MainWindow(FluentWindow):
 
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
 
+        is_detail_result = request_id == self._pending_detail_request_id
+        accepted_preview_key = self._pending_preview_content_key if request_id == self._pending_preview_request_id else None
+        accepted_detail_key = self._pending_detail_content_key if is_detail_result else None
+        previous_scope_data = self.current.scope_uint8_data
         self.current.update_data(None, img_uint8, source_size=source_size)
+        if is_detail_result and previous_scope_data is not None:
+            self.current.scope_uint8_data = previous_scope_data
         if self.current_raw_path:
              self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
 
@@ -1264,18 +1360,24 @@ class MainWindow(FluentWindow):
 
         if request_id == self._pending_preview_request_id:
             self._pending_preview_request_id = None
+            self._pending_preview_content_key = None
+            self._last_preview_content_key = accepted_preview_key
             if self._interactive_dirty and self._preview_interaction_active:
-                self._interactive_dirty = False
-                self.trigger_processing()
+                self._schedule_interactive_preview_update()
             elif self._needs_detail_after_preview and not self._preview_interaction_active:
                 self._detail_update_timer.start()
         elif request_id == self._pending_detail_request_id:
             self._pending_detail_request_id = None
+            self._pending_detail_content_key = None
+            self._last_detail_content_key = accepted_detail_key
             self._update_current_gallery_thumbnail_from_preview(img_uint8)
 
-        # Defer visible scope update to the next event loop iteration.
-        img_for_hist = img_uint8
-        QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+        # Defer visible scope update to the next event loop iteration. Detail
+        # refreshes are driven by viewport zoom/resize and must not change scopes.
+        if not is_detail_result:
+            img_for_hist = img_uint8
+            self.current.scope_uint8_data = img_for_hist
+            QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
 
     def _update_histogram_async(self, img_uint8):
         """Deferred scope update — runs after viewport display."""
@@ -1633,6 +1735,8 @@ class MainWindow(FluentWindow):
             self._preload_neighbors_timer.stop()
         if hasattr(self, '_zoom_update_timer'):
             self._zoom_update_timer.stop()
+        if hasattr(self, '_interactive_update_timer'):
+            self._interactive_update_timer.stop()
         if hasattr(self, '_detail_update_timer'):
             self._detail_update_timer.stop()
         if self.thumb_worker and self.thumb_worker.isRunning():
@@ -1642,6 +1746,4 @@ class MainWindow(FluentWindow):
         if hasattr(self, 'right_panel'):
             self.right_panel.shutdown_scope_workers()
         self.processor.stop_and_cleanup()
-        if hasattr(self, 'baseline_processor'):
-            self.baseline_processor.stop_and_cleanup()
         super().closeEvent(event)

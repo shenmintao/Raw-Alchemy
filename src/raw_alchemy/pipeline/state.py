@@ -19,6 +19,7 @@ class ImageState:
         self.display: Optional[QPixmap] = None
         self.float_data: Optional[np.ndarray] = None  # For histogram
         self.uint8_data: Optional[np.ndarray] = None   # For GL viewport
+        self.scope_uint8_data: Optional[np.ndarray] = None
         self.source_size: Optional[tuple[int, int]] = None
 
     def update_full(self, pixmap: QPixmap, float_data: Optional[np.ndarray] = None,
@@ -28,6 +29,7 @@ class ImageState:
         self.full = pixmap
         self.float_data = float_data
         self.uint8_data = uint8_data
+        self.scope_uint8_data = uint8_data
         self.source_size = source_size
         self.display = None  # Invalidate cached display
 
@@ -39,6 +41,7 @@ class ImageState:
         self.display = None
         self.float_data = float_data
         self.uint8_data = uint8_data
+        self.scope_uint8_data = uint8_data
         self.source_size = source_size
 
     def get_display(self, size: QSize) -> Optional[QPixmap]:
@@ -60,4 +63,5 @@ class ImageState:
         self.display = None
         self.float_data = None
         self.uint8_data = None
+        self.scope_uint8_data = None
         self.source_size = None

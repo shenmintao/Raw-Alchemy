@@ -544,8 +544,9 @@ class InspectorPanel(ScrollArea):
         self._update_display_mode_switch_text()
         main_window = self.window()
         current = getattr(main_window, 'current', None)
-        if current is not None and current.uint8_data is not None:
-            self.update_scope_data(current.uint8_data)
+        scope_data = getattr(current, 'scope_uint8_data', None) if current is not None else None
+        if scope_data is not None:
+            self.update_scope_data(scope_data)
 
     def update_scope_data(self, img_uint8):
         """Update only the visible scope."""

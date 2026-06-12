@@ -33,6 +33,7 @@ from raw_alchemy.math_ops import (
     max_inplace,
     apply_geometry_gpu,
     apply_crop_gpu,
+    apply_crop_pixels_gpu,
     log_encode_gpu,
     float_to_uint8_gpu,
     resize_float_to_uint8_gpu,
@@ -72,6 +73,7 @@ class ImageProcessor(QThread):
 
         # Request management
         self.pending_request: Optional[ProcessRequest] = None
+        self.active_request: Optional[ProcessRequest] = None
         self.current_request_id = 0
         self._preload_queue: list = []
 
@@ -88,6 +90,8 @@ class ImageProcessor(QThread):
         self.gpu_cropped = GpuImage()      # After geo+crop (immutable ProPhoto Linear source)
         self.gpu_preview_source = GpuImage()  # Viewport-sized linear source for interactive grading
         self.gpu_graded = GpuImage()       # Output: always rebuilt from a clean linear source
+        self.gpu_tile_source = GpuImage()   # Full-detail tiled preview source
+        self.gpu_tile_graded = GpuImage()   # Full-detail tiled preview output
 
         # ===== Cache Keys =====
         self.cached_lens_key = None
@@ -125,6 +129,7 @@ class ImageProcessor(QThread):
 
         self._should_stop = False
         self._gpu_uint8 = None      # Pre-allocated GPU uint8 buffer (ti.ndarray)
+        self._gpu_tile_uint8 = None
 
     def stop_and_cleanup(self):
         """Signal the worker to stop and wait for GPU cleanup."""
@@ -152,8 +157,35 @@ class ImageProcessor(QThread):
         if not self.isRunning():
             self.start()
 
+    @staticmethod
+    def _freeze_param_value(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, ImageProcessor._freeze_param_value(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(ImageProcessor._freeze_param_value(v) for v in value)
+        if isinstance(value, np.ndarray):
+            return tuple(value.reshape(-1).tolist())
+        return value
+
+    @staticmethod
+    def _dedupe_params(params: ProcessorParams):
+        return tuple(sorted(
+            (k, ImageProcessor._freeze_param_value(v))
+            for k, v in params.items()
+            if k not in ('_load', '_preload')
+        ))
+
     def update_preview(self, path: str, params: ProcessorParams):
         with self.lock:
+            incoming_params = self._dedupe_params(params)
+            if self.pending_request is not None:
+                pending_params = self._dedupe_params(self.pending_request.params)
+                if self.pending_request.path == path and pending_params == incoming_params:
+                    return self.pending_request.request_id
+            if self.active_request is not None:
+                active_params = self._dedupe_params(self.active_request.params)
+                if self.active_request.path == path and active_params == incoming_params:
+                    return self.active_request.request_id
             self.current_request_id += 1
             request_id = self.current_request_id
             self.pending_request = ProcessRequest(path, params, request_id)
@@ -198,6 +230,8 @@ class ImageProcessor(QThread):
                 continue
 
             try:
+                with self.lock:
+                    self.active_request = request
                 if '_preload' in request.params:
                     with self.lock:
                         has_user_request = self.pending_request is not None
@@ -212,6 +246,10 @@ class ImageProcessor(QThread):
                 import traceback
                 traceback.print_exc()
                 self.error_occurred.emit(str(e))
+            finally:
+                with self.lock:
+                    if self.active_request is request:
+                        self.active_request = None
 
         # Release GPU buffers on shutdown while CUDA context is still valid
         self._release_gpu_buffers()
@@ -240,7 +278,7 @@ class ImageProcessor(QThread):
         from raw_alchemy.exif import extract_lens_exif
         from raw_alchemy.onnx.denoiser import _apply_flip
         from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
-        from rawspeedpy import try_decode, XTRANS_PATTERN
+        from raw_alchemy.rawspeed import try_decode, XTRANS_PATTERN
 
         # Try RawSpeed first (faster decode for supported formats)
         rs = try_decode(path)
@@ -382,7 +420,9 @@ class ImageProcessor(QThread):
                             map_y = coords[:, :, ch, 1]
                             corrected[:, :, ch] = cv2.remap(
                                 vignette_img[:, :, ch], map_x, map_y,
-                                cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                                cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=0.0)
                         corrected[oob_mask] = 0
                         new_cache_item.corrected_data = corrected
                         new_cache_item.lens_key = (True, None, False)
@@ -464,7 +504,14 @@ class ImageProcessor(QThread):
                 self._graded_clean_pending = False
                 self._gpu_graded_is_sharpened = False
                 self.gpu_graded.clear()
+                self.gpu_tile_source.clear()
+                self.gpu_tile_graded.clear()
+                try:
+                    ti.sync()
+                except Exception:
+                    pass
                 self._gpu_uint8 = None
+                self._gpu_tile_uint8 = None
                 self.last_metering_key = None
                 self.cached_auto_ev = 0.0
             else:
@@ -487,7 +534,14 @@ class ImageProcessor(QThread):
         self._graded_clean_pending = False
         self._gpu_graded_is_sharpened = False
         self.gpu_graded.clear()
+        self.gpu_tile_source.clear()
+        self.gpu_tile_graded.clear()
+        try:
+            ti.sync()
+        except Exception:
+            pass
         self._gpu_uint8 = None
+        self._gpu_tile_uint8 = None
         self.cached_auto_ev = 0.0
         # Force immediate GPU memory release
         gc.collect()
@@ -500,7 +554,14 @@ class ImageProcessor(QThread):
             self.gpu_cropped.clear()
             self.gpu_preview_source.clear()
             self.gpu_graded.clear()
+            self.gpu_tile_source.clear()
+            self.gpu_tile_graded.clear()
+            try:
+                ti.sync()
+            except Exception:
+                pass
             self._gpu_uint8 = None
+            self._gpu_tile_uint8 = None
             logger.debug("[Worker] GPU buffers released.")
         except Exception as e:
             logger.debug(f"[Worker] GPU buffer release error (non-critical): {e}")
@@ -533,6 +594,10 @@ class ImageProcessor(QThread):
             12_000_000 if raw_max_preview_pixels is None
             else int(raw_max_preview_pixels)
         )
+        full_detail = bool(params.get('_detail_preview', False)) and max_preview_pixels <= 0
+        viewport_key = None if full_detail else params.get('viewport_size')
+        zoom_key = 1.0 if full_detail else round(float(params.get('preview_zoom', 1.0) or 1.0), 3)
+        dpr_key = 1.0 if full_detail else round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2)
         return (
             params.get('denoise_enabled', False),
             params.get('lens_correct'), params.get('custom_db_path'),
@@ -548,9 +613,9 @@ class ImageProcessor(QThread):
             params.get('saturation', 1.0), params.get('contrast', 1.0),
             params.get('log_space'), params.get('lut_path'),
             params.get('sharpen_strength', 0.0),
-            params.get('viewport_size'),
-            round(float(params.get('preview_zoom', 1.0) or 1.0), 3),
-            round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2),
+            viewport_key,
+            zoom_key,
+            dpr_key,
             max_preview_pixels,
         )
 
@@ -585,6 +650,219 @@ class ImageProcessor(QThread):
             target_h = max(1, int(target_h * scale))
 
         return target_w, target_h
+
+    def _cache_output_result(self, path: str, img_uint8: np.ndarray, output_key,
+                             applied_ev: float, output_source_size):
+        cached_item = self.cache_manager.get(path)
+        if not cached_item:
+            return
+
+        old_size = cached_item.size_mb
+        cached_item.output_uint8 = img_uint8.copy()
+        cached_item.output_key = output_key
+        cached_item.output_ev = applied_ev
+        cached_item.output_source_size = output_source_size
+        cached_item.update_size()
+        with self.cache_manager.lock:
+            self.cache_manager.current_memory_mb += cached_item.size_mb - old_size
+
+    def _grade_source_to(self, source_buf: GpuImage, dst_buf: GpuImage,
+                         final_exposure_gain: float, params: ProcessorParams):
+        """Apply exposure, color, log/LUT and output transform to a GPU source."""
+        log_space = params.get('log_space')
+        lut_path = params.get('lut_path')
+        wb_temp = params.get('wb_temp', 0.0)
+        wb_tint = params.get('wb_tint', 0.0)
+        highlight = params.get('highlight', 0.0)
+        shadow = params.get('shadow', 0.0)
+        sat = params.get('saturation', 1.0)
+        con = params.get('contrast', 1.0)
+
+        use_fused = (not log_space or log_space == 'None') and not lut_path
+
+        if use_fused:
+            source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
+            luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
+            M_srgb = colour.matrix_RGB_to_RGB(
+                source_cs, colour.RGB_COLOURSPACES['sRGB'])
+
+            t_val = wb_temp * 0.005
+            g_val = wb_tint * 0.005
+
+            dst_buf._allocate(source_buf.height, source_buf.width, 3)
+
+            fused_expose_adjust_grade(
+                source_buf.arr, dst_buf.arr,
+                gain=float(final_exposure_gain),
+                wb_r=float(1.0 + t_val),
+                wb_g=float(1.0 - g_val),
+                wb_b=float(1.0 - t_val),
+                highlight=float(highlight / 100.0),
+                shadow=float(shadow / 100.0),
+                saturation=float(sat),
+                contrast=float(con),
+                pivot=0.18,
+                luma_coeffs=luma,
+                matrix=M_srgb,
+                apply_srgb=True,
+            )
+            return
+
+        dst_buf.copy_from(source_buf)
+        arr = dst_buf.arr
+
+        apply_gain_inplace(arr, float(final_exposure_gain))
+
+        if wb_temp != 0.0 or wb_tint != 0.0:
+            t_val = wb_temp * 0.005
+            g_val = wb_tint * 0.005
+            apply_white_balance_inplace(arr,
+                                        float(1.0 + t_val),
+                                        float(1.0 - g_val),
+                                        float(1.0 - t_val))
+
+        source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
+        luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
+
+        if highlight != 0.0 or shadow != 0.0:
+            apply_highlight_shadow_inplace(arr,
+                                           float(highlight / 100.0),
+                                           float(shadow / 100.0),
+                                           luma)
+
+        apply_saturation_contrast_inplace(arr,
+                                          float(sat), float(con), 0.18,
+                                          luma)
+
+        if log_space and log_space != 'None':
+            log_color_space = config.LOG_TO_WORKING_SPACE.get(log_space)
+            log_curve = config.LOG_ENCODING_MAP.get(log_space, log_space)
+
+            if log_color_space:
+                M = colour.matrix_RGB_to_RGB(
+                    colour.RGB_COLOURSPACES['ProPhoto RGB'],
+                    colour.RGB_COLOURSPACES[log_color_space])
+                apply_matrix_inplace(arr, M)
+                max_inplace(arr, 1e-6)
+                if not log_encode_gpu(arr, log_curve):
+                    graded_np = dst_buf.to_numpy()
+                    graded_np = colour.cctf_encoding(graded_np, function=log_curve).astype(np.float32)
+                    dst_buf.upload(graded_np)
+                    arr = dst_buf.arr
+
+        if lut_path and os.path.exists(lut_path):
+            try:
+                if lut_path != self.cached_lut_path:
+                    logger.info(f"[Worker] Loading LUT: {os.path.basename(lut_path)}")
+                    lut = utils.load_lut_cached(lut_path)
+                    self.cached_lut_is_3d = isinstance(lut, colour.LUT3D)
+                    if self.cached_lut_is_3d:
+                        lut_table = np.ascontiguousarray(lut.table.astype(np.float32))
+                        self.cached_lut_table = lut_table
+                        self.cached_lut_domain_min = np.ascontiguousarray(lut.domain[0].astype(np.float64))
+                        self.cached_lut_domain_max = np.ascontiguousarray(lut.domain[1].astype(np.float64))
+                    else:
+                        self.cached_lut_table = lut
+                    self.cached_lut_path = lut_path
+
+                if self.cached_lut_is_3d:
+                    apply_lut_inplace(arr,
+                                      self.cached_lut_table,
+                                      self.cached_lut_domain_min,
+                                      self.cached_lut_domain_max)
+                else:
+                    graded_np = dst_buf.to_numpy()
+                    graded_np = self.cached_lut_table.apply(graded_np).astype(np.float32)
+                    dst_buf.upload(graded_np)
+                    arr = dst_buf.arr
+            except Exception as e:
+                logger.error(f"[Worker] LUT error: {e}")
+                self.cached_lut_path = None
+
+        if not log_space or log_space == 'None':
+            M_srgb = colour.matrix_RGB_to_RGB(
+                colour.RGB_COLOURSPACES['ProPhoto RGB'],
+                colour.RGB_COLOURSPACES['sRGB'])
+            apply_matrix_inplace(arr, M_srgb)
+            linear_to_srgb_inplace(arr)
+
+        clip_inplace(arr)
+
+    def _render_full_uint8_tiled(self, request: ProcessRequest,
+                                 source_buf: GpuImage,
+                                 final_exposure_gain: float,
+                                 params: ProcessorParams) -> Optional[np.ndarray]:
+        """Render a full-size preview in tiles to cap peak GPU memory."""
+        h, w = source_buf.height, source_buf.width
+        out = np.empty((h, w, 3), dtype=np.uint8)
+
+        max_tile_pixels = int(params.get('tile_preview_pixels', 2_000_000) or 2_000_000)
+        sharpen_strength = float(params.get('sharpen_strength', 0.0) or 0.0)
+        overlap = int(params.get('tile_overlap_pixels', 32) or 32) if sharpen_strength > 0 else 0
+        tile_w = min(w, 1536)
+        tile_h = max(1, min(h, max_tile_pixels // max(1, tile_w)))
+        logger.info(
+            f"[Worker] Tiled detail preview: {w}x{h}, "
+            f"tile={tile_w}x{tile_h}, overlap={overlap}"
+        )
+
+        sharpen_gpu_fn = None
+        if sharpen_strength > 0:
+            from raw_alchemy.math_ops import sharpen_gpu as sharpen_gpu_fn
+
+        for y in range(0, h, tile_h):
+            if self._has_newer_pending_request(request):
+                return None
+            th = min(tile_h, h - y)
+            for x in range(0, w, tile_w):
+                if self._has_newer_pending_request(request):
+                    return None
+                tw = min(tile_w, w - x)
+
+                src_x = max(0, x - overlap)
+                src_y = max(0, y - overlap)
+                src_right = min(w, x + tw + overlap)
+                src_bottom = min(h, y + th + overlap)
+                ext_w = src_right - src_x
+                ext_h = src_bottom - src_y
+                inner_x = x - src_x
+                inner_y = y - src_y
+
+                apply_crop_pixels_gpu(source_buf, self.gpu_tile_source,
+                                      src_x, src_y, ext_w, ext_h)
+                self._grade_source_to(
+                    self.gpu_tile_source,
+                    self.gpu_tile_graded,
+                    final_exposure_gain,
+                    params,
+                )
+                if sharpen_gpu_fn is not None:
+                    sharpen_gpu_fn(self.gpu_tile_graded,
+                                   strength=sharpen_strength,
+                                   sigma=1.0)
+
+                output_tile = self.gpu_tile_graded
+                if inner_x != 0 or inner_y != 0 or ext_w != tw or ext_h != th:
+                    apply_crop_pixels_gpu(self.gpu_tile_graded, self.gpu_tile_source,
+                                          inner_x, inner_y, tw, th)
+                    output_tile = self.gpu_tile_source
+
+                if (self._gpu_tile_uint8 is None
+                        or self._gpu_tile_uint8.shape != (th, tw, 3)):
+                    if self._gpu_tile_uint8 is not None:
+                        try:
+                            ti.sync()
+                        except Exception:
+                            pass
+                        self._gpu_tile_uint8 = None
+                    self._gpu_tile_uint8 = ti.ndarray(dtype=ti.u8, shape=(th, tw, 3))
+
+                float_to_uint8_gpu(output_tile.arr, self._gpu_tile_uint8)
+                if self._has_newer_pending_request(request):
+                    return None
+                out[y:y + th, x:x + tw, :] = self._gpu_tile_uint8.to_numpy()
+
+        return out
 
     def _do_process(self, request: ProcessRequest):
         t_start = time.perf_counter()
@@ -688,7 +966,9 @@ class ImageProcessor(QThread):
                             corrected[:, :, ch] = cv2.remap(
                                 vignette_img[:, :, ch],
                                 coords[:, :, ch, 0], coords[:, :, ch, 1],
-                                cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                                cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=0.0)
                         corrected[oob_mask] = 0
                         self.cpu_corrected = corrected
                         self.gpu_corrected.upload(corrected)
@@ -855,6 +1135,39 @@ class ImageProcessor(QThread):
                 sat, con,
                 log_space, lut_path,
             )
+
+            full_pixels = full_source_w * full_source_h
+            tile_threshold = int(params.get('tile_preview_threshold', 12_000_000) or 12_000_000)
+            sharpen_strength = params.get('sharpen_strength', 0.0)
+            if (params.get('_detail_preview', False)
+                    and preview_target_w == full_source_w
+                    and preview_target_h == full_source_h
+                    and full_pixels > tile_threshold):
+                t_out = time.perf_counter()
+                img_uint8 = self._render_full_uint8_tiled(
+                    request,
+                    self.gpu_cropped,
+                    final_exposure_gain,
+                    params,
+                )
+                if img_uint8 is None:
+                    return
+
+                t_end = time.perf_counter()
+                logger.info(
+                    f"[Worker] Tiled pipeline: {(t_end - t_start)*1000:.0f}ms total, "
+                    f"output: {(t_end - t_out)*1000:.0f}ms "
+                    f"({full_source_w}x{full_source_h})"
+                )
+
+                output_source_size = (full_source_w, full_source_h)
+                self._cache_output_result(
+                    request.path, img_uint8, output_key, applied_ev,
+                    output_source_size)
+                self.result_ready.emit(img_uint8, request.path,
+                                       request.request_id, applied_ev,
+                                       output_source_size)
+                return
 
             if grading_key != self.last_grading_key:
                 use_fused = (not log_space or log_space == 'None') and not lut_path
@@ -1034,6 +1347,12 @@ class ImageProcessor(QThread):
 
             # Pre-allocate GPU uint8 buffer (avoids Taichi's implicit upload of numpy dst)
             if self._gpu_uint8 is None or self._gpu_uint8.shape != (target_h, target_w, 3):
+                if self._gpu_uint8 is not None:
+                    try:
+                        ti.sync()
+                    except Exception:
+                        pass
+                    self._gpu_uint8 = None
                 self._gpu_uint8 = ti.ndarray(dtype=ti.u8, shape=(target_h, target_w, 3))
 
             # GPU→GPU kernel (no CPU transfer)
@@ -1043,6 +1362,9 @@ class ImageProcessor(QThread):
                 resize_float_to_uint8_gpu(self.gpu_graded.arr, self._gpu_uint8)
 
             # Single GPU→CPU download of uint8 preview.
+            if self._has_newer_pending_request(request):
+                return
+
             img_uint8 = self._gpu_uint8.to_numpy()
             output_source_size = (full_source_w, full_source_h)
 
@@ -1054,16 +1376,9 @@ class ImageProcessor(QThread):
             )
 
             # Cache final output for instant switching
-            cached_item = self.cache_manager.get(request.path)
-            if cached_item:
-                old_size = cached_item.size_mb
-                cached_item.output_uint8 = img_uint8.copy()
-                cached_item.output_key = output_key
-                cached_item.output_ev = applied_ev
-                cached_item.output_source_size = output_source_size
-                cached_item.update_size()
-                with self.cache_manager.lock:
-                    self.cache_manager.current_memory_mb += cached_item.size_mb - old_size
+            self._cache_output_result(
+                request.path, img_uint8, output_key, applied_ev,
+                output_source_size)
 
             self.result_ready.emit(img_uint8, request.path,
                                    request.request_id, applied_ev,
