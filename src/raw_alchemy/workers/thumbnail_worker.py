@@ -32,7 +32,6 @@ class ThumbnailWorker(QThread):
     2. Load actual thumbnails in parallel, emit as ready
     """
     thumbnail_ready = Signal(str, QImage)
-    placeholder_ready = Signal(str, QImage)  # sorted placeholders
     placeholders_ready = Signal(object, QImage)  # batched sorted placeholders
     progress_update = Signal(int, int)
     finished_scanning = Signal()

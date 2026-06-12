@@ -68,6 +68,7 @@ class ImageProcessor(QThread):
     def __init__(self):
         super().__init__()
         self.lock = threading.Lock()
+        self._wake = threading.Condition(self.lock)
 
         # Request management
         self.pending_request: Optional[ProcessRequest] = None
@@ -119,13 +120,17 @@ class ImageProcessor(QThread):
         self.cached_graded_clean = None   # grading output before sharpening
         self.cached_sharpened = None
         self.last_sharpen_key = None
+        self._graded_clean_pending = False
+        self._gpu_graded_is_sharpened = False
 
         self._should_stop = False
         self._gpu_uint8 = None      # Pre-allocated GPU uint8 buffer (ti.ndarray)
 
     def stop_and_cleanup(self):
         """Signal the worker to stop and wait for GPU cleanup."""
-        self._should_stop = True
+        with self.lock:
+            self._should_stop = True
+            self._wake.notify_all()
         if self.isRunning():
             self.wait(5000)  # Wait up to 5s for thread to finish
 
@@ -134,6 +139,7 @@ class ImageProcessor(QThread):
             self.current_request_id += 1
             request_id = self.current_request_id
             self.pending_request = ProcessRequest(path, {'_load': True}, request_id)
+            self._wake.notify_all()
         if not self.isRunning():
             self.start()
         return request_id
@@ -142,6 +148,7 @@ class ImageProcessor(QThread):
         with self.lock:
             if not any(p.path == path for p in self._preload_queue):
                 self._preload_queue.append(ProcessRequest(path, {'_preload': True}, -1))
+                self._wake.notify_all()
         if not self.isRunning():
             self.start()
 
@@ -150,6 +157,7 @@ class ImageProcessor(QThread):
             self.current_request_id += 1
             request_id = self.current_request_id
             self.pending_request = ProcessRequest(path, params, request_id)
+            self._wake.notify_all()
         if not self.isRunning():
             self.start()
         return request_id
@@ -168,17 +176,25 @@ class ImageProcessor(QThread):
             self._warmed_up = True
 
         # Permanent worker loop — thread stays alive until app closes
-        while not self._should_stop:
+        while True:
             with self.lock:
+                while (self.pending_request is None and not self._preload_queue
+                       and not self._should_stop):
+                    self._wake.wait(timeout=0.5)
+
+                if self._should_stop:
+                    break
+
                 request = self.pending_request
                 if request:
                     self.pending_request = None
                     self._preload_queue.clear()
                 elif self._preload_queue:
                     request = self._preload_queue.pop(0)
+                else:
+                    request = None
 
             if not request:
-                time.sleep(0.05)
                 continue
 
             try:
@@ -445,6 +461,8 @@ class ImageProcessor(QThread):
                 self.gpu_preview_source.clear()
                 self.last_grading_key = None
                 self.cached_graded_clean = None
+                self._graded_clean_pending = False
+                self._gpu_graded_is_sharpened = False
                 self.gpu_graded.clear()
                 self._gpu_uint8 = None
                 self.last_metering_key = None
@@ -466,6 +484,8 @@ class ImageProcessor(QThread):
         self.gpu_preview_source.clear()
         self.last_grading_key = None
         self.cached_graded_clean = None
+        self._graded_clean_pending = False
+        self._gpu_graded_is_sharpened = False
         self.gpu_graded.clear()
         self._gpu_uint8 = None
         self.cached_auto_ev = 0.0
@@ -508,6 +528,11 @@ class ImageProcessor(QThread):
 
     @staticmethod
     def _make_output_key(params):
+        raw_max_preview_pixels = params.get('max_preview_pixels', 12_000_000)
+        max_preview_pixels = (
+            12_000_000 if raw_max_preview_pixels is None
+            else int(raw_max_preview_pixels)
+        )
         return (
             params.get('denoise_enabled', False),
             params.get('lens_correct'), params.get('custom_db_path'),
@@ -526,7 +551,7 @@ class ImageProcessor(QThread):
             params.get('viewport_size'),
             round(float(params.get('preview_zoom', 1.0) or 1.0), 3),
             round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2),
-            int(params.get('max_preview_pixels', 12_000_000) or 0),
+            max_preview_pixels,
         )
 
     @staticmethod
@@ -796,7 +821,10 @@ class ImageProcessor(QThread):
                     source_cs = colour.RGB_COLOURSPACES['ProPhoto RGB']
                     mode = params.get('metering_mode', 'matrix')
                     strategy = metering.get_metering_strategy(mode)
-                    metering_data = self.cpu_corrected if self.cpu_corrected is not None else self.cpu_linear
+                    if grading_source is self.gpu_preview_source and self.gpu_preview_source.valid:
+                        metering_data = self.gpu_preview_source.to_numpy()
+                    else:
+                        metering_data = self.cpu_corrected if self.cpu_corrected is not None else self.cpu_linear
                     gain = strategy.calculate_gain(metering_data, source_cs)
                     self.cached_auto_ev = np.log2(gain)
                     self.last_metering_key = current_metering_key
@@ -950,6 +978,7 @@ class ImageProcessor(QThread):
                 self.last_grading_key = grading_key
                 self.cached_graded_clean = None
                 self._graded_clean_pending = True
+                self._gpu_graded_is_sharpened = False
 
         except Exception as e:
             logger.error(f"[Worker] Error in dev stages: {e}")
@@ -967,6 +996,14 @@ class ImageProcessor(QThread):
             sharpen_strength = params.get('sharpen_strength', 0.0)
             sharpen_key = (grading_key, sharpen_strength)
 
+            if sharpen_strength <= 0 and self._gpu_graded_is_sharpened:
+                if self.cached_graded_clean is not None:
+                    self.gpu_graded.upload(self.cached_graded_clean)
+                else:
+                    logger.warning("[Worker] Missing clean grading cache while disabling sharpening")
+                    self.last_grading_key = None
+                self._gpu_graded_is_sharpened = False
+
             if sharpen_strength > 0:
                 if sharpen_key != self.last_sharpen_key or self.cached_sharpened is None:
                     try:
@@ -982,10 +1019,12 @@ class ImageProcessor(QThread):
                         sharpen_gpu(self.gpu_graded, strength=sharpen_strength, sigma=1.0)
                         self.cached_sharpened = self.gpu_graded.to_numpy()
                         self.last_sharpen_key = sharpen_key
+                        self._gpu_graded_is_sharpened = True
                     except Exception as e:
                         logger.error(f"[Worker] Sharpening failed: {e}")
                 elif self.cached_sharpened is not None:
                     self.gpu_graded.upload(self.cached_sharpened)
+                    self._gpu_graded_is_sharpened = True
 
             # --- Stage 11: Preview Output ---
             # GPU float32 -> uint8 on GPU, optionally resized to preview target.

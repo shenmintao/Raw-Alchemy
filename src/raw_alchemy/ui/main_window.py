@@ -142,6 +142,7 @@ class MainWindow(FluentWindow):
         self._preview_interaction_active = False
         self._interactive_preview_max_pixels = 4_000_000
         self._needs_detail_after_preview = False
+        self._interactive_dirty = False
         self._pending_preview_request_id = None
         self._pending_detail_request_id = None
 
@@ -715,7 +716,6 @@ class MainWindow(FluentWindow):
         self.loading_label.show()
         
         self.thumb_worker = ThumbnailWorker(folder)
-        self.thumb_worker.placeholder_ready.connect(self.add_gallery_item)
         self.thumb_worker.placeholders_ready.connect(self.add_gallery_items)
         self.thumb_worker.thumbnail_ready.connect(self.update_gallery_item)
         self.thumb_worker.progress_update.connect(self.on_thumbnail_progress)
@@ -1010,6 +1010,31 @@ class MainWindow(FluentWindow):
         rect = self.gallery_list.visualItemRect(item)
         self.gallery_list.viewport().update(rect)
 
+    def _update_current_gallery_thumbnail_from_preview(self, img_uint8):
+        """Refresh the current gallery thumbnail after a low-frequency detail render."""
+        if not self.current_raw_path:
+            return
+        item = self.gallery_items_by_path.get(self.current_raw_path)
+        if item is None or img_uint8 is None or img_uint8.ndim != 3:
+            return
+
+        h, w, c = img_uint8.shape
+        if c < 3 or h <= 0 or w <= 0:
+            return
+
+        thumb_data = np.ascontiguousarray(img_uint8[:, :, :3])
+        image = QImage(
+            thumb_data.data,
+            w,
+            h,
+            3 * w,
+            QImage.Format.Format_RGB888,
+        ).copy()
+        image = image.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
+        item.setIcon(QIcon(QPixmap.fromImage(image)))
+        rect = self.gallery_list.visualItemRect(item)
+        self.gallery_list.viewport().update(rect)
+
     def on_gallery_item_clicked(self, item):
         if not item: return
         path = item.data(Qt.ItemDataRole.UserRole)
@@ -1084,20 +1109,28 @@ class MainWindow(FluentWindow):
                         self.processor.preload_image(path)
 
     def on_param_changed(self, params):
-        self.update_timer.start()
         if self._preview_interaction_active:
+            self.update_timer.stop()
             self._detail_update_timer.stop()
+            if self._pending_preview_request_id is None:
+                self.trigger_processing()
+            else:
+                self._interactive_dirty = True
         else:
             self._needs_detail_after_preview = True
             self._detail_update_timer.stop()
+            self.update_timer.start()
 
     def on_param_interaction_started(self):
         self._preview_interaction_active = True
         self._needs_detail_after_preview = False
+        self._interactive_dirty = False
+        self.update_timer.stop()
         self._detail_update_timer.stop()
 
     def on_param_interaction_finished(self, params):
         self._preview_interaction_active = False
+        self._interactive_dirty = False
         self._needs_detail_after_preview = True
         self.update_timer.start()
         self._detail_update_timer.stop()
@@ -1231,10 +1264,14 @@ class MainWindow(FluentWindow):
 
         if request_id == self._pending_preview_request_id:
             self._pending_preview_request_id = None
-            if self._needs_detail_after_preview and not self._preview_interaction_active:
+            if self._interactive_dirty and self._preview_interaction_active:
+                self._interactive_dirty = False
+                self.trigger_processing()
+            elif self._needs_detail_after_preview and not self._preview_interaction_active:
                 self._detail_update_timer.start()
         elif request_id == self._pending_detail_request_id:
             self._pending_detail_request_id = None
+            self._update_current_gallery_thumbnail_from_preview(img_uint8)
 
         # Defer visible scope update to the next event loop iteration.
         img_for_hist = img_uint8
@@ -1253,8 +1290,8 @@ class MainWindow(FluentWindow):
     
     def _trigger_processing_for_path(self, path):
         if path != self.current_raw_path: return
-        params = self._get_preview_params()
-        self.current_request_id = self.processor.update_preview(path, params)
+        self._needs_detail_after_preview = True
+        self.trigger_processing()
 
     def on_error(self, msg):
         self.preview_lbl.setText(f"{tr('error')}: {msg}")
