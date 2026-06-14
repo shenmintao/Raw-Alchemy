@@ -262,8 +262,8 @@ def process_image(
     exif_data, exif_metadata = extract_lens_exif(raw_path, None)
 
     if denoise_enabled:
-        # CANS RAW V2: packed RAW → ProPhoto Linear RGB (replaces demosaicing)
-        logger.info(f"  🔹 [Step 1] CANS RAW V2 denoise + demosaic...")
+        # CANS raw-main v5: packed RAW denoise, then Raw-Alchemy demosaic/WB/CCM.
+        logger.info(f"  🔹 [Step 1] CANS raw-main v5 denoise + demosaic...")
         try:
             img = denoise_raw(raw_path, exposure_ratio=1.0)
             logger.info("  ✅ CANS denoise complete")

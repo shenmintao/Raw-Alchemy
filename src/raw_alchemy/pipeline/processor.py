@@ -569,8 +569,8 @@ class ImageProcessor(QThread):
                                        cached_item.output_source_size)
                 return
 
-            # --- Stage 0: Denoising (CANS RAW V2, packed RAW → ProPhoto Linear) ---
-            # When enabled, replaces rawpy demosaicing entirely.
+            # --- Stage 0: Denoising (CANS raw-main v5, packed RAW → packed RAW → ProPhoto Linear) ---
+            # Only runs when the UI switch enables denoise.
             denoise_enabled = params.get('denoise_enabled', False)
             denoise_cache_key = (request.path, 'denoise')
 
@@ -579,7 +579,7 @@ class ImageProcessor(QThread):
                     try:
                         self.denoise_started.emit()
 
-                        logger.info("[Worker] CANS RAW V2 denoise (replaces demosaicing)...")
+                        logger.info("[Worker] CANS raw-main v5 denoise...")
 
                         def progress_cb(cur, total):
                             self.denoise_progress.emit(cur, total)

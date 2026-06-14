@@ -1,16 +1,19 @@
 """
-CANS RAW V2 denoiser — packed RAW → ProPhoto Linear RGB via ONNX Runtime.
+CANS RAW denoiser via ONNX Runtime.
 
-Two ONNX models (auto-selected by CFA pattern):
-  - cans_raw_v2_bayer_fp16.onnx   (4ch Bayer → 3ch ProPhoto RGB, 2× upscale)
-  - cans_raw_v2_xtrans_fp16.onnx  (9ch X-Trans → 3ch ProPhoto RGB, 3× upscale)
+The current production path is CANSRawV8 raw-main v5:
+  - cans_raw_v8_rawmain_v5_bayer_fp16.onnx   (4ch Bayer packed RAW in/out)
+  - cans_raw_v8_rawmain_v5_xtrans_fp16.onnx  (9ch X-Trans packed RAW in/out)
+
+The denoised packed RAW is demosaiced by Raw-Alchemy's existing Bayer/X-Trans
+pipeline, then WB and camera-to-ProPhoto are applied as before.
 
 Tile-based inference with Hann window blending for seamless large-image processing.
 
 Supports:
-  - Windows: CPU, CUDA (if available)
+  - Windows: CPU, CUDA or DirectML (if available)
   - macOS: CPU, CoreML (if available)
-  - Linux: CPU, CUDA (if available)
+  - Linux: CPU, CUDA or ROCm (if available)
 """
 
 import os
@@ -85,12 +88,14 @@ _session_bayer = None
 _session_xtrans = None
 _session_provider = None
 
-BAYER_MODEL = "cans_raw_v2_bayer_fp16.onnx"
-XTRANS_MODEL = "cans_raw_v2_xtrans_fp16.onnx"
+BAYER_MODEL = "cans_raw_v8_rawmain_v5_bayer_fp16.onnx"
+XTRANS_MODEL = "cans_raw_v8_rawmain_v5_xtrans_fp16.onnx"
 
-# Tile size at packed resolution (before upscale)
-DEFAULT_TILE_SIZE = 256
-DEFAULT_TILE_OVERLAP = 32
+# Tile size at packed resolution.
+DEFAULT_TILE_SIZE_BAYER = 768
+DEFAULT_TILE_OVERLAP_BAYER = 64
+DEFAULT_TILE_SIZE_XTRANS = 512
+DEFAULT_TILE_OVERLAP_XTRANS = 48
 
 
 # ---------------------------------------------------------------------------
@@ -100,24 +105,58 @@ DEFAULT_TILE_OVERLAP = 32
 def _detect_sensor(raw) -> str:
     """Detect sensor type from rawpy object using raw_pattern."""
     pattern = raw.raw_pattern
-    if pattern.shape == (6, 6):
+    if pattern is not None and pattern.shape == (6, 6):
         return 'xtrans'
-    elif pattern.shape == (2, 2):
+    elif pattern is not None and pattern.shape == (2, 2):
         return 'bayer'
     else:
-        raise ValueError(f"Unknown CFA pattern shape: {pattern.shape}")
+        raise ValueError(f"Unknown CFA pattern shape: {None if pattern is None else pattern.shape}")
+
+
+def _normalize_raw_image(raw) -> np.ndarray:
+    """Black-level subtract and normalize per CFA color channel."""
+    im = raw.raw_image_visible.astype(np.float32)
+    pattern = raw.raw_pattern
+    bl = np.array(raw.black_level_per_channel, dtype=np.float32)
+    wl = float(raw.white_level)
+    if pattern is None:
+        base = float(bl[0])
+        return np.maximum(im - base, 0) / max(wl - base, 1.0)
+
+    pat_size = pattern.shape[0]
+    out = np.empty_like(im, dtype=np.float32)
+    for r in range(pat_size):
+        for c in range(pat_size):
+            color = int(pattern[r, c])
+            bl_c = float(bl[min(color, len(bl) - 1)])
+            out[r::pat_size, c::pat_size] = np.maximum(
+                im[r::pat_size, c::pat_size] - bl_c,
+                0,
+            ) / max(wl - bl_c, 1.0)
+    return out
+
+
+def _is_rggb_pattern(pattern: np.ndarray) -> bool:
+    if pattern is None or pattern.shape != (2, 2):
+        return False
+    # rawpy may encode the two green sites as either 1/1 or 1/3.
+    return (
+        int(pattern[0, 0]) == 0
+        and int(pattern[0, 1]) in (1, 3)
+        and int(pattern[1, 0]) in (1, 3)
+        and int(pattern[1, 1]) == 2
+    )
 
 
 def _pack_bayer(raw) -> np.ndarray:
-    """Pack Bayer raw to (H/2, W/2, 4) float32, black-level subtracted and normalized.
+    """Pack RGGB Bayer raw to (H/2, W/2, 4) float32.
 
     Channel order: [R, G1, B, G2] at positions (0,0), (0,1), (1,1), (1,0).
     Uses rawpy raw_image_visible directly.
     """
-    im = raw.raw_image_visible.astype(np.float32)
-    bl = float(raw.black_level_per_channel[0])
-    wl = float(raw.white_level)
-    im = np.maximum(im - bl, 0) / (wl - bl)
+    if not _is_rggb_pattern(raw.raw_pattern):
+        raise ValueError(f"CANS raw-main v5 currently supports RGGB Bayer only, got pattern={raw.raw_pattern}")
+    im = _normalize_raw_image(raw)
 
     H, W = im.shape
     H = H // 2 * 2
@@ -137,10 +176,7 @@ def _pack_xtrans(raw) -> np.ndarray:
 
     Uses rawpy raw_image_visible directly.
     """
-    im = raw.raw_image_visible.astype(np.float32)
-    bl = float(raw.black_level_per_channel[0])
-    wl = float(raw.white_level)
-    im = np.maximum(im - bl, 0) / (wl - bl)
+    im = _normalize_raw_image(raw)
 
     H = (im.shape[0] // 6) * 6
     W = (im.shape[1] // 6) * 6
@@ -215,7 +251,7 @@ def _find_model(model_filename: str) -> str:
 
 
 def _get_providers() -> list:
-    """Get execution providers (CUDA > CoreML > CPU). DirectML excluded."""
+    """Get execution providers (CUDA/ROCm/DirectML/CoreML > CPU)."""
     try:
         import onnxruntime as ort
     except ImportError:
@@ -227,6 +263,12 @@ def _get_providers() -> list:
     if 'CUDAExecutionProvider' in available:
         providers.append('CUDAExecutionProvider')
         logger.info("Using CUDA execution provider")
+    elif 'ROCMExecutionProvider' in available:
+        providers.append('ROCMExecutionProvider')
+        logger.info("Using ROCm execution provider")
+    elif 'DmlExecutionProvider' in available:
+        providers.append('DmlExecutionProvider')
+        logger.info("Using DirectML execution provider")
     elif 'CoreMLExecutionProvider' in available and platform.system() == 'Darwin':
         providers.append('CoreMLExecutionProvider')
         logger.info("Using CoreML execution provider (macOS)")
@@ -252,7 +294,7 @@ def _get_session(sensor: str):
     model_path = _find_model(model_file)
     providers = _get_providers()
 
-    logger.info(f"Loading CANS RAW V2 ({sensor}) from: {model_path}")
+    logger.info(f"Loading CANS raw-main v5 ({sensor}) from: {model_path}")
 
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -316,19 +358,20 @@ def _get_free_vram_mb() -> float:
     return 0.0
 
 
-def _estimate_tile_vram_mb(in_ch: int, tile_size: int, upscale: int) -> float:
+def _estimate_tile_vram_mb(in_ch: int, out_ch: int, tile_size: int, upscale: int = 1) -> float:
     """Estimate VRAM needed per tile in MB (input + output + intermediate).
 
     Conservative estimate: ~4x the raw input+output size for intermediate
     activations and workspace.
     """
     in_bytes = in_ch * tile_size * tile_size * 2  # fp16
-    out_bytes = 3 * (tile_size * upscale) ** 2 * 2  # fp16 output
+    out_bytes = out_ch * (tile_size * upscale) ** 2 * 2  # fp16 output
     # Model intermediate activations roughly 4x input
     return (in_bytes + out_bytes) * 4 / (1024 * 1024)
 
 
-def _compute_batch_size(in_ch: int, tile_size: int, upscale: int,
+def _compute_batch_size(in_ch: int, tile_size: int, upscale: int = 1,
+                        out_ch: Optional[int] = None,
                         vram_reserve_mb: float = 512) -> int:
     """Compute optimal batch size based on available VRAM.
 
@@ -346,13 +389,13 @@ def _compute_batch_size(in_ch: int, tile_size: int, upscale: int,
         # Can't query VRAM — conservative default
         return 1
 
-    per_tile_mb = _estimate_tile_vram_mb(in_ch, tile_size, upscale)
+    out_ch = in_ch if out_ch is None else out_ch
+    per_tile_mb = _estimate_tile_vram_mb(in_ch, out_ch, tile_size, upscale)
     if per_tile_mb <= 0:
         return 1
 
     available = max(free_mb - vram_reserve_mb, per_tile_mb)
-    # CANS RAW V2 ONNX has ScatterElements ops that require batch=1
-    batch_size = 1
+    batch_size = max(1, min(8, int(available // per_tile_mb)))
 
     logger.info(
         f"VRAM: {free_mb:.0f} MB free, {per_tile_mb:.1f} MB/tile, "
@@ -396,6 +439,12 @@ def _has_wb_input(session) -> bool:
     return len(session.get_inputs()) >= 2
 
 
+def _ort_input_dtype(input_info) -> np.dtype:
+    if "float16" in input_info.type:
+        return np.float16
+    return np.float32
+
+
 def _build_wb_iso(cam_wb: np.ndarray, iso: float) -> np.ndarray:
     """Build WB+ISO condition vector.
 
@@ -421,108 +470,253 @@ def _process_batch(session, tiles_chw: list[np.ndarray],
         tiles_chw: List of (C, H, W) float16 packed RAW tiles (same spatial size)
         wb_iso: Optional (4,) float32 WB+ISO condition [R/G, 1.0, B/G, log10(ISO)]
     Returns:
-        List of (3, H*upscale, W*upscale) float32 ProPhoto Linear RGB
+        List of CHW float32 model outputs.
     """
     if not tiles_chw:
         return []
 
+    raw_dtype = _ort_input_dtype(session.get_inputs()[0])
+
     if len(tiles_chw) == 1:
-        batch = tiles_chw[0][np.newaxis, ...]
+        batch = tiles_chw[0][np.newaxis, ...].astype(raw_dtype, copy=False)
     else:
-        batch = np.stack(tiles_chw, axis=0)
+        batch = np.stack(tiles_chw, axis=0).astype(raw_dtype, copy=False)
 
     feeds = {session.get_inputs()[0].name: batch}
 
     # Add WB+ISO condition if model supports it
     if wb_iso is not None and _has_wb_input(session):
         B = batch.shape[0]
-        wb_batch = np.tile(wb_iso.astype(np.float16)[np.newaxis, :], (B, 1))
+        wb_dtype = _ort_input_dtype(session.get_inputs()[1])
+        wb_batch = np.tile(wb_iso.astype(wb_dtype)[np.newaxis, :], (B, 1))
         feeds[session.get_inputs()[1].name] = wb_batch
 
     output = session.run(None, feeds)[0]
     return [output[i].astype(np.float32) for i in range(output.shape[0])]
 
 
-def denoise_raw(
-    raw_path: str,
-    exposure_ratio: float = 1.0,
-    tile_size: int = DEFAULT_TILE_SIZE,
-    tile_overlap: int = DEFAULT_TILE_OVERLAP,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+def _tile_weight(
+    h: int,
+    w: int,
+    overlap: int,
+    *,
+    at_top: bool,
+    at_bottom: bool,
+    at_left: bool,
+    at_right: bool,
 ) -> np.ndarray:
-    """Denoise a RAW file using CANS RAW V2 (packed RAW → ProPhoto Linear RGB).
+    """Linear feathering window that keeps outer image borders at weight 1."""
+    feather = max(0, min(overlap, h // 2, w // 2))
+    wy = np.ones(h, dtype=np.float32)
+    wx = np.ones(w, dtype=np.float32)
+    if feather > 0:
+        ramp = np.linspace(1.0 / (feather + 1), 1.0, feather, dtype=np.float32)
+        if not at_top:
+            wy[:feather] = ramp
+        if not at_bottom:
+            wy[-feather:] = ramp[::-1]
+        if not at_left:
+            wx[:feather] = ramp
+        if not at_right:
+            wx[-feather:] = ramp[::-1]
+    return np.outer(wy, wx)[np.newaxis, :, :]
 
-    This replaces rawpy's demosaicing entirely — the model performs both
-    denoising and demosaicing in a single pass.
 
-    Args:
-        raw_path: Path to the RAW file (.ARW, .CR3, .NEF, .RAF, .DNG, etc.)
-        exposure_ratio: Multiply packed RAW by this ratio (for exposure matching)
-        tile_size: Tile size at packed resolution (default 256)
-        tile_overlap: Overlap in packed pixels (default 32)
-        progress_callback: Optional (current, total) callback
+def _unpack_bayer_rggb(packed: np.ndarray) -> np.ndarray:
+    h, w, c = packed.shape
+    if c != 4:
+        raise ValueError(f"Bayer packed RAW must have 4 channels, got {c}")
+    raw = np.zeros((h * 2, w * 2), dtype=np.float32)
+    raw[0::2, 0::2] = packed[..., 0]
+    raw[0::2, 1::2] = packed[..., 1]
+    raw[1::2, 1::2] = packed[..., 2]
+    raw[1::2, 0::2] = packed[..., 3]
+    return raw
 
-    Returns:
-        (H, W, 3) float32 ProPhoto Linear RGB in [0, 1]
-    """
-    import time
-    import rawpy
-    t0 = time.time()
 
-    # Open RAW via rawpy, pack, extract WB+ISO and orientation
-    with rawpy.imread(raw_path) as raw:
-        sensor = _detect_sensor(raw)
+def _assign_xtrans(
+    raw: np.ndarray,
+    packed: np.ndarray,
+    channel: int,
+    *,
+    top: int,
+    left: int,
+    offsets: dict[tuple[int, int], tuple[int, int]],
+) -> None:
+    h, w, _ = packed.shape
+    yy, xx = np.indices((h, w), dtype=np.int32)
+    parity_y = (yy + top) & 1
+    parity_x = (xx + left) & 1
+    for py in (0, 1):
+        for px in (0, 1):
+            mask = (parity_y == py) & (parity_x == px)
+            if not np.any(mask):
+                continue
+            dy, dx = offsets[(py, px)]
+            raw[yy[mask] * 3 + dy, xx[mask] * 3 + dx] = packed[..., channel][mask]
 
-        if sensor == 'bayer':
-            packed = _pack_bayer(raw)
-            upscale = 2
-        else:
-            packed = _pack_xtrans(raw)
-            upscale = 3
 
-        # WB+ISO condition
-        cam_wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-        flip_code = raw.sizes.flip
+def _unpack_xtrans_sid(packed: np.ndarray, *, top: int = 0, left: int = 0) -> np.ndarray:
+    h, w, c = packed.shape
+    if c != 9:
+        raise ValueError(f"X-Trans packed RAW must have 9 channels, got {c}")
+    raw = np.zeros((h * 3, w * 3), dtype=np.float32)
 
-        # Extract ISO from EXIF (rawpy doesn't expose ISO directly)
-        iso = 100.0
+    _assign_xtrans(
+        raw,
+        packed,
+        0,
+        top=top,
+        left=left,
+        offsets={(0, 0): (0, 0), (0, 1): (0, 1), (1, 0): (0, 1), (1, 1): (0, 0)},
+    )
+    raw[0::3, 2::3] = packed[..., 1]
+    _assign_xtrans(
+        raw,
+        packed,
+        2,
+        top=top,
+        left=left,
+        offsets={(0, 0): (0, 1), (0, 1): (0, 0), (1, 0): (0, 0), (1, 1): (0, 1)},
+    )
+    _assign_xtrans(
+        raw,
+        packed,
+        3,
+        top=top,
+        left=left,
+        offsets={(0, 0): (1, 2), (0, 1): (2, 2), (1, 0): (2, 2), (1, 1): (1, 2)},
+    )
+    _assign_xtrans(
+        raw,
+        packed,
+        4,
+        top=top,
+        left=left,
+        offsets={(0, 0): (2, 2), (0, 1): (1, 2), (1, 0): (1, 2), (1, 1): (2, 2)},
+    )
 
-    # Get ISO from EXIF via pyexiv2 (best effort)
+    raw[1::3, 0::3] = packed[..., 5]
+    raw[1::3, 1::3] = packed[..., 6]
+    raw[2::3, 0::3] = packed[..., 7]
+    raw[2::3, 1::3] = packed[..., 8]
+    return raw
+
+
+def _render_packed_raw_to_prophoto(result: dict) -> np.ndarray:
+    from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
+    from raw_alchemy.demosaic import FILTERS_RGGB, rcd_demosaic
+    from raw_alchemy.math_ops import apply_matrix_inplace
+
+    packed = np.clip(result["packed"], 0.0, 1.0).astype(np.float32, copy=False)
+    sensor = result["sensor"]
+
+    if sensor == "bayer":
+        mosaic = _unpack_bayer_rggb(packed)
+        rgb = rcd_demosaic(mosaic, FILTERS_RGGB)
+    elif sensor == "xtrans":
+        from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
+
+        mosaic = _unpack_xtrans_sid(packed, top=0, left=0)
+        pattern = np.ascontiguousarray(result["cfa_pattern"].astype(np.int32))
+        rgb = xtrans_markesteijn_demosaic(mosaic, pattern)
+    else:
+        raise ValueError(f"unknown sensor {sensor!r}")
+
+    rgb = np.ascontiguousarray(rgb.astype(np.float32))
+    cam_wb = result["camera_wb"]
+    g = float(cam_wb[1]) if float(cam_wb[1]) > 0 else 1.0
+    rgb[:, :, 0] *= float(cam_wb[0]) / g
+    rgb[:, :, 2] *= float(cam_wb[2]) / g
+
+    apply_matrix_inplace(rgb, cam_to_prophoto_matrix(result["xyz_to_cam"]))
+    np.clip(rgb, 0.0, 1.0, out=rgb)
+    return _apply_flip(rgb, int(result["flip_code"]))
+
+
+def _read_iso(raw_path: str) -> float:
+    """Best-effort ISO read from EXIF."""
     try:
         import pyexiv2
+
         with pyexiv2.Image(raw_path) as exif_img:
             exif_data = exif_img.read_exif() or {}
             iso_str = exif_data.get('Exif.Photo.ISOSpeedRatings') or exif_data.get('Exif.Photo.ISOSpeed', '')
             if iso_str:
-                iso = float(iso_str)
+                return float(iso_str)
     except Exception:
         pass
+    return 100.0
 
-    g = cam_wb[1] if cam_wb[1] > 0 else 1.0
-    wb3 = np.array([cam_wb[0] / g, 1.0, cam_wb[2] / g], dtype=np.float32)
 
-    wb_iso = np.concatenate([wb3, [np.log10(max(iso, 1.0))]], dtype=np.float32)
+def _default_tile_params(sensor: str) -> tuple[int, int]:
+    if sensor == "xtrans":
+        return DEFAULT_TILE_SIZE_XTRANS, DEFAULT_TILE_OVERLAP_XTRANS
+    return DEFAULT_TILE_SIZE_BAYER, DEFAULT_TILE_OVERLAP_BAYER
 
-    # Apply exposure ratio
+
+def denoise_raw_packed(
+    raw_path: str,
+    exposure_ratio: float = 1.0,
+    tile_size: Optional[int] = None,
+    tile_overlap: Optional[int] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> dict:
+    """Denoise a RAW file to packed sensor-space RAW using CANS raw-main v5.
+
+    Args:
+        raw_path: Path to the RAW file (.ARW, .CR3, .NEF, .RAF, .DNG, etc.)
+        exposure_ratio: Multiply packed RAW by this ratio before denoising.
+        tile_size: Tile size at packed resolution. Defaults by sensor.
+        tile_overlap: Overlap in packed pixels. Defaults by sensor.
+        progress_callback: Optional (current, total) callback
+
+    Returns:
+        Dict with denoised HWC packed RAW plus metadata needed for rendering.
+    """
+    import time
+    import rawpy
+
+    t0 = time.time()
+
+    with rawpy.imread(raw_path) as raw:
+        sensor = _detect_sensor(raw)
+        if sensor == 'bayer':
+            packed = _pack_bayer(raw)
+        else:
+            packed = _pack_xtrans(raw)
+
+        cam_wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+        flip_code = raw.sizes.flip
+        cfa_pattern = raw.raw_pattern.copy().astype(np.int32)
+        xyz_to_cam = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
+
+    iso = _read_iso(raw_path)
+    wb_iso = _build_wb_iso(cam_wb, iso)
+
     if exposure_ratio != 1.0:
         packed = np.clip(packed * exposure_ratio, 0.0, 1.0)
 
     pack_h, pack_w, in_ch = packed.shape
-    out_h, out_w = pack_h * upscale, pack_w * upscale
+    if tile_size is None or tile_overlap is None:
+        default_tile, default_overlap = _default_tile_params(sensor)
+        tile_size = default_tile if tile_size is None else tile_size
+        tile_overlap = default_overlap if tile_overlap is None else tile_overlap
+
+    if tile_overlap < 0 or tile_overlap >= tile_size:
+        raise ValueError(f"tile_overlap must be in [0, tile_size), got {tile_overlap}/{tile_size}")
+    if sensor == "xtrans" and (tile_size % 2 or tile_overlap % 2):
+        raise ValueError("X-Trans tile_size and tile_overlap must be even in packed coordinates")
 
     logger.info(
-        f"CANS denoise: {os.path.basename(raw_path)} ({sensor}), "
-        f"packed {pack_w}x{pack_h} -> output {out_w}x{out_h}, "
-        f"WB=[{wb3[0]:.2f}, {wb3[2]:.2f}] ISO={iso:.0f} flip={flip_code}"
+        f"CANS raw-main v5: {os.path.basename(raw_path)} ({sensor}), "
+        f"packed {pack_w}x{pack_h}, tile={tile_size}/{tile_overlap}, "
+        f"WB=[{wb_iso[0]:.2f}, {wb_iso[2]:.2f}] ISO={iso:.0f} flip={flip_code}"
     )
 
-    # Get ONNX session
     session = _get_session(sensor)
-
-    # Convert to CHW float16
     packed_chw = np.ascontiguousarray(packed.transpose(2, 0, 1), dtype=np.float16)
 
-    # Tile positions (at packed resolution)
     step = tile_size - tile_overlap
     ys = list(range(0, max(pack_h - tile_size, 0) + 1, step))
     xs = list(range(0, max(pack_w - tile_size, 0) + 1, step))
@@ -531,12 +725,8 @@ def denoise_raw(
     if xs[-1] + tile_size < pack_w:
         xs.append(pack_w - tile_size)
 
-    total_tiles = len(ys) * len(xs)
+    batch_size = _compute_batch_size(in_ch, tile_size, upscale=1, out_ch=in_ch)
 
-    # Compute batch size from available VRAM
-    batch_size = _compute_batch_size(in_ch, tile_size, upscale)
-
-    # Small image: single tile
     if pack_h <= tile_size and pack_w <= tile_size:
         if progress_callback:
             progress_callback(0, 1)
@@ -547,15 +737,20 @@ def denoise_raw(
         else:
             tile = packed_chw
         result = _process_batch(session, [tile.astype(np.float16)], wb_iso)[0]
-        result = result[:, :out_h, :out_w]
+        result = result[:, :pack_h, :pack_w]
         if progress_callback:
             progress_callback(1, 1)
         elapsed = time.time() - t0
-        logger.info(f"CANS denoise done in {elapsed:.1f}s (1 tile, {_session_provider})")
-        out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0)
-        return _apply_flip(out, flip_code)
+        logger.info(f"CANS raw-main v5 done in {elapsed:.1f}s (1 tile, {_session_provider})")
+        return {
+            "packed": np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32),
+            "sensor": sensor,
+            "camera_wb": cam_wb,
+            "cfa_pattern": cfa_pattern,
+            "xyz_to_cam": xyz_to_cam,
+            "flip_code": flip_code,
+        }
 
-    # Collect all tile coordinates
     tile_infos = []
     for y in ys:
         y2 = min(y + tile_size, pack_h)
@@ -566,14 +761,8 @@ def denoise_raw(
             tile_infos.append((y, x, y2, x2))
 
     total_tiles = len(tile_infos)
-
-    # Tile-based processing with Hann window blending
-    out_tile_size = tile_size * upscale
-    ramp = np.hanning(out_tile_size).astype(np.float32)
-    w2d = np.outer(ramp, ramp)[np.newaxis, :, :]  # (1, tile_out, tile_out)
-
-    accum = np.zeros((3, out_h, out_w), dtype=np.float32)
-    weight = np.zeros((1, out_h, out_w), dtype=np.float32)
+    accum = np.zeros((in_ch, pack_h, pack_w), dtype=np.float32)
+    weight = np.zeros((1, pack_h, pack_w), dtype=np.float32)
 
     current = 0
     for batch_start in range(0, total_tiles, batch_size):
@@ -598,14 +787,21 @@ def denoise_raw(
         # Accumulate results
         for idx, (y, x, y2, x2) in enumerate(batch_infos):
             pred = preds[idx]
-            oph = min(pred.shape[1], (y2 - y) * upscale)
-            opw = min(pred.shape[2], (x2 - x) * upscale)
+            oph = min(pred.shape[1], y2 - y)
+            opw = min(pred.shape[2], x2 - x)
             pred = pred[:, :oph, :opw]
-            wt = w2d[:, :oph, :opw]
+            wt = _tile_weight(
+                oph,
+                opw,
+                tile_overlap,
+                at_top=(y == 0),
+                at_bottom=(y2 >= pack_h),
+                at_left=(x == 0),
+                at_right=(x2 >= pack_w),
+            )
 
-            oy, ox = y * upscale, x * upscale
-            accum[:, oy:oy + oph, ox:ox + opw] += pred * wt
-            weight[:, oy:oy + oph, ox:ox + opw] += wt
+            accum[:, y:y + oph, x:x + opw] += pred * wt
+            weight[:, y:y + oph, x:x + opw] += wt
 
             current += 1
             if progress_callback:
@@ -617,12 +813,41 @@ def denoise_raw(
     elapsed = time.time() - t0
     n_batches = (total_tiles + batch_size - 1) // batch_size
     logger.info(
-        f"CANS denoise done in {elapsed:.1f}s "
+        f"CANS raw-main v5 done in {elapsed:.1f}s "
         f"({total_tiles} tiles, {n_batches} batches of {batch_size}, {_session_provider})"
     )
 
-    out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0)
-    return _apply_flip(out, flip_code)
+    return {
+        "packed": np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32),
+        "sensor": sensor,
+        "camera_wb": cam_wb,
+        "cfa_pattern": cfa_pattern,
+        "xyz_to_cam": xyz_to_cam,
+        "flip_code": flip_code,
+    }
+
+
+def denoise_raw(
+    raw_path: str,
+    exposure_ratio: float = 1.0,
+    tile_size: Optional[int] = None,
+    tile_overlap: Optional[int] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> np.ndarray:
+    """Denoise RAW and return HWC float32 ProPhoto Linear RGB in [0, 1].
+
+    This public API remains controlled by the caller. Raw-Alchemy keeps
+    denoise disabled by default; the UI switch decides whether this function
+    is called.
+    """
+    result = denoise_raw_packed(
+        raw_path,
+        exposure_ratio=exposure_ratio,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
+        progress_callback=progress_callback,
+    )
+    return _render_packed_raw_to_prophoto(result)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +859,7 @@ def is_available() -> bool:
     try:
         import onnxruntime
         _find_model(BAYER_MODEL)
+        _find_model(XTRANS_MODEL)
         return True
     except (ImportError, FileNotFoundError):
         return False
