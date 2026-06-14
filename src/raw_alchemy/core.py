@@ -146,7 +146,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters, get_cfa_pattern_from_filters
     from raw_alchemy.onnx.denoiser import _apply_flip
     from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
-    from rawspeedpy import try_decode, XTRANS_PATTERN
+    from raw_alchemy.rawspeed import try_decode, XTRANS_PATTERN
 
     rs = try_decode(raw_path)
 

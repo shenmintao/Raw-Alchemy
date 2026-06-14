@@ -1,7 +1,6 @@
 import sys
 import os
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
 
 from raw_alchemy import i18n
 from raw_alchemy.ui.main_window import MainWindow
@@ -15,6 +14,10 @@ def main():
     os.environ["QT_SCALE_FACTOR"] = "1"
 
     app = QApplication(sys.argv)
+    app_font = app.font()
+    if app_font.pointSize() <= 0:
+        app_font.setPointSize(9)
+        app.setFont(app_font)
 
     # Load i18n
     i18n.init_i18n()

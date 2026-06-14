@@ -32,13 +32,13 @@ class ThumbnailWorker(QThread):
     2. Load actual thumbnails in parallel, emit as ready
     """
     thumbnail_ready = Signal(str, QImage)
-    placeholder_ready = Signal(str, QImage)  # sorted placeholders
+    placeholders_ready = Signal(object, QImage)  # batched sorted placeholders
     progress_update = Signal(int, int)
     finished_scanning = Signal()
 
     THUMB_HEIGHT = 300
 
-    def __init__(self, folder_path, max_workers=8):
+    def __init__(self, folder_path, max_workers=4):
         super().__init__()
         self.folder_path = folder_path
         self.stopped = False
@@ -152,35 +152,60 @@ class ThumbnailWorker(QThread):
         files.sort(key=lambda p: os.path.basename(p).lower())
         total = len(files)
 
-        # 2. Emit placeholders in sorted order (instant, UI can lay out immediately)
+        # 2. Emit placeholders in sorted order. Batch them to avoid thousands of
+        # queued Qt events and repeated QListWidget relayouts on large folders.
         placeholder = self._make_placeholder()
-        for f in files:
+        chunk_size = 200
+        for i in range(0, total, chunk_size):
             if self.stopped:
                 return
-            self.placeholder_ready.emit(f, placeholder)
+            self.placeholders_ready.emit(files[i:i + chunk_size], placeholder)
 
-        # 3. Load actual thumbnails in parallel, emit as ready
+        # 3. Load actual thumbnails in parallel, emit as ready. Keep only a small
+        # number of futures in flight so huge folders do not create huge queues.
         processed_count = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(self.extract_thumbnail, f): f for f in files}
+            file_iter = iter(files)
+            futures = {}
+            max_in_flight = max(1, self.max_workers * 2)
 
-            for future in concurrent.futures.as_completed(futures):
+            def submit_next():
+                try:
+                    next_file = next(file_iter)
+                except StopIteration:
+                    return False
+                futures[executor.submit(self.extract_thumbnail, next_file)] = next_file
+                return True
+
+            for _ in range(min(max_in_flight, total)):
+                submit_next()
+
+            while futures:
                 if self.stopped:
                     executor.shutdown(wait=False, cancel_futures=True)
                     return
 
-                f_path = futures[future]
-                try:
-                    qimg = future.result()
-                    if qimg:
-                        self.thumbnail_ready.emit(f_path, qimg)
-                except Exception as e:
-                    logger.error(f"Worker exception for {f_path}: {e}")
+                done, _pending = concurrent.futures.wait(
+                    futures,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
 
-                processed_count += 1
-                if processed_count % 5 == 0 or processed_count == total:
-                    self.progress_update.emit(processed_count, total)
+                for future in done:
+                    f_path = futures.pop(future)
+                    try:
+                        qimg = future.result()
+                        if qimg:
+                            self.thumbnail_ready.emit(f_path, qimg)
+                    except Exception as e:
+                        logger.error(f"Worker exception for {f_path}: {e}")
+
+                    processed_count += 1
+                    if processed_count % 5 == 0 or processed_count == total:
+                        self.progress_update.emit(processed_count, total)
+
+                    if not self.stopped:
+                        submit_next()
 
         self.finished_scanning.emit()
 

@@ -167,7 +167,32 @@ class ImageViewportGL(QOpenGLWidget):
 
     def resizeGL(self, w, h):
         GL.glViewport(0, 0, w, h)
+        self._clamp_offset()
         self.viewport_resized.emit(w, h)
+
+    def _display_dimensions(self):
+        """Return the stable image dimensions used for viewport geometry."""
+        if self._source_width > 0 and self._source_height > 0:
+            return self._source_width, self._source_height
+        if self._pending_data is not None:
+            h, w = self._pending_data.shape[:2]
+            return w, h
+        return self._img_width, self._img_height
+
+    def _display_scale(self, zoom=None):
+        vp_w, vp_h = self.width(), self.height()
+        display_w, display_h = self._display_dimensions()
+        if vp_w <= 0 or vp_h <= 0 or display_w <= 0 or display_h <= 0:
+            z = self._zoom if zoom is None else zoom
+            return z, z
+
+        z = self._zoom if zoom is None else zoom
+        img_aspect = display_w / display_h
+        vp_aspect = vp_w / vp_h
+
+        if img_aspect > vp_aspect:
+            return z, z * vp_aspect / img_aspect
+        return z * img_aspect / vp_aspect, z
 
     def paintGL(self):
         """Render the current texture."""
@@ -184,21 +209,10 @@ class ImageViewportGL(QOpenGLWidget):
         # Draw textured quad
         self._shader_program.bind()
 
-        # Compute aspect-correct zoom
-        vp_w, vp_h = self.width(), self.height()
-        if vp_w > 0 and vp_h > 0 and self._img_width > 0 and self._img_height > 0:
-            img_aspect = self._img_width / self._img_height
-            vp_aspect = vp_w / vp_h
-
-            if img_aspect > vp_aspect:
-                scale_x = self._zoom
-                scale_y = self._zoom * vp_aspect / img_aspect
-            else:
-                scale_x = self._zoom * img_aspect / vp_aspect
-                scale_y = self._zoom
-        else:
-            scale_x = self._zoom
-            scale_y = self._zoom
+        # Compute aspect-correct zoom from the full source dimensions, not the
+        # current preview texture. Preview/detail texture swaps must not move
+        # the image while the user is zooming.
+        scale_x, scale_y = self._display_scale()
 
         # Set uniforms via raw GL calls (PySide6 setUniformValue doesn't support str+float)
         scale_loc = self._shader_program.uniformLocation("u_scale")
@@ -331,44 +345,54 @@ class ImageViewportGL(QOpenGLWidget):
     def preview_zoom(self):
         return self._zoom
 
-    def _clamp_offset(self):
-        if self._img_width <= 0 or self._img_height <= 0:
-            return
-        vp_w, vp_h = self.width(), self.height()
-        if vp_w <= 0 or vp_h <= 0:
-            return
-        img_aspect = self._img_width / self._img_height
-        vp_aspect = vp_w / vp_h
-
-        if img_aspect > vp_aspect:
-            sx, sy = self._zoom, self._zoom * vp_aspect / img_aspect
+    def display_is_full_resolution(self):
+        if not self._has_image:
+            return False
+        if self._pending_data is not None:
+            img_h, img_w = self._pending_data.shape[:2]
         else:
-            sx, sy = self._zoom * img_aspect / vp_aspect, self._zoom
+            img_w, img_h = self._img_width, self._img_height
+        if img_w <= 0 or img_h <= 0:
+            return False
+        source_w = self._source_width if self._source_width > 0 else self._img_width
+        source_h = self._source_height if self._source_height > 0 else self._img_height
+        return img_w >= source_w and img_h >= source_h
 
-        if sx <= 1.0:
+    def _clamp_offset(self):
+        scale_x, scale_y = self._display_scale()
+        if scale_x <= 0.0 or scale_y <= 0.0:
+            return
+
+        if scale_x <= 1.0:
             self._offset_x = 0.0
         else:
-            max_off = sx - 1.0
+            max_off = scale_x - 1.0
             self._offset_x = max(-max_off, min(self._offset_x, max_off))
 
-        if sy <= 1.0:
+        if scale_y <= 1.0:
             self._offset_y = 0.0
         else:
-            max_off = sy - 1.0
+            max_off = scale_y - 1.0
             self._offset_y = max(-max_off, min(self._offset_y, max_off))
 
     def wheelEvent(self, event: QWheelEvent):
         delta = event.angleDelta().y()
         factor = 1.1 if delta > 0 else (1 / 1.1)
         old_zoom = self._zoom
-        self._zoom = max(0.1, min(self._zoom * factor, 50.0))
-        real_factor = self._zoom / old_zoom
+        old_scale_x, old_scale_y = self._display_scale(old_zoom)
+        new_zoom = max(0.1, min(self._zoom * factor, 50.0))
+        new_scale_x, new_scale_y = self._display_scale(new_zoom)
 
         mx = (event.position().x() / self.width()) * 2.0 - 1.0
         my = -((event.position().y() / self.height()) * 2.0 - 1.0)
 
-        self._offset_x = mx - (mx - self._offset_x) * real_factor
-        self._offset_y = my - (my - self._offset_y) * real_factor
+        if old_scale_x > 0.0 and old_scale_y > 0.0:
+            local_x = (mx - self._offset_x) / old_scale_x
+            local_y = (my - self._offset_y) / old_scale_y
+            self._offset_x = mx - local_x * new_scale_x
+            self._offset_y = my - local_y * new_scale_y
+
+        self._zoom = new_zoom
         self._clamp_offset()
         self.update()
         self.zoom_changed.emit(self._zoom)

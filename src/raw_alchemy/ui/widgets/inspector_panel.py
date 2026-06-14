@@ -22,6 +22,8 @@ from raw_alchemy.ui.widgets.waveform import WaveformWidget
 class InspectorPanel(ScrollArea):
     """Right side control panel"""
     param_changed = Signal(dict)
+    param_interaction_started = Signal()
+    param_interaction_finished = Signal(dict)
     enter_crop_mode = Signal()
     enter_perspective_mode = Signal()
     
@@ -120,6 +122,8 @@ class InspectorPanel(ScrollArea):
         self.exp_slider.setRange(-100, 100) # -10.0 to 10.0
         self.exp_slider.setValue(0)
         self.exp_slider.update()
+        self.exp_slider.sliderPressed.connect(self._on_param_interaction_started)
+        self.exp_slider.sliderReleased.connect(self._on_param_interaction_finished)
         
         # Add exposure value label
         self.exp_value_label = BodyLabel(tr('exposure_ev') + ": 0.0")
@@ -242,6 +246,8 @@ class InspectorPanel(ScrollArea):
             # slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             slider.setRange(int(min_v*scale), int(max_v*scale))
             slider.setValue(int(default_v*scale))
+            slider.sliderPressed.connect(self._on_param_interaction_started)
+            slider.sliderReleased.connect(self._on_param_interaction_finished)
             
             def update_lbl(val):
                 """Update label and trigger debounced parameter change"""
@@ -322,6 +328,8 @@ class InspectorPanel(ScrollArea):
         self.sharpen_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.sharpen_slider.setRange(0, 100)
         self.sharpen_slider.setValue(0)
+        self.sharpen_slider.sliderPressed.connect(self._on_param_interaction_started)
+        self.sharpen_slider.sliderReleased.connect(self._on_param_interaction_finished)
 
         def update_sharpen_label(val):
             real_val = val / 100.0
@@ -536,8 +544,9 @@ class InspectorPanel(ScrollArea):
         self._update_display_mode_switch_text()
         main_window = self.window()
         current = getattr(main_window, 'current', None)
-        if current is not None and current.uint8_data is not None:
-            self.update_scope_data(current.uint8_data)
+        scope_data = getattr(current, 'scope_uint8_data', None) if current is not None else None
+        if scope_data is not None:
+            self.update_scope_data(scope_data)
 
     def update_scope_data(self, img_uint8):
         """Update only the visible scope."""
@@ -624,6 +633,14 @@ class InspectorPanel(ScrollArea):
 
     def _on_param_change(self):
         self.param_changed.emit(self.get_params())
+
+    def _on_param_interaction_started(self):
+        self.param_interaction_started.emit()
+
+    def _on_param_interaction_finished(self):
+        params = self.get_params()
+        self.param_changed.emit(params)
+        self.param_interaction_finished.emit(params)
     
     def _revert_slider(self, key):
         """撤回单个滑条到基准值（如果有）或默认值"""

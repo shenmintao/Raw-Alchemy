@@ -303,7 +303,10 @@ if _lensfun:
     _lensfun.lf_free.argtypes = [ctypes.c_void_p]
 
     _lensfun.lf_modifier_get_auto_scale.restype = ctypes.c_float
-    _lensfun.lf_modifier_get_auto_scale.argtypes = [ctypes.POINTER(lfModifier)]
+    _lensfun.lf_modifier_get_auto_scale.argtypes = [
+        ctypes.POINTER(lfModifier),
+        ctypes.c_int,
+    ]
 
 
 # ============================================================================
@@ -432,9 +435,9 @@ class LensfunModifier:
         """启用缩放"""
         return _lensfun.lf_modifier_enable_scaling(self.modifier, scale)
 
-    def get_auto_scale(self) -> float:
+    def get_auto_scale(self, reverse: bool = False) -> float:
         """获取自动缩放比例"""
-        return _lensfun.lf_modifier_get_auto_scale(self.modifier)
+        return _lensfun.lf_modifier_get_auto_scale(self.modifier, int(reverse))
     
     def apply_subpixel_geometry_distortion(self, xu: float, yu: float, 
                                            width: int, height: int) -> Optional[np.ndarray]:
@@ -646,6 +649,16 @@ def apply_lens_correction(
     if correct_tca:
         modifier.enable_tca_correction()
 
+    if correct_distortion or correct_tca:
+        try:
+            auto_scale = float(modifier.get_auto_scale(False))
+            if np.isfinite(auto_scale) and auto_scale > 0.0:
+                modifier.enable_scaling(auto_scale)
+                if abs(auto_scale - 1.0) > 1e-4:
+                    logger.info(f"  [Lensfun] Auto-scale crop: {auto_scale:.4f}")
+        except Exception as e:
+            logger.debug(f"  [Lensfun] Auto-scale unavailable: {e}")
+
     if correct_vignetting:
         modifier.enable_vignetting_correction(aperture, distance)
 
@@ -688,6 +701,28 @@ def apply_lens_correction(
             # order=3 三次插值需要 4x4 邻域，边界 2 像素内会采样到零填充值，
             # 不同通道坐标不同（TCA）导致混入量不一致产生彩色噪点，因此加 margin
             interp_margin = 2.0
+            x_min = min(coords[:, :, ch, 0].min() for ch in range(3))
+            x_max = max(coords[:, :, ch, 0].max() for ch in range(3))
+            y_min = min(coords[:, :, ch, 1].min() for ch in range(3))
+            y_max = max(coords[:, :, ch, 1].max() for ch in range(3))
+            x_hi = width - 1 - interp_margin
+            y_hi = height - 1 - interp_margin
+            if x_min < interp_margin or y_min < interp_margin or x_max > x_hi or y_max > y_hi:
+                cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+                scales = [1.0]
+                if x_min < cx:
+                    scales.append((cx - interp_margin) / max(cx - x_min, 1e-6))
+                if x_max > cx:
+                    scales.append((x_hi - cx) / max(x_max - cx, 1e-6))
+                if y_min < cy:
+                    scales.append((cy - interp_margin) / max(cy - y_min, 1e-6))
+                if y_max > cy:
+                    scales.append((y_hi - cy) / max(y_max - cy, 1e-6))
+                scale = max(0.0, min(scales))
+                for ch in range(3):
+                    coords[:, :, ch, 0] = cx + (coords[:, :, ch, 0] - cx) * scale
+                    coords[:, :, ch, 1] = cy + (coords[:, :, ch, 1] - cy) * scale
+                logger.info(f"  [Lensfun] Safety crop scale: {scale:.4f}")
             oob_mask = np.zeros((height, width), dtype=bool)
             for ch in range(3):
                 oob_mask |= (coords[:, :, ch, 0] < interp_margin) | (coords[:, :, ch, 0] > width - 1 - interp_margin)
@@ -800,13 +835,22 @@ def compute_lens_distortion_map(
     if correct_tca:
         modifier.enable_tca_correction()
 
+    try:
+        auto_scale = float(modifier.get_auto_scale(False))
+        if np.isfinite(auto_scale) and auto_scale > 0.0:
+            modifier.enable_scaling(auto_scale)
+            if abs(auto_scale - 1.0) > 1e-4:
+                logger.info(f"  [Lensfun] Auto-scale crop: {auto_scale:.4f}")
+    except Exception as e:
+        logger.debug(f"  [Lensfun] Auto-scale unavailable: {e}")
+
     coords = modifier.apply_subpixel_geometry_distortion(0.0, 0.0, width, height)
     if coords is None:
         return None
 
-    # Flatten to (N, 2) for vectorized min/max/scale/clamp/oob
-    all_x = coords[:, :, :, 0].ravel()
-    all_y = coords[:, :, :, 1].ravel()
+    # Work on views so crop/clamp changes are applied to the coordinate map.
+    all_x = coords[:, :, :, 0]
+    all_y = coords[:, :, :, 1]
 
     x_min, x_max = float(all_x.min()), float(all_x.max())
     y_min, y_max = float(all_y.min()), float(all_y.max())
@@ -825,6 +869,26 @@ def compute_lens_distortion_map(
 
     # OOB mask + clamp (single pass over flattened views)
     interp_margin = 2.0
+    x_min, x_max = float(all_x.min()), float(all_x.max())
+    y_min, y_max = float(all_y.min()), float(all_y.max())
+    x_hi = width - 1 - interp_margin
+    y_hi = height - 1 - interp_margin
+    if x_min < interp_margin or y_min < interp_margin or x_max > x_hi or y_max > y_hi:
+        cx, cy = (float(width) - 1.0) / 2.0, (float(height) - 1.0) / 2.0
+        scales = [1.0]
+        if x_min < cx:
+            scales.append((cx - interp_margin) / max(cx - x_min, 1e-6))
+        if x_max > cx:
+            scales.append((x_hi - cx) / max(x_max - cx, 1e-6))
+        if y_min < cy:
+            scales.append((cy - interp_margin) / max(cy - y_min, 1e-6))
+        if y_max > cy:
+            scales.append((y_hi - cy) / max(y_max - cy, 1e-6))
+        scale = max(0.0, min(scales))
+        all_x[:] = cx + (all_x - cx) * scale
+        all_y[:] = cy + (all_y - cy) * scale
+        logger.info(f"  [Lensfun] Safety crop scale: {scale:.4f}")
+
     oob_x = (all_x < interp_margin) | (all_x > width - 1 - interp_margin)
     oob_y = (all_y < interp_margin) | (all_y > height - 1 - interp_margin)
     oob_flat = oob_x | oob_y

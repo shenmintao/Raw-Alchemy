@@ -14,7 +14,7 @@ strip_executable = True if sys.platform.startswith('linux') else False
 # --- Platform-specific binaries ---
 import os
 import glob
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 binaries_list = []
 
@@ -91,6 +91,8 @@ taichi_datas = taichi_ret[0]
 taichi_binaries = taichi_ret[1]
 taichi_hiddenimports = taichi_ret[2]
 
+rawspeedpy_datas = collect_data_files('rawspeedpy')
+
 # Determine ONNX Runtime package based on platform
 ort_package = 'onnxruntime' # Default fallback
 if sys.platform == 'win32' or sys.platform.startswith('linux'):
@@ -113,7 +115,7 @@ a = Analysis(
         ('src/raw_alchemy/demosaic.py', 'raw_alchemy'),
         ('src/raw_alchemy/xtrans_demosaic.py', 'raw_alchemy'),
         ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
-    ] + taichi_datas,
+    ] + taichi_datas + rawspeedpy_datas,
     hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'] + taichi_hiddenimports,
     hookspath=[],
     hooksconfig={},
