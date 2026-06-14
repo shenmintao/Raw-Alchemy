@@ -96,6 +96,7 @@ DEFAULT_TILE_SIZE_BAYER = 768
 DEFAULT_TILE_OVERLAP_BAYER = 64
 DEFAULT_TILE_SIZE_XTRANS = 512
 DEFAULT_TILE_OVERLAP_XTRANS = 48
+ENABLE_RAWMAIN_V5_XTRANS = os.environ.get("RAW_ALCHEMY_ENABLE_CANS_V5_XTRANS", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +685,11 @@ def denoise_raw_packed(
         if sensor == 'bayer':
             packed = _pack_bayer(raw)
         else:
+            if not ENABLE_RAWMAIN_V5_XTRANS:
+                raise RuntimeError(
+                    "CANS raw-main v5 X-Trans is disabled by default; "
+                    "set RAW_ALCHEMY_ENABLE_CANS_V5_XTRANS=1 for experimental testing"
+                )
             packed = _pack_xtrans(raw)
 
         cam_wb = np.array(raw.camera_whitebalance, dtype=np.float32)
