@@ -95,6 +95,10 @@ class ThumbnailWorker(QThread):
     viewport) are extracted first; everything else follows in sorted order.
     Only a small number of futures is kept in flight, so a viewport change
     takes effect almost immediately and off-screen work is deferred.
+
+    disk_cache (T7.8): optional ThumbnailCache. Hits skip the RAW decode
+    entirely; misses are extracted as before and written back on the pool
+    thread. After a completed scan the cache prunes itself in the background.
     """
     thumbnail_ready = Signal(str, QImage)
     placeholders_ready = Signal(object, QImage)  # batched sorted placeholders
@@ -103,11 +107,12 @@ class ThumbnailWorker(QThread):
 
     THUMB_HEIGHT = 300
 
-    def __init__(self, folder_path, max_workers=None):
+    def __init__(self, folder_path, max_workers=None, disk_cache=None):
         super().__init__()
         self.folder_path = folder_path
         self.stopped = False
         self.max_workers = max_workers if max_workers else _default_max_workers()
+        self.disk_cache = disk_cache
         self._priority_lock = threading.Lock()
         self._priority_paths = []
 
@@ -125,14 +130,18 @@ class ThumbnailWorker(QThread):
         return img
 
     @staticmethod
-    def extract_thumbnail(full_path, stop_check=None):
+    def extract_thumbnail(full_path, stop_check=None, cache=None):
         """
-        Extract thumbnail — tries embedded JPEG first (decoded directly at
-        thumbnail size, ~50ms), falls back to rawpy half_size postprocess.
+        Extract thumbnail — tries the disk cache first (T7.8, ~5ms), then the
+        embedded JPEG (decoded directly at thumbnail size, ~50ms), and finally
+        falls back to rawpy half_size postprocess.
 
         stop_check: optional callable; when it returns True the (remaining)
         expensive decode work is skipped and None is returned, so worker
         shutdown never waits behind a full RAW decode.
+
+        cache: optional ThumbnailCache; extracted thumbnails are written back
+        so the next visit of this folder skips the decode entirely.
         """
         try:
             ext = os.path.splitext(full_path)[1].lower()
@@ -140,6 +149,14 @@ class ThumbnailWorker(QThread):
                 return None
             if stop_check is not None and stop_check():
                 return None
+
+            if cache is not None:
+                try:
+                    cached = cache.get(full_path)
+                except Exception:
+                    cached = None
+                if cached is not None and not cached.isNull():
+                    return cached
 
             target_height = ThumbnailWorker.THUMB_HEIGHT
             image = None
@@ -175,6 +192,11 @@ class ThumbnailWorker(QThread):
                         image = image.scaledToHeight(target_height)
                 image = _apply_flip_rotation(image, flip)
                 if not image.isNull():
+                    if cache is not None:
+                        try:
+                            cache.put(full_path, image)
+                        except Exception:
+                            pass
                     return image
                 image = None
 
@@ -243,6 +265,11 @@ class ThumbnailWorker(QThread):
             if image is not None and not image.isNull():
                 if image.height() != target_height:
                     image = image.scaledToHeight(target_height)
+                if cache is not None:
+                    try:
+                        cache.put(full_path, image)
+                    except Exception:
+                        pass
                 return image
             return None
 
@@ -299,6 +326,12 @@ class ThumbnailWorker(QThread):
         def stop_check():
             return self.stopped
 
+        # Only pass the cache through when present so injected extractors
+        # with the plain (path, stop_check) signature keep working.
+        extract_kwargs = {}
+        if self.disk_cache is not None:
+            extract_kwargs["cache"] = self.disk_cache
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="thumb",
@@ -311,7 +344,9 @@ class ThumbnailWorker(QThread):
                 next_path = next_file()
                 if next_path is None:
                     return False
-                futures[executor.submit(self.extract_thumbnail, next_path, stop_check)] = next_path
+                futures[executor.submit(
+                    self.extract_thumbnail, next_path, stop_check, **extract_kwargs
+                )] = next_path
                 return True
 
             for _ in range(min(max_in_flight, total)):
@@ -342,6 +377,14 @@ class ThumbnailWorker(QThread):
 
                     if not self.stopped:
                         submit_next()
+
+        # Capacity governance (T7.8): after a completed scan, trim the disk
+        # cache in the background if it grew past its budget.
+        if self.disk_cache is not None and not self.stopped:
+            try:
+                self.disk_cache.prune_async()
+            except Exception:
+                pass
 
         self.finished_scanning.emit()
 

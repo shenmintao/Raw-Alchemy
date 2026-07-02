@@ -18,6 +18,7 @@ from qfluentwidgets import (
 
 from raw_alchemy import config, lensfun_wrapper, i18n, sidecar
 from raw_alchemy.i18n import tr
+from raw_alchemy.thumb_cache import ThumbnailCache
 from loguru import logger
 
 # New structure imports
@@ -62,7 +63,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.file_params_cache = {}  # path -> params dict
         self.file_baseline_params_cache = {}  # path -> baseline params dict
         self.write_sidecar_enabled = True
-        
+
+        # Persistent thumbnail cache (T7.8); shared across folder switches
+        # and toggled from Settings.
+        self.thumb_cache = ThumbnailCache()
+        self.thumb_cache_enabled = True
+
         # Last used paths for file dialogs
         self.last_folder_path = None  # Last opened gallery folder
         self.last_lut_folder_path = None  # Last LUT folder
@@ -224,6 +230,11 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         if hasattr(self, 'settings_widget'):
             self.settings_widget.set_cache_limit_mb(self.cache_limit_mb)
 
+        self.thumb_cache_enabled = bool(settings.get('thumb_cache', True))
+        self.thumb_cache.set_enabled(self.thumb_cache_enabled)
+        if hasattr(self, 'settings_widget'):
+            self.settings_widget.set_thumb_cache_enabled(self.thumb_cache_enabled)
+
     def restore_ui(self):
         """Restore UI state from saved settings"""
         if self.last_lut_folder_path and os.path.exists(self.last_lut_folder_path):
@@ -291,6 +302,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             'last_export_path': self.last_export_path,
             'write_sidecar': self.write_sidecar_enabled,
             'cache_limit_mb': int(getattr(self, 'cache_limit_mb', config.CACHE_LIMIT_MB)),
+            'thumb_cache': bool(getattr(self, 'thumb_cache_enabled', True)),
         }
         i18n.save_app_settings(settings)
 
@@ -552,11 +564,25 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.settings_widget.setObjectName("settingsInterface")
         self.settings_widget.write_sidecar_changed.connect(self.on_write_sidecar_changed)
         self.settings_widget.cache_limit_changed.connect(self.on_cache_limit_changed)
+        self.settings_widget.thumb_cache_changed.connect(self.on_thumb_cache_changed)
+        self.settings_widget.thumb_cache_clear_requested.connect(
+            self.on_thumb_cache_clear_requested
+        )
         self.addSubInterface(self.settings_widget, FIF.SETTING, tr('settings'))
 
     def on_cache_limit_changed(self, limit_mb):
         self.cache_limit_mb = int(limit_mb)
         self._apply_cache_limit(self.cache_limit_mb)
+
+    def on_thumb_cache_changed(self, enabled):
+        """Toggle the persistent thumbnail cache (T7.8). Off = legacy
+        behavior: every folder visit re-extracts thumbnails."""
+        self.thumb_cache_enabled = bool(enabled)
+        self.thumb_cache.set_enabled(self.thumb_cache_enabled)
+
+    def on_thumb_cache_clear_requested(self):
+        removed = self.thumb_cache.clear()
+        InfoBar.success(tr('thumb_cache_cleared'), str(removed), parent=self)
 
     def _apply_cache_limit(self, limit_mb):
         """Apply the image-cache memory cap to all processors (T7.6)."""

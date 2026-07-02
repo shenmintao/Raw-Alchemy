@@ -99,7 +99,9 @@ class LibraryControllerMixin:
         self.loading_label.setText(tr("loading_thumbnails"))
         self.loading_label.show()
 
-        worker = ThumbnailWorker(folder)
+        # T7.8: the shared thumbnail cache (disk + session memory) makes a
+        # revisit of this folder redisplay from cache instead of re-decoding.
+        worker = ThumbnailWorker(folder, disk_cache=getattr(self, "thumb_cache", None))
         self.thumb_worker = worker
         worker.placeholders_ready.connect(self._on_thumbnail_placeholders)
         worker.thumbnail_ready.connect(self._on_thumbnail_image_ready)

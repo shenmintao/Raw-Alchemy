@@ -33,6 +33,8 @@ class SettingsPanel(QWidget):
     """Settings panel widget"""
     write_sidecar_changed = Signal(bool)
     cache_limit_changed = Signal(int)
+    thumb_cache_changed = Signal(bool)
+    thumb_cache_clear_requested = Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -114,6 +116,30 @@ class SettingsPanel(QWidget):
         perf_layout.addWidget(cache_hint)
         settings_layout.addWidget(perf_card)
 
+        # Thumbnail cache Settings Card (T7.8)
+        thumb_card = SimpleCardWidget()
+        thumb_layout = QVBoxLayout(thumb_card)
+        thumb_layout.setSpacing(10)
+        thumb_title = StrongBodyLabel(tr('thumb_cache'))
+        thumb_layout.addWidget(thumb_title)
+
+        self.thumb_cache_switch = SwitchButton(text=tr('thumb_cache_enable'))
+        self.thumb_cache_switch.setChecked(True)
+        self.thumb_cache_switch.checkedChanged.connect(self.thumb_cache_changed.emit)
+        thumb_layout.addWidget(self.thumb_cache_switch)
+
+        thumb_btn_row = QHBoxLayout()
+        self.clear_thumb_cache_btn = PushButton(tr('clear_thumb_cache'))
+        self.clear_thumb_cache_btn.clicked.connect(self.thumb_cache_clear_requested.emit)
+        thumb_btn_row.addWidget(self.clear_thumb_cache_btn)
+        thumb_btn_row.addStretch()
+        thumb_layout.addLayout(thumb_btn_row)
+
+        thumb_hint = CaptionLabel(tr('thumb_cache_hint'))
+        thumb_hint.setStyleSheet("color: gray;")
+        thumb_layout.addWidget(thumb_hint)
+        settings_layout.addWidget(thumb_card)
+
 
         # GPU Acceleration Settings Card
         gpu_card = SimpleCardWidget()
@@ -178,6 +204,11 @@ class SettingsPanel(QWidget):
         self.cache_limit_spin.blockSignals(True)
         self.cache_limit_spin.setValue(int(limit_mb))
         self.cache_limit_spin.blockSignals(False)
+
+    def set_thumb_cache_enabled(self, enabled: bool):
+        self.thumb_cache_switch.blockSignals(True)
+        self.thumb_cache_switch.setChecked(bool(enabled))
+        self.thumb_cache_switch.blockSignals(False)
     
     def _update_cuda_status(self):
         """Update CUDA status display based on current state."""
