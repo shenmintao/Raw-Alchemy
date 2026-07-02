@@ -518,6 +518,23 @@ class ImageProcessor(QThread):
                 self.cached_denoise_original = cached_item.denoise_original
                 self.last_denoise_key = cached_item.denoise_key
 
+            # Aborted-preload backfill (T7.3/M6): a neighbor preload that was
+            # superseded mid-decode caches the entry with proxy_linear=None.
+            # Without a rebuild, _should_use_proxy_preview stays False for
+            # this image forever and every fit-view interaction pays the
+            # full-resolution pipeline. Rebuild the proxy once, on the load
+            # that actually views the image (~100ms, vs seconds per slider
+            # move saved), and publish it back to the entry.
+            if self.cpu_proxy_linear is None and self.cpu_linear is not None:
+                proxy_np = self._make_proxy(self.cpu_linear)
+                if proxy_np is not None:
+                    self.cpu_proxy_linear = proxy_np
+                    with cached_item.lock:
+                        cached_item.proxy_linear = proxy_np
+                    # Re-account outside the entry lock (manager.lock ->
+                    # entry.lock is the fixed lock order).
+                    self.cache_manager.notify_entry_updated(path)
+
         else:
             logger.info(f"[Worker] Cache Miss - Loading: {os.path.basename(path)}")
 
@@ -600,17 +617,64 @@ class ImageProcessor(QThread):
         except Exception as e:
             logger.debug(f"[Worker] GPU buffer release error (non-critical): {e}")
 
-    def get_cached_for_export(self) -> Optional[dict]:
+    @staticmethod
+    def _normalize_lens_state_key(key) -> Optional[tuple]:
+        """Canonical form of a (lens_correct, custom_db_path, denoise) key.
+
+        The worker stores these keys with raw param values (True/False/None
+        for lens_correct); normalizing the booleans lets state written by
+        different code paths compare equal when semantically identical.
+        """
+        if key is None:
+            return None
+        lens_correct, custom_db_path, denoise_enabled = key
+        return (bool(lens_correct), custom_db_path, bool(denoise_enabled))
+
+    @classmethod
+    def _expected_lens_state_key(cls, params: ProcessorParams) -> tuple:
+        """The lens/denoise state the current UI params require of
+        ``cpu_corrected`` (normalized)."""
+        return (
+            bool(params.get('lens_correct', False)),
+            params.get('custom_db_path'),
+            bool(params.get('denoise_enabled', False)),
+        )
+
+    def get_cached_for_export(self, params: Optional[ProcessorParams] = None) -> Optional[dict]:
         """Return cached data for the current image, for use by single-image export.
 
         Called from the main thread. The numpy arrays are read-only references
         so no copy is made here 鈥?the export thread should treat them as
         immutable (they are only ever replaced, never mutated in-place).
+
+        When ``params`` (the current UI params) are given, ``cpu_corrected``
+        is served only if its recorded lens/denoise state
+        (``cached_lens_key``) matches what those params require. The T7.4
+        multi-slot output cache made pure preview hits routine, and a hit
+        returns before the executor re-syncs this state — so the export
+        path must key-validate instead of trusting it (M5). On mismatch
+        this returns None and the caller falls back to the full
+        re-processing export path: slower, but always consistent with the
+        preview. (Re-syncing on the hit path instead would mean re-running
+        lens correction / denoise — seconds to tens of seconds — inside
+        the interactive path, exactly the cost T7.4 exists to avoid.)
         """
-        if self.cpu_corrected is None:
+        # Snapshot once: the worker thread only ever *replaces* these
+        # references, so locals keep the validated pairing consistent.
+        corrected = self.cpu_corrected
+        if corrected is None:
             return None
+        if params is not None:
+            expected = self._expected_lens_state_key(params)
+            if self._normalize_lens_state_key(self.cached_lens_key) != expected:
+                return None
+            if expected[2] and self.cached_denoise_full is None:
+                # The key claims a denoised source but the denoise artifact
+                # is gone (failed/aborted run, dropped cache) — cpu_corrected
+                # cannot be trusted to actually be denoised.
+                return None
         return {
-            'corrected': self.cpu_corrected,
+            'corrected': corrected,
             'denoise_original': self.cached_denoise_original,
             'denoise_full': self.cached_denoise_full,
             'exif_data': self.exif_data,
@@ -1119,6 +1183,66 @@ class ImageProcessor(QThread):
         else:
             self.cpu_corrected = self.cpu_linear
 
+    def _restore_export_state_from_entry(
+        self, cached_item: Optional[CachedImage], params: ProcessorParams
+    ):
+        """Cheap export-state resync for the output-cache hit path (M5).
+
+        A hit emits and returns before the executor runs, so
+        ``cpu_corrected`` / ``cached_lens_key`` may still describe an older
+        parameter state (e.g. after a lens/denoise ON->OFF->ON round trip,
+        which the T7.4 multi-slot cache turns into a pure hit). Resync
+        without any recompute:
+
+        - lens OFF: the corrected source is just the linear data (or the
+          cached denoise result) — synthesize it, mirroring
+          ``_prepare_executor_source_state`` / ``_sync_executor_export_source``.
+        - lens ON: adopt the entry's full-size corrected write-back when its
+          lens key matches the current params (a reference, no copy).
+
+        When neither applies (e.g. the required denoise artifact was
+        dropped), the stale fields are deliberately left as-is:
+        ``get_cached_for_export`` key-validates them and refuses to serve a
+        mismatched array, so the export takes the full re-processing path
+        instead of silently diverging from the preview.
+        """
+        expected = self._expected_lens_state_key(params)
+        if (
+            self.cpu_corrected is not None
+            and self._normalize_lens_state_key(self.cached_lens_key) == expected
+        ):
+            return
+
+        denoise_enabled = bool(params.get('denoise_enabled', False))
+        if not params.get('lens_correct', False):
+            if denoise_enabled:
+                if self.cached_denoise_full is None:
+                    return  # nothing cheap to resync; export re-runs fully
+                corrected = np.ascontiguousarray(self.cached_denoise_full)
+            else:
+                corrected = self.cpu_linear
+            if corrected is None:
+                return
+            self.cpu_corrected = corrected
+            self.cached_lens_key = (
+                False,
+                params.get('custom_db_path'),
+                denoise_enabled,
+            )
+            return
+
+        if cached_item is None:
+            return
+        with cached_item.lock:
+            corrected = cached_item.corrected_data
+            entry_key = cached_item.lens_key
+        if (
+            corrected is not None
+            and self._normalize_lens_state_key(entry_key) == expected
+        ):
+            self.cpu_corrected = corrected
+            self.cached_lens_key = entry_key
+
     def _invalidate_executor_prefix_if_needed(self, params: ProcessorParams):
         """Semantic invalidation of the executor's pipeline caches.
 
@@ -1183,6 +1307,16 @@ class ImageProcessor(QThread):
             if cached_output is not None:
                 logger.info(f"[Worker] Output Cache Hit: {os.path.basename(request.path)}")
                 cached_uint8, cached_ev, cached_source_size = cached_output
+                # The hit returns before the executor runs, so sync the
+                # state downstream consumers read from the worker:
+                # - last_applied_ev feeds the Auto-exposure export contract
+                #   (resolve_export_exposure); without this line an export
+                #   after a cross-image hit bakes the *other* image's EV
+                #   while the preview shows this slot's EV (M4).
+                # - cpu_corrected/cached_lens_key feed the single-image
+                #   export fast path; resync them when it costs nothing (M5).
+                self.last_applied_ev = float(cached_ev)
+                self._restore_export_state_from_entry(cached_item, params)
                 self.last_preview_source = preview_source
                 self.preview_source_changed.emit(preview_source)
                 if use_proxy:
