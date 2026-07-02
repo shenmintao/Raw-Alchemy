@@ -9,13 +9,27 @@ class CachedImage:
     """
     Container for cached image data
     """
-    def __init__(self, path: str, linear_data: np.ndarray, exif_data: Any, lens_key: Any, corrected_data: Optional[np.ndarray] = None, exif_metadata: Any = None):
+    def __init__(
+        self,
+        path: str,
+        linear_data: np.ndarray,
+        exif_data: Any,
+        lens_key: Any,
+        corrected_data: Optional[np.ndarray] = None,
+        exif_metadata: Any = None,
+        proxy_linear: Optional[np.ndarray] = None,
+        proxy_corrected_data: Optional[np.ndarray] = None,
+        proxy_lens_key: Any = None,
+    ):
         self.path = path
         self.linear_data = linear_data
+        self.proxy_linear = proxy_linear
         self.exif_data = exif_data
         self.exif_metadata = exif_metadata
         self.lens_key = lens_key
+        self.proxy_lens_key = proxy_lens_key
         self.corrected_data = corrected_data
+        self.proxy_corrected_data = proxy_corrected_data
 
         # Denoise Cache
         self.denoise_full = None
@@ -34,13 +48,21 @@ class CachedImage:
 
         # Calculate approximate size in MB
         self.size_mb = linear_data.nbytes / (1024 * 1024)
+        if proxy_linear is not None:
+            self.size_mb += proxy_linear.nbytes / (1024 * 1024)
         if corrected_data is not None:
              self.size_mb += corrected_data.nbytes / (1024 * 1024)
+        if proxy_corrected_data is not None:
+             self.size_mb += proxy_corrected_data.nbytes / (1024 * 1024)
 
     def update_size(self):
         self.size_mb = self.linear_data.nbytes / (1024 * 1024)
+        if self.proxy_linear is not None:
+            self.size_mb += self.proxy_linear.nbytes / (1024 * 1024)
         if self.corrected_data is not None:
             self.size_mb += self.corrected_data.nbytes / (1024 * 1024)
+        if self.proxy_corrected_data is not None:
+            self.size_mb += self.proxy_corrected_data.nbytes / (1024 * 1024)
         if self.output_uint8 is not None:
             self.size_mb += self.output_uint8.nbytes / (1024 * 1024)
 

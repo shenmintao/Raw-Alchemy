@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from raw_alchemy import config
+
 
 # sRGB(D65) → XYZ(D65) — exactly the matrix darktable uses (constants from
 # colorspaces.c so we match its numerical behaviour bit-for-bit).
@@ -50,7 +52,27 @@ _D65_TO_D50_BRADFORD = np.array([
 # cam, so the working-space input also needs to live in D65.
 _D50_TO_D65 = np.linalg.inv(_D65_TO_D50_BRADFORD)
 PRO_TO_XYZ_D65 = _D50_TO_D65 @ _PRO_TO_XYZ_D50
+PROPHOTO_TO_XYZ_D65 = PRO_TO_XYZ_D65
+ACESCG_TO_XYZ_D65 = np.array([
+    [0.652237541886, 0.128236136000, 0.169982249166],
+    [0.267672180125, 0.674339988802, 0.057987831073],
+    [-0.005381815766, 0.001369060209, 1.093070506317],
+], dtype=np.float64)
 SRGB_TO_XYZ_D65 = _RGB_TO_XYZ_D65
+
+WORKING_SPACE_TO_XYZ_D65 = {
+    config.WORKING_SPACE_PROPHOTO: PROPHOTO_TO_XYZ_D65,
+    config.WORKING_SPACE_ACESCG: ACESCG_TO_XYZ_D65,
+}
+
+
+def working_rgb_to_xyz_d65(working_space: str | None = None) -> np.ndarray:
+    """Return the RGB->XYZ_D65 matrix for a configured working colour space."""
+    name = working_space or config.WORKING_SPACE
+    try:
+        return WORKING_SPACE_TO_XYZ_D65[name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported working colour space: {name}") from exc
 
 
 def _pseudoinverse(M: np.ndarray) -> np.ndarray:
@@ -144,4 +166,16 @@ def cam_to_prophoto_matrix(xyz_to_cam_4x3: np.ndarray) -> np.ndarray:
     Equivalent to the old two-postprocess + lstsq fit, ~1000× faster.
     """
     M, _ = cam_to_working_matrix(xyz_to_cam_4x3, PRO_TO_XYZ_D65)
+    return M
+
+
+def cam_to_working_space_matrix(
+    xyz_to_cam_4x3: np.ndarray,
+    working_space: str | None = None,
+) -> np.ndarray:
+    """Derive Camera->configured-working-space matrix from rawpy metadata."""
+    M, _ = cam_to_working_matrix(
+        xyz_to_cam_4x3,
+        working_rgb_to_xyz_d65(working_space),
+    )
     return M

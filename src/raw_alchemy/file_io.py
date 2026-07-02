@@ -17,7 +17,8 @@ def save_image(
     logger: Optional[Logger] = None,
     exif_metadata: Optional[dict] = None,
     exif_dict: Optional[dict] = None,
-    color_matrix = None
+    color_matrix = None,
+    hdr_output: bool = False,
 ) -> bool:
     """
     保存图像到指定路径，根据扩展名自动选择格式
@@ -52,7 +53,10 @@ def save_image(
             _save_dng(img, output_path, color_matrix, logger)
             exif_handled_internally = True  # 【重要】DNG 格式已在保存时写入了必要标签
         elif file_ext in ['.heic', '.heif']:
-            _save_heif(img, output_path, logger)
+            if hdr_output or output_path.lower().endswith('.hdr.heif'):
+                _save_hdr_heif_pq(img, output_path, logger)
+            else:
+                _save_heif(img, output_path, logger)
         else:
             _save_jpeg_or_other(img, output_path, file_ext, logger)
         
@@ -111,6 +115,33 @@ def _save_heif(img: np.ndarray, output_path: str, logger: Logger):
         data=output_image_uint16.tobytes()
     )
     heif_file.save(output_path, quality=85, bit_depth=10)
+
+
+def _save_hdr_heif_pq(img: np.ndarray, output_path: str, logger: Logger):
+    """Save a 10-bit BT.2020/PQ HEIF file.
+
+    The input is expected to already be PQ-encoded BT.2020 RGB from the
+    pipeline's pq_out operation.
+    """
+    logger.info("    Format: HDR HEIF (10-bit BT.2020/PQ)")
+    output_image_uint16 = (np.clip(img, 0.0, 1.0) * 65535).astype(np.uint16)
+
+    heif_file = pillow_heif.from_bytes(
+        mode='RGB;16',
+        size=(output_image_uint16.shape[1], output_image_uint16.shape[0]),
+        data=output_image_uint16.tobytes()
+    )
+    heif_file.save(
+        output_path,
+        quality=90,
+        bit_depth=10,
+        save_nclx_profile=True,
+        color_primaries=9,
+        transfer_characteristics=16,
+        matrix_coefficients=9,
+        full_range_flag=1,
+        chroma="420",
+    )
 
 
 def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):

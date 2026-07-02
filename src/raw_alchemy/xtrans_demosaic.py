@@ -12,9 +12,10 @@ Usage:
     rgb = xtrans_markesteijn_demosaic(raw, xtrans_pattern)
 """
 
-import taichi as ti
 import numpy as np
 from loguru import logger
+
+from raw_alchemy.backend import ndarray as backend_ndarray, ti
 
 
 # ---------------------------------------------------------------------------
@@ -831,22 +832,22 @@ def xtrans_markesteijn_demosaic(
     logger.debug(f"X-Trans allhex built: sgrow={sgrow}, sgcol={sgcol}")
 
     # --- GPU buffer allocation ---
-    xt_gpu = ti.ndarray(dtype=ti.i32, shape=(6, 6))
+    xt_gpu = backend_ndarray(dtype=ti.i32, shape=(6, 6))
     xt_gpu.from_numpy(xtrans_pattern.astype(np.int32))
 
-    ah_dr_gpu = ti.ndarray(dtype=ti.i32, shape=(72,))
+    ah_dr_gpu = backend_ndarray(dtype=ti.i32, shape=(72,))
     ah_dr_gpu.from_numpy(allhex_dr)
-    ah_dc_gpu = ti.ndarray(dtype=ti.i32, shape=(72,))
+    ah_dc_gpu = backend_ndarray(dtype=ti.i32, shape=(72,))
     ah_dc_gpu.from_numpy(allhex_dc)
 
-    raw_gpu = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    raw_gpu = backend_ndarray(dtype=ti.f32, shape=(h, w))
     raw_gpu.from_numpy(np.ascontiguousarray(raw, dtype=np.float32))
 
     # 4 direction buffers, each (H, W, 3)
-    rgb_d0 = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
-    rgb_d1 = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
-    rgb_d2 = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
-    rgb_d3 = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
+    rgb_d0 = backend_ndarray(dtype=ti.f32, shape=(h, w, 3))
+    rgb_d1 = backend_ndarray(dtype=ti.f32, shape=(h, w, 3))
+    rgb_d2 = backend_ndarray(dtype=ti.f32, shape=(h, w, 3))
+    rgb_d3 = backend_ndarray(dtype=ti.f32, shape=(h, w, 3))
 
     # --- Kernel 1: Populate ---
     _xtm_populate(raw_gpu, rgb_d0, xt_gpu)
@@ -855,8 +856,8 @@ def xtrans_markesteijn_demosaic(
     _xtm_copy_rgb(rgb_d0, rgb_d3)
 
     # --- Kernel 2: gmin/gmax ---
-    gmin_buf = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    gmax_buf = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    gmin_buf = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    gmax_buf = backend_ndarray(dtype=ti.f32, shape=(h, w))
     del raw_gpu
 
     _xtm_gminmax(rgb_d0, gmin_buf, gmax_buf, ah_dr_gpu, ah_dc_gpu, xt_gpu, h, w)
@@ -880,16 +881,16 @@ def xtrans_markesteijn_demosaic(
     del ah_dr_gpu, ah_dc_gpu
 
     # --- Kernel 7: Derivatives ---
-    drv0 = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    drv1 = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    drv2 = ti.ndarray(dtype=ti.f32, shape=(h, w))
-    drv3 = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    drv0 = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    drv1 = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    drv2 = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    drv3 = backend_ndarray(dtype=ti.f32, shape=(h, w))
 
     _xtm_yuv_derivatives(rgb_d0, rgb_d1, rgb_d2, rgb_d3,
                           drv0, drv1, drv2, drv3, h, w)
 
     # --- Kernel 8: Homogeneity + merge ---
-    out = ti.ndarray(dtype=ti.f32, shape=(h, w, 3))
+    out = backend_ndarray(dtype=ti.f32, shape=(h, w, 3))
 
     _xtm_homo_merge(rgb_d0, rgb_d1, rgb_d2, rgb_d3,
                      drv0, drv1, drv2, drv3, out, h, w)
@@ -898,7 +899,7 @@ def xtrans_markesteijn_demosaic(
     del drv0, drv1, drv2, drv3
 
     # --- Kernel 9: Border ---
-    raw_gpu2 = ti.ndarray(dtype=ti.f32, shape=(h, w))
+    raw_gpu2 = backend_ndarray(dtype=ti.f32, shape=(h, w))
     raw_gpu2.from_numpy(np.ascontiguousarray(raw, dtype=np.float32))
     _xtm_border_interpolate(raw_gpu2, out, xt_gpu, BORDER)
     del raw_gpu2, xt_gpu

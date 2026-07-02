@@ -1,0 +1,45 @@
+# Runtime lock generated for Raw Alchemy Phase 0 dependency cleanup.
+# Git dependencies are pinned to explicit commits from pyproject.toml.
+certifi==2026.4.22
+charset-normalizer==3.4.7
+click==8.3.3
+colorama==0.4.6
+colour-science @ git+https://github.com/colour-science/colour.git@4ee3b72a2c6205c1d0cd964075621ec19290d571
+darkdetect==0.8.0
+dill==0.4.1
+flatbuffers==25.12.19
+idna==3.13
+loguru==0.7.3
+markdown-it-py==4.0.0
+mdurl==0.1.2
+numpy==2.4.4
+onnxruntime-gpu==1.25.1 ; sys_platform != "darwin"
+onnxruntime==1.25.1 ; sys_platform == "darwin"
+opencv-python-headless==4.13.0.92
+ordered-set==4.1.0
+packaging==26.2
+pillow==12.2.0
+pillow-heif==1.3.0
+protobuf==7.34.1
+psutil==7.2.2
+pyexiv2==2.15.5
+Pygments==2.20.0
+PyOpenGL==3.1.10
+PySide6==6.11.0
+PySide6-Addons==6.11.0
+PySide6-Essentials==6.11.0
+PySide6-Fluent-Widgets==1.11.2
+PySideSix-Frameless-Window==0.8.1
+rawpy @ git+https://github.com/shenmintao/rawpy.git@f857909f2f308d827065691725df0ec5402210c4
+rawspeedpy @ git+https://github.com/shenmintao/rawspeedpy.git@b3eff714300da7092864a3c35179d31baf97f799
+requests==2.33.1
+rich==15.0.0
+scipy==1.17.1
+Send2Trash==2.1.0
+shiboken6==6.11.0
+six==1.17.0
+taichi==1.7.4
+tifffile==2026.5.2
+urllib3==2.6.3
+win32-setctime==1.2.0
+zstandard==0.25.0

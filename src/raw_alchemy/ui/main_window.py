@@ -1,39 +1,28 @@
-import sys
+﻿import sys
 import os
-import shutil
-import time
-import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
-    QFileDialog, QListWidget, QListWidgetItem, QFrame,
-    QSplitter, QSizePolicy, QGraphicsDropShadowEffect, QGridLayout,
-    QInputDialog, QMessageBox, QTreeView, QHeaderView
+    QListWidget, QFrame, QSplitter, QSizePolicy, QTreeView,
 )
 from PySide6.QtWidgets import QFileSystemModel as _QFileSystemModel
 from PySide6.QtCore import QDir
-from PySide6.QtCore import Qt, QSize, QThread, Signal, QObject, QTimer, QEvent, QRect
-from PySide6.QtGui import QIcon, QPixmap, QImage, QPainter, QColor, QResizeEvent
+from PySide6.QtCore import Qt, QSize, QTimer, QEvent, QRect
+from PySide6.QtGui import QIcon, QPixmap, QImage
 
 from qfluentwidgets import (
-    FluentWindow, SubtitleLabel, PrimaryPushButton, 
-    CaptionLabel, StrongBodyLabel, BodyLabel, 
-    SimpleCardWidget, ScrollArea, InfoBar, Theme, setTheme, 
-    FluentIcon as FIF, ProgressRing, ComboBox,
-    ToolButton, PushButton, MessageBoxBase, CheckBox
+    FluentWindow, SubtitleLabel, PrimaryPushButton,
+    CaptionLabel, InfoBar, Theme, setTheme,
+    FluentIcon as FIF, ProgressRing,
+    ToolButton, PushButton,
 )
 
-from raw_alchemy import config, utils, orchestrator, lensfun_wrapper, i18n
+from raw_alchemy import lensfun_wrapper, i18n, sidecar
 from raw_alchemy.i18n import tr
 from loguru import logger
 
 # New structure imports
-from raw_alchemy.pipeline.state import ImageState
-from raw_alchemy.pipeline.processor import ImageProcessor
-from raw_alchemy.workers.thumbnail_worker import ThumbnailWorker
-from raw_alchemy.workers.version_worker import VersionCheckWorker
-from raw_alchemy.ui.widgets.histogram import HistogramWidget
-from raw_alchemy.ui.widgets.waveform import WaveformWidget
-from raw_alchemy.ui.widgets.gallery_item import GalleryItem
+from raw_alchemy.ui.image_state import ImageState
+from raw_alchemy.workers.image_processor import ImageProcessor
 from raw_alchemy.ui.widgets.inspector_panel import InspectorPanel
 from raw_alchemy.ui.widgets.title_bar import CenteredFluentTitleBar
 from raw_alchemy.ui.widgets.crop_rotate_viewer import CropRotateViewer
@@ -42,39 +31,13 @@ from raw_alchemy.ui.widgets.help_panel import HelpPanel
 from raw_alchemy.ui.widgets.about_panel import AboutPanel
 from raw_alchemy.ui.viewport_gl import ImageViewportGL
 from raw_alchemy.ui.widgets.settings_panel import SettingsPanel
+from raw_alchemy.ui.edit_modes import EditModesMixin
+from raw_alchemy.ui.export_controller import ExportControllerMixin
+from raw_alchemy.ui.library_controller import LibraryControllerMixin
 from PySide6.QtWidgets import QStackedWidget
 
-class BatchExportDialog(MessageBoxBase):
-    """Dialog for batch export settings"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.titleLabel = SubtitleLabel(tr("batch_export_settings"), self)
-        
-        # Format Selection
-        self.formatLabel = BodyLabel(tr("select_format"), self)
-        self.formatComboBox = ComboBox(self)
-        self.formatComboBox.addItems(["JPEG", "HEIF", "TIFF", "DNG"])
-        self.formatComboBox.setCurrentIndex(0)
-        
-        # Disable LUT Option
-        self.disableLutCheckBox = CheckBox(tr("disable_lut_globally"), self)
-        self.disableLutCheckBox.setChecked(False)
-        
-        # Layout
-        self.viewLayout.addWidget(self.titleLabel)
-        self.viewLayout.addWidget(self.formatLabel)
-        self.viewLayout.addWidget(self.formatComboBox)
-        self.viewLayout.addWidget(self.disableLutCheckBox)
-        
-        self.widget.setMinimumWidth(350)
-        
-    def get_settings(self):
-        return {
-            "format": self.formatComboBox.currentText(),
-            "ignore_lut": self.disableLutCheckBox.isChecked()
-        }
 
-class MainWindow(FluentWindow):
+class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, FluentWindow):
     def __init__(self):
         # Initialize image states BEFORE super().__init__() to avoid resizeEvent issues
         # FluentWindow.__init__ may trigger resizeEvent during initialization
@@ -83,7 +46,7 @@ class MainWindow(FluentWindow):
         self.baseline = ImageState()  # Saved baseline (optional)
         
         super().__init__()
-        # 替换为“真正居中”的标题栏，避免 resize 拖动期间跳左
+        # Use a centered custom title bar to avoid left jumps while resizing.
         self.setTitleBar(CenteredFluentTitleBar(self))
 
         self.base_title = "Raw Alchemy Studio"
@@ -98,6 +61,7 @@ class MainWindow(FluentWindow):
         self.gallery_items_by_path = {}
         self.file_params_cache = {}  # path -> params dict
         self.file_baseline_params_cache = {}  # path -> baseline params dict
+        self.write_sidecar_enabled = True
         
         # Last used paths for file dialogs
         self.last_folder_path = None  # Last opened gallery folder
@@ -109,7 +73,7 @@ class MainWindow(FluentWindow):
         self.current_request_id = 0
         self._suppress_gallery_change = False
         
-        # 预加载lensfun数据库（在后台线程中）
+        # Preload lensfun database in the background.
         self._preload_lensfun_database()
         
         self.create_ui()
@@ -126,28 +90,20 @@ class MainWindow(FluentWindow):
         self.processor.denoise_started.connect(self.on_denoise_started)
         self.processor.denoise_progress.connect(self.on_denoise_progress)
         self.processor.denoise_finished.connect(self.on_denoise_finished)
+        self.processor.preview_source_changed.connect(self.right_panel.update_scope_source)
         
         # Denoise progress dialog
         self.denoise_progress_dialog = None
+        
+        # Baseline processor
+        self.baseline_processor = ImageProcessor()
+        self.baseline_processor.result_ready.connect(self.on_baseline_result)
         
         # Processing Debounce
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
         self.update_timer.setInterval(150) # 150ms debounce
         self.update_timer.timeout.connect(self.trigger_processing)
-        self._preview_interaction_active = False
-        self._interactive_preview_max_pixels = 4_000_000
-        self._detail_preview_max_pixels = 0
-        self._needs_detail_after_preview = False
-        self._interactive_dirty = False
-        self._pending_preview_request_id = None
-        self._pending_detail_request_id = None
-        self._pending_preview_content_key = None
-        self._pending_detail_content_key = None
-        self._last_preview_content_key = None
-        self._last_detail_content_key = None
-        self._last_preview_request_time = 0.0
-        self._interactive_preview_min_interval_ms = 140
 
         self._preload_neighbors_args = None
         self._preload_neighbors_timer = QTimer()
@@ -157,17 +113,13 @@ class MainWindow(FluentWindow):
 
         self._zoom_update_timer = QTimer()
         self._zoom_update_timer.setSingleShot(True)
-        self._zoom_update_timer.setInterval(650)
-        self._zoom_update_timer.timeout.connect(lambda: self.trigger_processing(detail=True))
+        self._zoom_update_timer.setInterval(220)
+        self._zoom_update_timer.timeout.connect(self.trigger_processing)
 
-        self._interactive_update_timer = QTimer()
-        self._interactive_update_timer.setSingleShot(True)
-        self._interactive_update_timer.timeout.connect(self._run_interactive_preview_update)
-
-        self._detail_update_timer = QTimer()
-        self._detail_update_timer.setSingleShot(True)
-        self._detail_update_timer.setInterval(80)
-        self._detail_update_timer.timeout.connect(lambda: self.trigger_processing(detail=True))
+        self._sidecar_write_timer = QTimer()
+        self._sidecar_write_timer.setSingleShot(True)
+        self._sidecar_write_timer.setInterval(2000)
+        self._sidecar_write_timer.timeout.connect(self._persist_current_sidecar_now)
         
         # Load saved settings
         self.load_settings()
@@ -178,7 +130,7 @@ class MainWindow(FluentWindow):
         self.processor_connection_mode = 'normal' # 'normal', 'crop', or 'perspective'
 
     def systemTitleBarRect(self, size: QSize):
-        """macOS: 预留系统红黄绿按钮区域（避免被自绘标题栏覆盖）"""
+        """macOS: reserve the system traffic-light button area."""
         if sys.platform != "darwin":
             return super().systemTitleBarRect(size)
 
@@ -186,7 +138,7 @@ class MainWindow(FluentWindow):
         return QRect(0, y, 100, size.height())
 
     def update_window_title(self):
-        """更新窗口标题以显示当前文件名"""
+        """Update the window title with the current filename."""
         if self.current_raw_path:
             filename = os.path.basename(self.current_raw_path)
             self.setWindowTitle(f"{self.base_title} - {filename}")
@@ -215,12 +167,12 @@ class MainWindow(FluentWindow):
         return icon_path
 
     def _preload_lensfun_database(self):
-        """在后台线程中预加载lensfun数据库，避免阻塞GUI启动"""
+        """Preload the lensfun database without blocking GUI startup."""
         def preload():
             try:
                 lensfun_wrapper._get_or_create_database(custom_db_path=None)
             except Exception as e:
-                logger.error(f"  ⚠️ [Lensfun] Failed to preload database: {e}")
+                logger.error(f"[Lensfun] Failed to preload database: {e}")
         
         import threading
         preload_thread = threading.Thread(target=preload, daemon=True)
@@ -249,6 +201,10 @@ class MainWindow(FluentWindow):
         
         if 'last_export_path' in settings:
             self.last_export_path = settings['last_export_path']
+
+        self.write_sidecar_enabled = settings.get('write_sidecar', True)
+        if hasattr(self, 'settings_widget'):
+            self.settings_widget.set_write_sidecar_enabled(self.write_sidecar_enabled)
     
     def restore_ui(self):
         """Restore UI state from saved settings"""
@@ -269,7 +225,7 @@ class MainWindow(FluentWindow):
     def _on_directory_loaded(self, loaded_path):
         """When a directory is loaded, check if we need to keep expanding towards the target."""
         if not self._pending_scroll_path:
-            # New directories loading may shift layout — debounce a final scroll
+            # New directories loading may shift layout; debounce a final scroll.
             if self._scroll_target_path:
                 self._scroll_debounce_timer.start()
             return
@@ -277,7 +233,7 @@ class MainWindow(FluentWindow):
         norm_target = os.path.normpath(self._pending_scroll_path).lower()
 
         if norm_loaded == norm_target:
-            # Target directory loaded — select and scroll
+            # Target directory loaded; select and scroll.
             target = self._pending_scroll_path
             self._pending_scroll_path = None
             self._expand_tree_to(target)
@@ -286,7 +242,7 @@ class MainWindow(FluentWindow):
             # Use rstrip to handle drive roots like "C:\" correctly
             norm_loaded_prefix = norm_loaded.rstrip(os.sep) + os.sep
             if norm_target.startswith(norm_loaded_prefix):
-                # An ancestor was loaded — expand the next level towards target
+                # An ancestor was loaded; expand the next level toward target.
                 remaining = os.path.normpath(self._pending_scroll_path)[len(norm_loaded_prefix):]
                 next_name = remaining.split(os.sep)[0]
                 next_path = os.path.join(loaded_path, next_name)
@@ -314,7 +270,8 @@ class MainWindow(FluentWindow):
             'last_folder_path': self.current_folder,
             'last_lut_folder_path': self.last_lut_folder_path,
             'last_lensfun_db_path': self.last_lensfun_db_path,
-            'last_export_path': self.last_export_path
+            'last_export_path': self.last_export_path,
+            'write_sidecar': self.write_sidecar_enabled,
         }
         i18n.save_app_settings(settings)
 
@@ -336,7 +293,7 @@ class MainWindow(FluentWindow):
         except Exception:
             pass
         
-        # 1. Left Panel (Folder Tree + Gallery) — Bridge-style browser
+        # 1. Left Panel (Folder Tree + Gallery): Bridge-style browser
         self.left_panel = QWidget()
         self.left_panel.setFixedWidth(400)
         self.left_panel.setStyleSheet("background-color: transparent;")
@@ -394,7 +351,6 @@ class MainWindow(FluentWindow):
         self.gallery_list.setGridSize(QSize(160, 140))
         self.gallery_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.gallery_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.gallery_list.setUniformItemSizes(True)
         self.gallery_list.setSpacing(10)
         self.gallery_list.setDragEnabled(False)
         self.gallery_list.setAcceptDrops(False)
@@ -550,8 +506,6 @@ class MainWindow(FluentWindow):
         self.right_panel = InspectorPanel()
         self.right_panel.setFixedWidth(360) 
         self.right_panel.param_changed.connect(self.on_param_changed)
-        self.right_panel.param_interaction_started.connect(self.on_param_interaction_started)
-        self.right_panel.param_interaction_finished.connect(self.on_param_interaction_finished)
         self.right_panel.enter_crop_mode.connect(self.enter_crop_mode)
         self.right_panel.enter_perspective_mode.connect(self.enter_perspective_mode)
         self.right_panel.save_baseline_btn.clicked.connect(self.save_baseline_image)
@@ -577,7 +531,66 @@ class MainWindow(FluentWindow):
     def create_settings_interface(self):
         self.settings_widget = SettingsPanel()
         self.settings_widget.setObjectName("settingsInterface")
+        self.settings_widget.write_sidecar_changed.connect(self.on_write_sidecar_changed)
         self.addSubInterface(self.settings_widget, FIF.SETTING, tr('settings'))
+
+    def on_write_sidecar_changed(self, enabled):
+        self.write_sidecar_enabled = bool(enabled)
+        if self.write_sidecar_enabled:
+            if self.current_folder:
+                self._load_sidecars_for_folder(self.current_folder)
+            self._persist_current_sidecar_now()
+
+    def _load_sidecars_for_folder(self, folder):
+        if not self.write_sidecar_enabled:
+            return
+        for path, data in sidecar.load_folder_sidecars(folder).items():
+            if data.params and path not in self.file_params_cache:
+                self.file_params_cache[path] = data.params.copy()
+            if data.marked:
+                self.marked_files.add(path)
+
+    def _load_sidecar_for_path(self, path):
+        if not self.write_sidecar_enabled:
+            return None
+        data = sidecar.read_sidecar(path)
+        if data is None:
+            return None
+        if data.params and path not in self.file_params_cache:
+            self.file_params_cache[path] = data.params.copy()
+        if data.marked:
+            self.marked_files.add(path)
+        return data.params.copy()
+
+    def _cache_current_params(self):
+        if not self.current_raw_path or not hasattr(self, 'right_panel'):
+            return None
+        params = self.right_panel.get_params().copy()
+        self.file_params_cache[self.current_raw_path] = params
+        return params
+
+    def _write_sidecar_for_path(self, path, params=None):
+        if not self.write_sidecar_enabled or not path:
+            return
+        try:
+            if params is None:
+                if path == self.current_raw_path:
+                    params = self._cache_current_params()
+                else:
+                    params = self.file_params_cache.get(path, {})
+            sidecar.write_sidecar(path, params or {}, path in self.marked_files)
+        except Exception as e:
+            logger.warning(f"Failed to write sidecar for {path}: {e}")
+
+    def _persist_current_sidecar_now(self):
+        if not self.current_raw_path:
+            return
+        params = self._cache_current_params()
+        self._write_sidecar_for_path(self.current_raw_path, params)
+
+    def _schedule_current_sidecar_write(self):
+        if self.write_sidecar_enabled and self.current_raw_path:
+            self._sidecar_write_timer.start()
 
     def changeEvent(self, event):
         """Track window minimize/restore to suppress spurious gallery signals."""
@@ -585,7 +598,7 @@ class MainWindow(FluentWindow):
             old_minimized = bool(event.oldState() & Qt.WindowState.WindowMinimized)
             new_minimized = bool(self.windowState() & Qt.WindowState.WindowMinimized)
             if old_minimized and not new_minimized:
-                # Restoring from minimize — suppress currentItemChanged briefly
+                # Restoring from minimize; suppress currentItemChanged briefly.
                 self._suppress_gallery_change = True
                 QTimer.singleShot(500, self._unsuppress_gallery_change)
         super().changeEvent(event)
@@ -626,531 +639,16 @@ class MainWindow(FluentWindow):
                     return True
         return super().eventFilter(obj, event)
 
-    def browse_folder(self):
-        start_dir = self.last_folder_path if self.last_folder_path and os.path.exists(self.last_folder_path) else ""
-        folder = QFileDialog.getExistingDirectory(self, tr('select_folder'), start_dir)
-        if folder:
-            self._open_folder(folder)
-
-    def _on_folder_tree_clicked(self, index):
-        """Handle folder tree click — load thumbnails for selected directory"""
-
-        path = self.folder_model.filePath(index)
-        if path and os.path.isdir(path):
-            self._open_folder(path)
-
-    def _open_folder(self, folder):
-        """Open a folder: update state, sync tree selection, scan thumbnails"""
-        self.current_folder = folder
-        self.last_folder_path = folder
-        self.gallery_items_by_path.clear()
-        self.gallery_list.clear()
-
-        # Start chain-expansion: expand root ancestor, directoryLoaded will chain the rest
-        self._pending_scroll_path = folder
-        idx = self.folder_model.index(folder)
-        if idx.isValid():
-            ancestors = []
-            p = idx.parent()
-            while p.isValid():
-                ancestors.append(p)
-                p = p.parent()
-            if ancestors:
-                # Expand all ancestors from root towards target
-                for ancestor in reversed(ancestors):
-                    self.folder_tree.expand(ancestor)
-                # If ancestors were already loaded, directoryLoaded won't fire again,
-                # so use a fallback timer to finalize the selection
-                QTimer.singleShot(100, lambda f=folder: self._try_finalize_tree_selection(f))
-            else:
-                # Target is already at root level
-                self._pending_scroll_path = None
-                self._expand_tree_to(folder)
-        else:
-            # Index not yet valid (model still loading) — kick-start chain from drive root
-            drive = os.path.splitdrive(folder)[0]
-            if drive:
-                root_path = drive + os.sep
-                root_idx = self.folder_model.index(root_path)
-                if root_idx.isValid():
-                    self.folder_tree.expand(root_idx)
-            # directoryLoaded will chain-expand towards _pending_scroll_path
-
-        self.start_thumbnail_scan(folder)
-
-    def _try_finalize_tree_selection(self, folder):
-        """Fallback: if chain expansion via directoryLoaded didn't reach the target
-        (because ancestors were already loaded/expanded), select directly."""
-        if self._pending_scroll_path == folder:
-            self._pending_scroll_path = None
-            self._expand_tree_to(folder)
-
-    def _expand_tree_to(self, folder):
-        """Expand the folder tree view to show and select the given folder path."""
-        idx = self.folder_model.index(folder)
-        if not idx.isValid():
-            return
-        # Collect ancestors from root down
-        ancestors = []
-        p = idx.parent()
-        while p.isValid():
-            ancestors.append(p)
-            p = p.parent()
-        # Expand from root towards target
-        for ancestor in reversed(ancestors):
-            self.folder_tree.expand(ancestor)
-        self.folder_tree.setCurrentIndex(idx)
-        # Don't scrollTo now — directories are still loading and will shift layout.
-        # Set scroll target and start debounce; final scroll happens when loading settles.
-        self._scroll_target_path = folder
-        self._scroll_debounce_timer.start()
-
-    def _do_final_scroll(self):
-        """Scroll to target folder after directory loading has settled (debounced)."""
-        if not self._scroll_target_path:
-            return
-        idx = self.folder_model.index(self._scroll_target_path)
-        if idx.isValid():
-            self.folder_tree.scrollTo(idx, QTreeView.ScrollHint.PositionAtCenter)
-        self._scroll_target_path = None
-
-    def start_thumbnail_scan(self, folder):
-        if self.thumb_worker:
-            self.thumb_worker.stop()
-            self.thumb_worker.wait()
-        
-        self.loading_label.setText(tr('loading_thumbnails'))
-        self.loading_label.show()
-        
-        self.thumb_worker = ThumbnailWorker(folder)
-        self.thumb_worker.placeholders_ready.connect(self.add_gallery_items)
-        self.thumb_worker.thumbnail_ready.connect(self.update_gallery_item)
-        self.thumb_worker.progress_update.connect(self.on_thumbnail_progress)
-        self.thumb_worker.finished_scanning.connect(self.on_thumbnail_finished)
-        self.thumb_worker.start()
-    
-    def update_status(self, text):
-        self.loading_label.setText(text)
-        if text:
-            self.loading_label.show()
-        else:
-            self.loading_label.hide()
-            
-    # --- Crop Mode Handling ---
-    
-    def enter_crop_mode(self):
-        """Switch to Crop/Rotate view"""
-        if not self.current_raw_path: return
-        
-        # [Fix Issue 2] If already in crop mode, this button acts as "Done"
-        if self.center_stack.currentWidget() == self.crop_viewer:
-            self.crop_viewer._on_done()
-            return
-            
-        logger.info("Entering Crop Mode...")
-         
-        # 1. Disable standard processing updates temporarily
-        self.update_timer.stop()
-        
-        # 2. Get current params
-        params = self.file_params_cache.get(self.current_raw_path, {}).copy()
-        
-        # 3. We need the "Base" image (Linear + Lens Corrected ONLY).
-        # The crop viewer needs to see the UN-ROTATED, UN-CROPPED image to allow user to edit it.
-        # However, for performance, we should ask the processor for the cached linear/corrected data.
-        # But Processor communicates via signals.
-        # Strategy: Send a special request or leverage the fact that we process in layers?
-        # Actually, we can just grab the current 'linear' or 'corrected' from processor if we had access, 
-        # but thread safety.
-        # `self.original` in MainWindow is RAW decoded? No, `ImageState` just holds generic objects.
-        # `self.original` is populated in `on_load_complete`? No, it's not currently used much.
-        
-        # Let's request a special "preview_for_crop" from processor?
-        # Or just use the original raw loading logic?
-        # 
-        # Hack/Fast path: Access processor.cached_corrected directly? (Not thread safe technically but Python GIL helps)
-        # Proper way: request_id.
-        
-        # Let's implement a "request_base_image" signal/slot.
-        # For now, let's just trigger a process with "Geometry=Defaults" and "Color=Defaults"?
-        # But that applies display transform etc.
-        # The CropViewer expects a PIXMAP.
-        
-        # Let's add a sync method or callback to get the current base image from processor.
-        # Or... since we are in Python, let's cheat slightly and read the cache if the worker is idle?
-        # No, let's do it properly:
-        # We emit a signal to processor "get_crop_source(path)". Processor replies with signals.
-        
-        # Simpler: The `CropRotateViewer` takes the current display image? No, that's already cropped.
-        # 
-        # NEW PLAN: 
-        # When entering crop mode, we take the *current* params, 
-        # set rotation=0, flip=False, crop=None,
-        # request a preview update with a special flag `_for_crop=True`?
-        # The processor generates the image (which will hit the Corrected Cache) and emits result.
-        # We intercept this result.
-        
-        # To distinguish this result from normal preview: use `request_id`.
-        # Track ID for crop mode
-        # self.crop_request_id = self.processor.current_request_id + 100000 
-        # Actually we can't force ID.
-        # We can just track the ID returned by update_preview? 
-        # But update_preview returns nothing, just queues.
-        
-        # Let's assume we request an update with specific params. Parameters are the key.
-        base_params = params.copy()
-        base_params['rotation'] = 0
-        base_params['flip_horizontal'] = False
-        base_params['flip_vertical'] = False
-        base_params['crop'] = (0.0, 0.0, 1.0, 1.0)
-        # Keep Lens Correction!
-        # Disable others for speed? Or user wants to see exposure while cropping?
-        # Usually we want to see exposure. So keep exposure/color.
-        # Just reset Geometry.
-        
-        self.processor_connection_mode = 'crop' # State flag
-        self.crop_request_id = self.processor.update_preview(self.current_raw_path, base_params)
-        
-        self.update_status(tr('loading_crop_view'))
-        
-    def on_crop_ready(self, img_uint8, params_context):
-        """Called when processor finishes the image for Crop Viewer"""
-        # Convert to QPixmap
-        h, w, c = img_uint8.shape
-        img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(img)
-        
-        # Original Params (to retrieve current rotation/crop state)
-        current_params = self.file_params_cache.get(self.current_raw_path, {})
-        
-        # Initialize Viewer
-        self.crop_viewer.set_image(pixmap, current_params)
-        
-        # Switch View
-        self.center_stack.setCurrentWidget(self.crop_viewer)
-        self.loading_label.hide()
-
-    def on_crop_applied(self, rotation, flip_h, flip_v, crop_rect):
-        """User clicked Done"""
-        # Update Params
-        # We update the Inspector Panel, which updates its internal model and UI.
-        # Accessing private method or expose public setter? 
-        # `update_crop_params` was added to InspectorPanel.
-        self.right_panel.update_crop_params(rotation, flip_h, flip_v, crop_rect)
-        
-        self.exit_crop_mode()
-        
-    def exit_crop_mode(self):
-        """Return to normal view"""
-        logger.info("Exiting crop mode...")
-        
-        # [Fix Issue 1] Generate temporary preview to prevent "jump" back to old state
-        # effectively masking the lag while the processor works in background
-        try:
-            if self.crop_viewer.display_pixmap:
-                full_pix = self.crop_viewer.display_pixmap
-                w = full_pix.width()
-                h = full_pix.height()
-                cx, cy, cw, ch = self.crop_viewer.crop_rect
-                px = int(cx * w)
-                py = int(cy * h)
-                pw = int(cw * w)
-                ph = int(ch * h)
-                if pw > 0 and ph > 0:
-                    temp_preview = full_pix.copy(px, py, pw, ph)
-                    # Convert QPixmap to numpy uint8 for GL viewport
-                    qimg = temp_preview.toImage().convertToFormat(QImage.Format.Format_RGB888)
-                    ptr = qimg.bits()
-                    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(qimg.height(), qimg.width(), 3).copy()
-                    self.viewport.set_image(arr)
-        except Exception as e:
-            logger.warning(f"Failed to generate temp preview: {e}")
-
-        self.processor_connection_mode = 'normal'
-        self.center_stack.setCurrentWidget(self.page_preview)
-        
-        # Re-enable standard processing updates
-        self.update_timer.stop() # Stop any pending
-        
-        # Trigger re-process with current params from the panel
-        # This ensuring we use the latest state (including crop if applied, or old if cancelled)
-        if self.current_raw_path:
-            # Update cache immediately with new crop params
-            self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
-            # Trigger processing (handles request_id increment and viewport optimization)
-            self.trigger_processing()
-        
-    # --- Perspective Mode Handling ---
-    
-    def enter_perspective_mode(self):
-        """Switch to Perspective Correction view"""
-        if not self.current_raw_path: return
-        
-        # If already in perspective mode, this button acts as "Done"
-        if self.center_stack.currentWidget() == self.perspective_viewer:
-            self.perspective_viewer._on_done()
-            return
-            
-        logger.info("Entering Perspective Mode...")
-         
-        # 1. Disable standard processing updates temporarily
-        self.update_timer.stop()
-        
-        # 2. Get current params
-        params = self.file_params_cache.get(self.current_raw_path, {}).copy()
-        
-        # 3. Request base image (without geometry/perspective/crop applied)
-        base_params = params.copy()
-        base_params['rotation'] = 0
-        base_params['flip_horizontal'] = False
-        base_params['flip_vertical'] = False
-        base_params['perspective_corners'] = None  # Reset perspective
-        base_params['crop'] = (0.0, 0.0, 1.0, 1.0)
-        
-        self.processor_connection_mode = 'perspective'
-        self.perspective_request_id = self.processor.update_preview(self.current_raw_path, base_params)
-        
-        self.update_status(tr('loading_perspective_view'))
-        
-    def on_perspective_ready(self, img_uint8, params_context):
-        """Called when processor finishes the image for Perspective Viewer"""
-        # Convert to QPixmap
-        h, w, c = img_uint8.shape
-        from PySide6.QtGui import QImage, QPixmap
-        img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(img)
-        
-        # Original Params (to retrieve current perspective state)
-        current_params = self.file_params_cache.get(self.current_raw_path, {})
-        
-        # Initialize Viewer
-        self.perspective_viewer.set_image(pixmap, current_params)
-        
-        # Switch View
-        self.center_stack.setCurrentWidget(self.perspective_viewer)
-        self.loading_label.hide()
-
-    def on_perspective_applied(self, corners):
-        """User clicked Done in perspective viewer"""
-        # Update Params in cache
-        if self.current_raw_path:
-            current_params = self.file_params_cache.get(self.current_raw_path, {})
-            current_params['perspective_corners'] = corners
-            self.file_params_cache[self.current_raw_path] = current_params
-            # Also update InspectorPanel internal state
-            self.right_panel.set_params(current_params)
-        
-        self.exit_perspective_mode()
-        
-    def exit_perspective_mode(self):
-        """Return to normal view from perspective mode"""
-        logger.info("Exiting perspective mode...")
-
-        self.processor_connection_mode = 'normal'
-        self.center_stack.setCurrentWidget(self.page_preview)
-        
-        # Re-enable standard processing updates
-        self.update_timer.stop()
-        
-        # Trigger re-process with current params
-        if self.current_raw_path:
-            self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
-            self.trigger_processing()
-        
-    # Modify on_process_result to handle specific crop flow?
-    # We need to intercept the result.
-    
-    # ... In next edit, I will patch `on_process_result` ...
-    def on_thumbnail_progress(self, current, total):
-        self.loading_label.setText(f"{tr('loading_thumbnails')}: {current}/{total}")
-    
-    def on_thumbnail_finished(self):
-        self.loading_label.hide()
-        if self.current_raw_path:
-            current_row = self.gallery_list.currentRow()
-            if current_row >= 0:
-                self._preload_neighbors(current_row, count=2)
-
-    def add_gallery_item(self, path, image):
-        name = os.path.basename(path)
-        pixmap = QPixmap.fromImage(image)
-        
-        item = QListWidgetItem()
-        item.setData(Qt.ItemDataRole.UserRole, path)
-        item.setIcon(QIcon(pixmap))
-        
-        is_marked = path in self.marked_files
-        item.setText(f"🟢 {name}" if is_marked else name)
-        
-        self.gallery_list.addItem(item)
-        self.gallery_items_by_path[path] = item
-
-    def add_gallery_items(self, paths, image):
-        pixmap = QPixmap.fromImage(image)
-        icon = QIcon(pixmap)
-
-        updates_were_enabled = self.gallery_list.updatesEnabled()
-        self.gallery_list.setUpdatesEnabled(False)
-        try:
-            for path in paths:
-                name = os.path.basename(path)
-                item = QListWidgetItem()
-                item.setData(Qt.ItemDataRole.UserRole, path)
-                item.setIcon(icon)
-
-                is_marked = path in self.marked_files
-                item.setText(f"馃煝 {name}" if is_marked else name)
-
-                self.gallery_list.addItem(item)
-                self.gallery_items_by_path[path] = item
-        finally:
-            self.gallery_list.setUpdatesEnabled(updates_were_enabled)
-            self.gallery_list.viewport().update()
-
-    def update_gallery_item(self, path, image):
-        """Replace placeholder thumbnail with actual image."""
-        item = self.gallery_items_by_path.get(path)
-        if item is None:
-            return
-        pixmap = QPixmap.fromImage(image)
-        item.setIcon(QIcon(pixmap))
-        rect = self.gallery_list.visualItemRect(item)
-        self.gallery_list.viewport().update(rect)
-
-    def _update_current_gallery_thumbnail_from_preview(self, img_uint8):
-        """Refresh the current gallery thumbnail after a low-frequency detail render."""
-        if not self.current_raw_path:
-            return
-        item = self.gallery_items_by_path.get(self.current_raw_path)
-        if item is None or img_uint8 is None or img_uint8.ndim != 3:
-            return
-
-        h, w, c = img_uint8.shape
-        if c < 3 or h <= 0 or w <= 0:
-            return
-
-        thumb_data = np.ascontiguousarray(img_uint8[:, :, :3])
-        image = QImage(
-            thumb_data.data,
-            w,
-            h,
-            3 * w,
-            QImage.Format.Format_RGB888,
-        ).copy()
-        image = image.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
-        item.setIcon(QIcon(QPixmap.fromImage(image)))
-        rect = self.gallery_list.visualItemRect(item)
-        self.gallery_list.viewport().update(rect)
-
-    def on_gallery_item_clicked(self, item):
-        if not item: return
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if path == self.current_raw_path: return
-        
-        if self.current_raw_path:
-            self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
-        
-        self.current_raw_path = path
-        self.update_window_title()
-        
-        self.original.clear()
-        self.current.clear()
-        self.baseline.clear()
-        
-        if self.right_panel.auto_exp_radio.isChecked():
-            self.right_panel.auto_ev_value = 0.0
-            self.right_panel.exp_slider.blockSignals(True)
-            self.right_panel.exp_slider.setValue(0)
-            self.right_panel.exp_slider.update()
-            self.right_panel.exp_slider.blockSignals(False)
-            self.right_panel.exp_value_label.setText(f"{tr('exposure_ev')}: 0.0")
-        
-        if path in self.file_params_cache:
-            self.right_panel.set_params(self.file_params_cache[path])
-        else:
-            # [Fix Issue 11] New image: Reset geometry (crop/rotate) but keep other sticky settings
-            # We get the current params from the panel (which still holds the previous image's state or defaults)
-            current_sticky_params = self.right_panel.get_params()
-            
-            # Reset geometry defaults
-            current_sticky_params['rotation'] = 0
-            current_sticky_params['flip_horizontal'] = False
-            current_sticky_params['flip_vertical'] = False
-            current_sticky_params['crop'] = (0.0, 0.0, 1.0, 1.0)
-            
-            # Apply back to panel so the UI reflects the reset and next get_params() is correct
-            self.right_panel.set_params(current_sticky_params)
-        
-        self.update_mark_button_state()
-        self.load_image(path)
-
-        current_row = self.gallery_list.row(item)
-        self._preload_neighbors(current_row)
-
-    def load_image(self, path):
-        self.preview_lbl.setText(tr('loading'))
-        self.viewport.clear_image()
-        self._pending_preview_request_id = None
-        self._pending_detail_request_id = None
-        self._pending_preview_content_key = None
-        self._pending_detail_content_key = None
-        self._last_preview_content_key = None
-        self._last_detail_content_key = None
-        self._interactive_update_timer.stop()
-        self.current_request_id = self.processor.load_image(path)
-
-    def _preload_neighbors(self, current_index, count=2):
-        self._preload_neighbors_args = (current_index, count, self.current_raw_path)
-        self._preload_neighbors_timer.start()
-
-    def _run_preload_neighbors(self):
-        if not self._preload_neighbors_args:
-            return
-        current_index, count, expected_path = self._preload_neighbors_args
-        self._preload_neighbors_args = None
-        if expected_path != self.current_raw_path:
-            return
-
-        total = self.gallery_list.count()
-        for offset in range(1, count + 1):
-            for idx in [current_index + offset, current_index - offset]:
-                if 0 <= idx < total:
-                    path = self.gallery_list.item(idx).data(Qt.ItemDataRole.UserRole)
-                    if not self.processor.cache_manager.get(path):
-                        self.processor.preload_image(path)
-
     def on_param_changed(self, params):
-        if self._preview_interaction_active:
-            self.update_timer.stop()
-            self._detail_update_timer.stop()
-            self._schedule_interactive_preview_update()
-        else:
-            self._needs_detail_after_preview = True
-            self._detail_update_timer.stop()
-            self.update_timer.start()
-
-    def on_param_interaction_started(self):
-        self._preview_interaction_active = True
-        self._needs_detail_after_preview = False
-        self._interactive_dirty = False
-        self.update_timer.stop()
-        self._detail_update_timer.stop()
-        self._interactive_update_timer.stop()
-
-    def on_param_interaction_finished(self, params):
-        self._preview_interaction_active = False
-        self._interactive_dirty = False
-        self._needs_detail_after_preview = True
-        self._interactive_update_timer.stop()
+        if self.current_raw_path:
+            self.file_params_cache[self.current_raw_path] = params.copy()
+            self._schedule_current_sidecar_write()
         self.update_timer.start()
-        self._detail_update_timer.stop()
 
     def _on_viewport_zoom_changed(self, zoom):
         if not self.current_raw_path:
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
-            return
-        if self._detail_display_is_current():
             return
         self._zoom_update_timer.start()
 
@@ -1160,149 +658,60 @@ class MainWindow(FluentWindow):
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
             return
-        if self._detail_display_is_current():
-            return
         self._zoom_update_timer.start()
 
-    def _add_preview_output_params(self, params, max_preview_pixels=None):
+    def _add_preview_output_params(self, params):
         params = params.copy()
         size = self.viewport.size()
         params['viewport_size'] = (size.width(), size.height())
         params['preview_zoom'] = self.viewport.preview_zoom()
-        if max_preview_pixels is not None:
-            params['max_preview_pixels'] = max_preview_pixels
         try:
             params['device_pixel_ratio'] = float(self.viewport.devicePixelRatioF())
         except Exception:
             params['device_pixel_ratio'] = 1.0
         return params
 
-    def _get_preview_params(self, detail=False):
-        max_pixels = self._detail_preview_max_pixels if detail else self._interactive_preview_max_pixels
-        params = self._add_preview_output_params(
-            self.right_panel.get_params(),
-            max_preview_pixels=max_pixels,
-        )
-        params['_detail_preview'] = bool(detail)
-        return params
-
-    @staticmethod
-    def _freeze_param_value(value):
-        if isinstance(value, dict):
-            return tuple(sorted((k, MainWindow._freeze_param_value(v)) for k, v in value.items()))
-        if isinstance(value, (list, tuple)):
-            return tuple(MainWindow._freeze_param_value(v) for v in value)
-        return value
-
-    def _detail_content_key(self, params):
-        ignored = {
-            'viewport_size',
-            'preview_zoom',
-            'device_pixel_ratio',
-            'max_preview_pixels',
-            'tile_preview_pixels',
-            'tile_preview_threshold',
-            'tile_overlap_pixels',
-            '_detail_preview',
-        }
-        return (
-            self.current_raw_path,
-            tuple(sorted(
-                (k, self._freeze_param_value(v))
-                for k, v in params.items()
-                if k not in ignored
-            )),
-        )
-
-    def _preview_content_key(self, params):
-        return (
-            self.current_raw_path,
-            tuple(sorted(
-                (k, self._freeze_param_value(v))
-                for k, v in params.items()
-            )),
-        )
-
-    def _detail_display_is_current(self):
-        if not self.viewport.display_is_full_resolution():
-            return False
-        params = self._get_preview_params(detail=True)
-        return self._last_detail_content_key == self._detail_content_key(params)
-
-    def _schedule_interactive_preview_update(self):
-        self._interactive_dirty = True
-        if self._pending_preview_request_id is not None:
-            return
-
-        elapsed_ms = (time.perf_counter() - self._last_preview_request_time) * 1000.0
-        delay_ms = max(0, int(self._interactive_preview_min_interval_ms - elapsed_ms))
-        if delay_ms <= 0:
-            self._run_interactive_preview_update()
-        elif not self._interactive_update_timer.isActive():
-            self._interactive_update_timer.start(delay_ms)
-
-    def _run_interactive_preview_update(self):
-        if not self.current_raw_path or not self._preview_interaction_active:
-            return
-        if self._pending_preview_request_id is not None:
-            self._interactive_dirty = True
-            return
-        self._interactive_dirty = False
-        self.trigger_processing(detail=False)
+    def _get_preview_params(self):
+        return self._add_preview_output_params(self.right_panel.get_params())
     
-    def trigger_processing(self, detail=False):
+    def trigger_processing(self):
         if not self.current_raw_path: return
-        if detail and self._preview_interaction_active:
-            return
-        params = self._get_preview_params(detail=detail)
-        detail_key = self._detail_content_key(params)
-        if detail:
-            if (self._pending_preview_request_id is not None
-                    or self.update_timer.isActive()
-                    or self._interactive_update_timer.isActive()
-                    or self._interactive_dirty):
-                self._needs_detail_after_preview = True
-                self._detail_update_timer.start()
-                return
-            if (self._pending_detail_request_id is not None
-                    and self._pending_detail_content_key == detail_key):
-                return
-            if self._last_detail_content_key == detail_key and self.viewport.display_is_full_resolution():
-                return
-        else:
-            preview_key = self._preview_content_key(params)
-            if (self._pending_preview_request_id is not None
-                    and self._pending_preview_content_key == preview_key):
-                return
-            if self._last_preview_content_key == preview_key:
-                return
-            if self._last_detail_content_key != detail_key:
-                self._last_detail_content_key = None
-            self._pending_detail_request_id = None
-            self._pending_detail_content_key = None
-
-        request_id = self.processor.update_preview(self.current_raw_path, params)
-        self.current_request_id = request_id
-        if detail:
-            self._pending_detail_request_id = request_id
-            self._pending_detail_content_key = detail_key
-            self._needs_detail_after_preview = False
-        else:
-            self._pending_preview_request_id = request_id
-            self._pending_preview_content_key = preview_key
-            self._last_preview_request_time = time.perf_counter()
+        params = self._get_preview_params()
+        self.current_request_id = self.processor.update_preview(self.current_raw_path, params)
     
     def save_baseline_image(self):
         if not self.current_raw_path: return
         current_params = self.right_panel.get_params()
         self.file_baseline_params_cache[self.current_raw_path] = current_params.copy()
 
-        if self.current.uint8_data is not None:
-            self.baseline.update_data(
-                None,
-                self.current.uint8_data.copy(),
-                source_size=self.current.source_size,
+        if self.processor.cpu_linear is not None:
+            # Share CPU cache so baseline processor can load from it
+            self.baseline_processor.cache_manager = self.processor.cache_manager
+            self.baseline_processor.update_preview(
+                self.current_raw_path,
+                self._add_preview_output_params(current_params),
             )
+
+        InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
+    
+        
+    def on_baseline_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
+        if image_path != self.current_raw_path: return
+        h, w, c = img_uint8.shape
+        qimg = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg.copy())
+        self.baseline.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
+    
+    def regenerate_baseline_for_current_image(self):
+        if not self.current_raw_path or self.current_raw_path not in self.file_baseline_params_cache: return
+        if not self.processor.cpu_linear is not None: return
+
+        baseline_params = self.file_baseline_params_cache[self.current_raw_path]
+        self.baseline_processor.cache_manager = self.processor.cache_manager
+        self.baseline_processor.update_preview(
+            self.current_raw_path,
+            self._add_preview_output_params(baseline_params),
+        )
 
     def on_process_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
         """Handle processing result"""
@@ -1328,20 +737,26 @@ class MainWindow(FluentWindow):
                 self.on_perspective_ready(img_uint8, None)
             return
 
+        h, w, c = img_uint8.shape
+        img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(img)
+
+        # Update thumbnail without scanning the full gallery.
+        item = self.gallery_items_by_path.get(image_path)
+        if item is not None:
+            scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
+            item.setIcon(QIcon(scaled))
+            rect = self.gallery_list.visualItemRect(item)
+            self.gallery_list.viewport().update(rect)
+
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
 
-        is_detail_result = request_id == self._pending_detail_request_id
-        accepted_preview_key = self._pending_preview_content_key if request_id == self._pending_preview_request_id else None
-        accepted_detail_key = self._pending_detail_content_key if is_detail_result else None
-        previous_scope_data = self.current.scope_uint8_data
-        self.current.update_data(None, img_uint8, source_size=source_size)
-        if is_detail_result and previous_scope_data is not None:
-            self.current.scope_uint8_data = previous_scope_data
+        self.current.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
         if self.current_raw_path:
              self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
 
-        if self.original.uint8_data is None:
-            self.original.update_data(None, img_uint8, source_size=source_size)
+        if self.original.full is None:
+            self.original.update_full(pixmap.copy(), None, img_uint8.copy(), source_size=source_size)
 
         if self.right_panel.auto_exp_radio.isChecked():
             self.right_panel.auto_ev_value = applied_ev
@@ -1354,33 +769,16 @@ class MainWindow(FluentWindow):
             self.right_panel.exp_value_label.setText(f"{tr('exposure_ev')}: {applied_ev:+.1f}")
             self.right_panel.exp_slider.valueChanged.connect(self.right_panel.exp_slider_callback)
 
-        # Display via OpenGL viewport (priority — show image first)
+        # Display via OpenGL viewport first.
         self.viewport.set_image(img_uint8, source_size=source_size)
         self.preview_lbl.setText("")
 
-        if request_id == self._pending_preview_request_id:
-            self._pending_preview_request_id = None
-            self._pending_preview_content_key = None
-            self._last_preview_content_key = accepted_preview_key
-            if self._interactive_dirty and self._preview_interaction_active:
-                self._schedule_interactive_preview_update()
-            elif self._needs_detail_after_preview and not self._preview_interaction_active:
-                self._detail_update_timer.start()
-        elif request_id == self._pending_detail_request_id:
-            self._pending_detail_request_id = None
-            self._pending_detail_content_key = None
-            self._last_detail_content_key = accepted_detail_key
-            self._update_current_gallery_thumbnail_from_preview(img_uint8)
-
-        # Defer visible scope update to the next event loop iteration. Detail
-        # refreshes are driven by viewport zoom/resize and must not change scopes.
-        if not is_detail_result:
-            img_for_hist = img_uint8
-            self.current.scope_uint8_data = img_for_hist
-            QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+        # Defer visible scope update to the next event loop iteration.
+        img_for_hist = img_uint8
+        QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
 
     def _update_histogram_async(self, img_uint8):
-        """Deferred scope update — runs after viewport display."""
+        """Deferred scope update; runs after viewport display."""
         self.right_panel.update_scope_data(img_uint8)
 
     def on_load_complete(self, image_path, request_id):
@@ -1392,305 +790,12 @@ class MainWindow(FluentWindow):
     
     def _trigger_processing_for_path(self, path):
         if path != self.current_raw_path: return
-        self._needs_detail_after_preview = True
-        self.trigger_processing()
+        params = self._get_preview_params()
+        self.current_request_id = self.processor.update_preview(path, params)
 
     def on_error(self, msg):
         self.preview_lbl.setText(f"{tr('error')}: {msg}")
         InfoBar.error(tr('error'), msg, parent=self)
-
-    # --- Toolbar Actions ---
-    def prev_image(self):
-        count = self.gallery_list.count()
-        if count == 0: return
-        row = self.gallery_list.currentRow()
-        new_row = (row - 1) % count
-        self.gallery_list.setCurrentRow(new_row)
-
-    def next_image(self):
-        count = self.gallery_list.count()
-        if count == 0: return
-        row = self.gallery_list.currentRow()
-        new_row = (row + 1) % count
-        self.gallery_list.setCurrentRow(new_row)
-
-    def toggle_mark(self):
-        if not self.current_raw_path: return
-        if self.current_raw_path in self.marked_files:
-            self.marked_files.remove(self.current_raw_path)
-            InfoBar.info(tr('unmarked'), os.path.basename(self.current_raw_path), parent=self)
-        else:
-            self.marked_files.add(self.current_raw_path)
-            InfoBar.success(tr('marked'), os.path.basename(self.current_raw_path), parent=self)
-        self.update_mark_button_state()
-        self.update_gallery_item_mark_indicator(self.current_raw_path)
-    
-    def update_mark_button_state(self):
-        if not self.current_raw_path:
-            self.btn_mark.setChecked(False)
-            return
-        self.btn_mark.blockSignals(True)
-        self.btn_mark.setChecked(self.current_raw_path in self.marked_files)
-        self.btn_mark.blockSignals(False)
-
-    def update_gallery_item_mark_indicator(self, path):
-        item = self.gallery_items_by_path.get(path)
-        if item is None:
-            return
-        is_marked = path in self.marked_files
-        name = os.path.basename(path)
-        item.setText(f"🟢 {name}" if is_marked else name)
-
-    def delete_image(self):
-        if not self.current_raw_path: return
-        
-        reply = QMessageBox.question(self, tr('delete_image'), tr('confirm_delete', filename=os.path.basename(self.current_raw_path)),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                import send2trash
-                send2trash.send2trash(os.path.normpath(self.current_raw_path))
-                if self.current_raw_path in self.marked_files: self.marked_files.remove(self.current_raw_path)
-                if self.current_raw_path in self.file_params_cache: del self.file_params_cache[self.current_raw_path]
-                if self.current_raw_path in self.file_baseline_params_cache: del self.file_baseline_params_cache[self.current_raw_path]
-                
-                
-                current_row = self.gallery_list.currentRow()
-                item = self.gallery_items_by_path.pop(self.current_raw_path, None)
-                if item is not None:
-                    row = self.gallery_list.row(item)
-                    if row >= 0:
-                        self.gallery_list.takeItem(row)
-                
-                if self.gallery_list.count() > 0:
-                    if current_row >= self.gallery_list.count(): current_row = self.gallery_list.count() - 1
-                    self.gallery_list.setCurrentRow(current_row)
-                else:
-                    self.current_raw_path = None
-                    self.preview_lbl.setText(tr('no_image_selected'))
-                    self.update_window_title()
-                InfoBar.success(tr('delete_image'), tr('delete_image'), parent=self)
-            except Exception as e:
-                try:
-                    # Fallback to os.remove if send2trash fails
-                    os.remove(self.current_raw_path)
-                    if self.current_raw_path in self.marked_files: self.marked_files.remove(self.current_raw_path)
-                    # ... same cleanup logic ...
-                    current_row = self.gallery_list.currentRow()
-                    item = self.gallery_items_by_path.pop(self.current_raw_path, None)
-                    if item is not None:
-                        row = self.gallery_list.row(item)
-                        if row >= 0:
-                            self.gallery_list.takeItem(row)
-                    if self.gallery_list.count() > 0:
-                        if current_row >= self.gallery_list.count(): current_row = self.gallery_list.count() - 1
-                        self.gallery_list.setCurrentRow(current_row)
-                    else:
-                        self.current_raw_path = None
-                        self.preview_lbl.setText(tr('no_image_selected'))
-                        self.update_window_title()
-                    InfoBar.success(tr('delete_image'), tr('delete_image'), parent=self)
-                except Exception as e2:
-                    InfoBar.error(tr('delete_failed'), str(e2), parent=self)
-
-    def show_original(self):
-        img_to_show = self.baseline if self.baseline.uint8_data is not None else self.original
-        if img_to_show.uint8_data is None: return
-        if img_to_show.uint8_data is not None:
-            self.viewport.set_image(img_to_show.uint8_data, source_size=img_to_show.source_size)
-        InfoBar.info(tr('compare_showing_baseline'), "", parent=self)
-
-    def show_processed(self):
-        if self.current.uint8_data is None:
-            if self.original.uint8_data is not None:
-                self.viewport.set_image(self.original.uint8_data, source_size=self.original.source_size)
-            return
-        if self.current.uint8_data is not None:
-            self.viewport.set_image(self.current.uint8_data, source_size=self.current.source_size)
-
-    def export_current(self):
-        if not self.current_raw_path: return
-        base = os.path.splitext(os.path.basename(self.current_raw_path))[0]
-        start_dir = self.last_export_path if self.last_export_path else (self.last_folder_path if self.last_folder_path else "")
-        default_path = os.path.join(start_dir, base) if start_dir else base
-
-        path, _ = QFileDialog.getSaveFileName(self, tr('export_image'), default_path, "JPEG (*.jpg);;HEIF (*.heif);;TIFF (*.tif);;DNG (*.dng)")
-
-        if path:
-            self.last_export_path = os.path.dirname(path)
-            self.saving_infobar = InfoBar.info(tr('saving'), tr('saving_image'), duration=-1, parent=self)
-            self.btn_export_curr.setEnabled(False)
-
-            # Try to reuse cached data from preview pipeline
-            # (cpu_corrected already includes demosaic + denoise + lens correction)
-            cached_data = self.processor.get_cached_for_export()
-            if cached_data is not None:
-                self.run_export(
-                    self.current_raw_path, path,
-                    is_single_export=True,
-                    cached_img=cached_data['corrected'],
-                    cached_exif_data=cached_data.get('exif_data'),
-                    cached_exif_metadata=cached_data.get('exif_metadata'),
-                )
-            else:
-                self.run_export(self.current_raw_path, path, is_single_export=True)
-
-    def export_all(self):
-        if not self.marked_files:
-            InfoBar.warning(tr('no_files_marked'), tr('please_mark_files'), parent=self)
-            return
-        
-        dialog = BatchExportDialog(self)
-        if dialog.exec():
-            settings = dialog.get_settings()
-            format_str = settings["format"]
-            self.batch_export_ignore_lut = settings["ignore_lut"]
-        else:
-            return
-        
-        start_dir = self.last_export_path if self.last_export_path else (self.last_folder_path if self.last_folder_path else "")
-        folder = QFileDialog.getExistingDirectory(self, tr('select_export_folder'), start_dir)
-        
-        if folder:
-            self.last_export_path = folder
-            self.batch_export_list = list(self.marked_files)
-            self.batch_export_folder = folder
-            fmt_map = {"JPEG": "jpg", "HEIF": "heif", "TIFF": "tif", "DNG": "dng"}
-            self.batch_export_ext = fmt_map.get(format_str, "jpg")
-            
-            self.batch_saving_infobar = InfoBar.info(tr('saving'), tr('batch_exporting'), duration=-1, parent=self)
-            self.export_progress.setRange(0, len(self.batch_export_list))
-            self.export_progress.setValue(0)
-            self.export_progress.show()
-            self.btn_export_all.setEnabled(False)
-            self.batch_export_idx = 0
-            self.batch_export_next()
-
-    def batch_export_next(self):
-        if self.batch_export_idx >= len(self.batch_export_list):
-            if hasattr(self, 'batch_saving_infobar') and self.batch_saving_infobar:
-                try:
-                    self.batch_saving_infobar.close()
-                except RuntimeError:
-                    pass
-                self.batch_saving_infobar = None
-            InfoBar.success(tr('batch_export'), tr('all_exported'), parent=self)
-            self.export_progress.hide()
-            self.btn_export_all.setEnabled(True)
-            return
-        
-        self.export_progress.setValue(self.batch_export_idx)
-        input_path = self.batch_export_list[self.batch_export_idx]
-        filename = os.path.basename(input_path)
-        output_path = os.path.join(self.batch_export_folder, os.path.splitext(filename)[0] + "." + self.batch_export_ext)
-        
-        params = None
-        if input_path == self.current_raw_path:
-            params = self.right_panel.get_params().copy()
-        else:
-            params = self.file_params_cache.get(input_path)
-            if params:
-                params = params.copy()
-        
-        if params and hasattr(self, 'batch_export_ignore_lut') and self.batch_export_ignore_lut:
-            params['lut_path'] = None
-        
-        self.batch_export_idx += 1
-        self.run_export(input_path, output_path, params=params, callback=self.batch_export_next)
-
-    def run_export(self, input_path, output_path, params=None, callback=None,
-                   is_single_export=False, cached_img=None, cached_exif_data=None,
-                   cached_exif_metadata=None):
-        p = params if params else self.right_panel.get_params()
-
-        ext = os.path.splitext(output_path)[1].lower().replace('.', '')
-        if ext not in ['jpg', 'heif', 'tif', 'tiff', 'dng']: ext = 'jpg'
-
-        # Capture cached references for the closure
-        _cached_img = cached_img
-        _cached_exif_data = cached_exif_data
-        _cached_exif_metadata = cached_exif_metadata
-
-        class ExportThread(QThread):
-            finished_sig = Signal(bool, str)
-            def run(self):
-                try:
-                    if _cached_img is not None:
-                        # Fast path: reuse preview cache (skip demosaic + lens + denoise)
-                        from raw_alchemy.core import export_from_cache
-                        export_from_cache(
-                            cached_img=_cached_img,
-                            output_path=output_path,
-                            exif_data=_cached_exif_data,
-                            exif_metadata=_cached_exif_metadata,
-                            log_space=p.get('log_space'),
-                            lut_path=p.get('lut_path'),
-                            exposure=p.get('exposure', 0.0),
-                            metering_mode=p.get('metering_mode', 'matrix'),
-                            wb_temp=p.get('wb_temp', 0.0),
-                            wb_tint=p.get('wb_tint', 0.0),
-                            saturation=p.get('saturation', 1.0),
-                            contrast=p.get('contrast', 1.0),
-                            highlight=p.get('highlight', 0.0),
-                            shadow=p.get('shadow', 0.0),
-                            rotation=p.get('rotation', 0),
-                            flip_horizontal=p.get('flip_horizontal', False),
-                            flip_vertical=p.get('flip_vertical', False),
-                            crop=p.get('crop', (0.0, 0.0, 1.0, 1.0)),
-                            sharpen_strength=p.get('sharpen_strength', 0.0),
-                        )
-                    else:
-                        # Full path: read RAW from scratch
-                        orchestrator.process_path(
-                            input_path=input_path,
-                            output_path=output_path,
-                            log_space=p.get('log_space'),
-                            lut_path=p.get('lut_path'),
-                            exposure=p.get('exposure', 0.0),
-                            lens_correct=p.get('lens_correct', True),
-                            custom_db_path=p.get('custom_db_path'),
-                            metering_mode=p.get('metering_mode', 'matrix'),
-                            jobs=1,
-                            logger_func=lambda msg: None,
-                            output_format=ext,
-                            wb_temp=p.get('wb_temp', 0.0),
-                            wb_tint=p.get('wb_tint', 0.0),
-                            saturation=p.get('saturation', 1.0),
-                            contrast=p.get('contrast', 1.0),
-                            highlight=p.get('highlight', 0.0),
-                            shadow=p.get('shadow', 0.0),
-                            rotation=p.get('rotation', 0),
-                            flip_horizontal=p.get('flip_horizontal', False),
-                            flip_vertical=p.get('flip_vertical', False),
-                            crop=p.get('crop', (0.0, 0.0, 1.0, 1.0)),
-                            denoise_enabled=p.get('denoise_enabled', False),
-                            sharpen_strength=p.get('sharpen_strength', 0.0),
-                        )
-                    self.finished_sig.emit(True, "")
-                except Exception as e:
-                    self.finished_sig.emit(False, str(e))
-        
-        self.export_thread = ExportThread() # User self to keep reference
-        
-        def on_finish(success, msg):
-            if is_single_export:
-                if hasattr(self, 'saving_infobar') and self.saving_infobar:
-                    try:
-                        self.saving_infobar.close()
-                    except RuntimeError:
-                        pass
-                    self.saving_infobar = None
-                self.btn_export_curr.setEnabled(True)
-            
-            if success:
-                if not callback: InfoBar.success(tr('export_success'), tr('saved_to', path=os.path.basename(output_path)), parent=self)
-                if callback: callback()
-            else:
-                InfoBar.error(tr('export_failed'), msg, parent=self)
-        
-        self.export_thread.finished_sig.connect(on_finish)
-        self.export_thread.start()
 
     def _sync_preview_label_geometry(self, w=None, h=None):
         if hasattr(self, 'preview_lbl') and hasattr(self, 'viewport'):
@@ -1730,15 +835,14 @@ class MainWindow(FluentWindow):
             self.denoise_progress_dialog.setContent(tr('denoise_done_processing'))
 
     def closeEvent(self, event):
+        if hasattr(self, '_sidecar_write_timer'):
+            self._sidecar_write_timer.stop()
+        self._persist_current_sidecar_now()
         self.save_settings()
         if hasattr(self, '_preload_neighbors_timer'):
             self._preload_neighbors_timer.stop()
         if hasattr(self, '_zoom_update_timer'):
             self._zoom_update_timer.stop()
-        if hasattr(self, '_interactive_update_timer'):
-            self._interactive_update_timer.stop()
-        if hasattr(self, '_detail_update_timer'):
-            self._detail_update_timer.stop()
         if self.thumb_worker and self.thumb_worker.isRunning():
             self.thumb_worker.stop()
             self.thumb_worker.quit()
@@ -1746,4 +850,6 @@ class MainWindow(FluentWindow):
         if hasattr(self, 'right_panel'):
             self.right_panel.shutdown_scope_workers()
         self.processor.stop_and_cleanup()
+        if hasattr(self, 'baseline_processor'):
+            self.baseline_processor.stop_and_cleanup()
         super().closeEvent(event)

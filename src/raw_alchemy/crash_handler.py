@@ -79,16 +79,9 @@ class CrashHandler:
     def _show_crash_dialog(self, error_type, error_msg):
         """尝试显示崩溃对话框"""
         try:
-            from PySide6.QtWidgets import QMessageBox, QApplication
-            app = QApplication.instance()
-            if app:
-                msg = QMessageBox()
-                msg.setIcon(QMessageBox.Icon.Critical)
-                msg.setWindowTitle("Fatal Error")
-                msg.setText(f"Application encountered an unhandled exception.\nType: {error_type}")
-                msg.setInformativeText(f"Check log for details: {self.log_path}")
-                msg.setDetailedText(error_msg)
-                msg.exec()
+            from raw_alchemy.ui.crash_dialog import show_crash_dialog
+
+            show_crash_dialog(self.log_path, error_type, error_msg)
         except Exception as e:
             # 崩溃对话框显示失败（例如 GUI 未初始化），记录警告后继续
             logger.warning(f"⚠️ Failed to show crash dialog: {e}")

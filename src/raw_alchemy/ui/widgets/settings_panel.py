@@ -4,7 +4,7 @@ from PySide6.QtCore import Signal, QThread, QObject
 from qfluentwidgets import (
     SubtitleLabel, StrongBodyLabel, BodyLabel, CaptionLabel,
     SimpleCardWidget, ScrollArea, ComboBox, PrimaryPushButton, 
-    PushButton, ProgressBar, InfoBar, InfoBarPosition
+    PushButton, ProgressBar, InfoBar, InfoBarPosition, SwitchButton
 )
 
 from raw_alchemy import i18n
@@ -31,6 +31,7 @@ class CudaDownloadWorker(QObject):
 
 class SettingsPanel(QWidget):
     """Settings panel widget"""
+    write_sidecar_changed = Signal(bool)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -75,6 +76,18 @@ class SettingsPanel(QWidget):
         lang_layout.addWidget(lang_title)
         lang_layout.addWidget(self.lang_combo)
         settings_layout.addWidget(lang_card)
+
+        # Editing Settings Card
+        editing_card = SimpleCardWidget()
+        editing_layout = QVBoxLayout(editing_card)
+        editing_layout.setSpacing(10)
+        editing_title = StrongBodyLabel(tr('editing'))
+        self.write_sidecar_switch = SwitchButton(text=tr('write_sidecar'))
+        self.write_sidecar_switch.setChecked(True)
+        self.write_sidecar_switch.checkedChanged.connect(self.write_sidecar_changed.emit)
+        editing_layout.addWidget(editing_title)
+        editing_layout.addWidget(self.write_sidecar_switch)
+        settings_layout.addWidget(editing_card)
         
         # GPU Acceleration Settings Card
         gpu_card = SimpleCardWidget()
@@ -129,6 +142,11 @@ class SettingsPanel(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(settings_scroll)
+
+    def set_write_sidecar_enabled(self, enabled: bool):
+        self.write_sidecar_switch.blockSignals(True)
+        self.write_sidecar_switch.setChecked(bool(enabled))
+        self.write_sidecar_switch.blockSignals(False)
     
     def _update_cuda_status(self):
         """Update CUDA status display based on current state."""

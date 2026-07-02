@@ -2,14 +2,25 @@ import click
 from raw_alchemy import lensfun_wrapper as lf
 from raw_alchemy import config, orchestrator
 
+
+def _safe_echo(message):
+    text = str(message)
+    try:
+        click.echo(text)
+    except UnicodeEncodeError:
+        safe_text = text.encode("ascii", errors="replace").decode("ascii")
+        click.echo(safe_text)
+
+
 @click.command()
 @click.argument("input_path", type=click.Path(exists=True))
 @click.argument("output_path", type=click.Path())
 @click.option(
     "--log-space",
-    required=True,
-    type=click.Choice(list(config.LOG_TO_WORKING_SPACE.keys()), case_sensitive=False),
-    help="The log space to convert to.",
+    default="None",
+    show_default=True,
+    type=click.Choice(["None", *config.LOG_TO_WORKING_SPACE.keys()], case_sensitive=False),
+    help="The log space to convert to. Use None for scene-referred output.",
 )
 @click.option(
     "--lut",
@@ -27,6 +38,13 @@ from raw_alchemy import config, orchestrator
     "--lens-correct",
     default=True,
     help="Enable or disable lens distortion correction. Enabled by default.",
+)
+@click.option(
+    "--no-lens-correct",
+    "no_lens_correct",
+    is_flag=True,
+    default=False,
+    help="Disable lens distortion correction.",
 )
 @click.option(
     "--custom-lensfun-db",
@@ -49,17 +67,30 @@ from raw_alchemy import config, orchestrator
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(['tif', 'heif', 'jpg'], case_sensitive=False),
+    type=click.Choice(['tif', 'heif', 'hdr-heif', 'jpg', 'dng'], case_sensitive=False),
     default='tif',
-    help="Output file format. Default is 'tif'.",
+    help="Output file format. Use hdr-heif for BT.2020/PQ HEIF. Default is 'tif'.",
 )
-def main(input_path, output_path, log_space, lut_path, exposure, lens_correct, custom_lensfun_db_path, metering, jobs, output_format):
+def main(
+    input_path,
+    output_path,
+    log_space,
+    lut_path,
+    exposure,
+    lens_correct,
+    no_lens_correct,
+    custom_lensfun_db_path,
+    metering,
+    jobs,
+    output_format,
+):
     """
-    Converts RAW image(s) to high-quality image files (TIFF, HEIF, or JPG).
+    Converts RAW image(s) to high-quality image files.
 
     INPUT_PATH: Path to a single RAW file or a directory of RAWs.
     OUTPUT_PATH: Path to the output file or a directory for batch processing.
     """
+    effective_lens_correct = False if no_lens_correct else lens_correct
     try:
         orchestrator.process_path(
             input_path=input_path,
@@ -67,11 +98,11 @@ def main(input_path, output_path, log_space, lut_path, exposure, lens_correct, c
             log_space=log_space,
             lut_path=lut_path,
             exposure=exposure,
-            lens_correct=lens_correct,
+            lens_correct=effective_lens_correct,
             custom_db_path=custom_lensfun_db_path,
             metering_mode=metering,
             jobs=jobs,
-            logger_func=click.echo, # Use click.echo for robust Unicode support
+            logger_func=_safe_echo,
             output_format=output_format,
         )
     except Exception as e:

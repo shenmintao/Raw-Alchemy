@@ -25,21 +25,48 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install .
+          python -m pip install ".[build]"
         env:
           CMAKE_PREFIX_PATH: ''
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # CUDA is now downloaded on-demand by users, not bundled in executable
 
-      - name: Build executable with PyInstaller
-        run: pyinstaller RawAlchemy.spec
+      - name: Build onedir executable with PyInstaller
+        run: python -m PyInstaller --clean -y RawAlchemy-onedir.spec
+
+      - name: Package Windows portable ZIP
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          @(
+            'Raw Alchemy Studio Windows portable package'
+            '==========================================='
+            ''
+            'This is the portable build of Raw Alchemy Studio. Unzip it anywhere'
+            'and run RawAlchemy.exe. No installer, no admin privileges, no system'
+            'Python required.'
+            ''
+            'First-launch notes:'
+            ''
+            '  - Windows SmartScreen may say "Windows protected your PC" because'
+            '    the binary is unsigned. Click "More info" -> "Run anyway" once.'
+            '  - Portable builds do not auto-update. To upgrade, download a newer'
+            '    zip and replace this folder.'
+          ) | Set-Content -LiteralPath "dist/RawAlchemy/README-portable.txt" -Encoding UTF8
+
+          $zip = "RawAlchemyStudio-$env:TAG-windows-x64-portable.zip"
+          if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+          }
+          Compress-Archive -Path "dist/RawAlchemy/*" -DestinationPath $zip -CompressionLevel Optimal
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RawAlchemyStudio-windows
-          path: dist/RawAlchemy.exe
+          name: RawAlchemyStudio-windows-portable
+          path: RawAlchemyStudio-*-windows-x64-portable.zip
 
   build-linux:
     name: Build for Linux
@@ -56,20 +83,36 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install .
+          python -m pip install ".[build]"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # CUDA is now downloaded on-demand by users, not bundled in executable
 
-      - name: Build executable with PyInstaller
-        run: pyinstaller RawAlchemy.spec
+      - name: Build onedir executable with PyInstaller
+        run: python -m PyInstaller --clean -y RawAlchemy-onedir.spec
+
+      - name: Package Linux portable tarball
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          printf '%s\n' \
+            'Raw Alchemy Studio Linux portable package' \
+            '=========================================' \
+            '' \
+            'This is the portable build of Raw Alchemy Studio. Extract it anywhere' \
+            'and run ./RawAlchemy. No installer or system Python required.' \
+            '' \
+            'Portable builds do not auto-update. To upgrade, download a newer' \
+            'archive and replace this folder.' \
+            > dist/RawAlchemy/README-portable.txt
+          tar -C dist -czf "RawAlchemyStudio-${TAG}-linux-x64-portable.tar.gz" RawAlchemy
 
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RawAlchemyStudio-linux
-          path: dist/RawAlchemy
+          name: RawAlchemyStudio-linux-portable
+          path: RawAlchemyStudio-*-linux-x64-portable.tar.gz
 
   build-macos:
     name: Build for macOS
@@ -105,12 +148,12 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install .
+          python -m pip install ".[build]"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build executable with PyInstaller
-        run: pyinstaller RawAlchemy.spec
+      - name: Build onedir app with PyInstaller
+        run: python -m PyInstaller --clean -y RawAlchemy-onedir.spec
 
       - name: Package macOS .app into .dmg
         run: |
@@ -147,16 +190,61 @@ jobs:
       - name: Prepare Artifacts for Release
         run: |
           tag="${{ github.ref_name }}"
-          mv artifacts/RawAlchemyStudio-windows/RawAlchemy.exe "RawAlchemyStudio-${tag}-windows.exe"
-          mv artifacts/RawAlchemyStudio-linux/RawAlchemy "RawAlchemyStudio-${tag}-linux"
+          mv artifacts/RawAlchemyStudio-windows-portable/*.zip .
+          mv artifacts/RawAlchemyStudio-linux-portable/*.tar.gz .
           # The macOS artifact is now a DMG and already named correctly
           mv artifacts/RawAlchemyStudio-macos-dmg/*.dmg .
         shell: bash
 
+      - name: Remove stale legacy assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release delete-asset "$TAG" "RawAlchemyStudio-${TAG}-windows.exe" --yes || true
+          gh release delete-asset "$TAG" "RawAlchemyStudio-${TAG}-windows-x64-onedir.zip" --yes || true
+          gh release delete-asset "$TAG" "RawAlchemyStudio-${TAG}-linux" --yes || true
+
+      - name: Write release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > release-notes.md <<EOF
+          ## Raw Alchemy Studio $TAG
+
+          This is a prerelease validation build for testing, not final acceptance
+          for the full upgrade plan.
+
+          ## Artifacts
+
+          - Windows: portable ZIP. Unzip anywhere and run \`RawAlchemy.exe\`.
+          - macOS: DMG. Drag \`RawAlchemy.app\` to \`/Applications\`.
+          - Linux: portable tarball. Extract anywhere and run \`./RawAlchemy\`.
+
+          Windows, macOS, and Linux builds use PyInstaller onedir packaging to
+          avoid the slow onefile self-extraction path during startup.
+
+          ## First-Launch Notes For Unsigned Binaries
+
+          - Windows: SmartScreen may say "Windows protected your PC". Click
+            "More info" and then "Run anyway".
+          - macOS: Gatekeeper may refuse to open the .dmg. Run
+            \`xattr -dr com.apple.quarantine /Applications/RawAlchemy.app\`
+            after dragging it across.
+
+          ## Validation Scope
+
+          - CANS / AI demosaic-denoise remains disabled in the GUI for this
+            prerelease while quality tuning continues.
+          EOF
+
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-pre') || contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          overwrite_files: true
           files: |
-            RawAlchemyStudio-*-windows.exe
-            RawAlchemyStudio-*-linux
+            RawAlchemyStudio-*-windows-x64-portable.zip
+            RawAlchemyStudio-*-linux-x64-portable.tar.gz
             RawAlchemyStudio-*-macos.dmg

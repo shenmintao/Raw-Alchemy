@@ -47,7 +47,7 @@
 -   **基础调整**: 白平衡 (色温/色调)、饱和度、对比度、高光和阴影微调。
 -   **镜头校正**: 使用 Lensfun 自动进行镜头畸变校正，支持加载自定义 LCP 转换数据库。
 -   **批量处理**: 高效处理整个文件夹的 RAW 图像。
--   **多格式输出**: 支持保存为 16 位 TIFF、HEIF (10位) 或 JPEG。
+-   **多格式输出**: 支持保存为 16 位 TIFF、HEIF (10位)、HDR HEIF (BT.2020/PQ) 或 JPEG。
 
 ## 📸 效果示例
 
@@ -120,7 +120,7 @@ pip install .
 #### 3. 导出
 *   **Export Current** (导出当前): 保存当前选中的图像。
 *   **Export All Marked** (导出所有标记): 批量处理并保存所有已标记的图像。
-*   **格式**: 支持选择 JPEG, HEIF 或 TIFF。
+*   **格式**: 支持选择 JPEG、HEIF、HDR HEIF 或 TIFF。
 
 ## 🔧 高级用法：导入 Adobe 镜头配置文件 (LCP)
 
@@ -148,6 +148,8 @@ Raw Alchemy Studio 包含一个脚本，用于转换和导入 Adobe LCP 镜头�
 RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_PATH>
 ```
 
+CLI 使用中性饱和度和对比度默认值（`1.0` / `1.0`）；GUI 默认值保持不变。
+
 #### 示例
 
 **1. 基本 Log 转换**
@@ -173,7 +175,9 @@ RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_PATH>
 -   `--lut TEXT`: (可选) `.cube` LUT 文件路径。
 -   `--exposure FLOAT`: (可选) 手动曝光调整 (档)。
 -   `--metering TEXT`: (可选) 自动曝光模式: `matrix`, `hybrid`, `average`, `center-weighted`, `highlight-safe`。
--   `--format TEXT`: (可选) 输出格式: `tif` (默认), `heif`, `jpg`。
+-   `--format TEXT`: (可选) 输出格式: `tif` (默认), `heif`, `hdr-heif`, `jpg`。
+
+`hdr-heif` 会写出 10-bit BT.2020/PQ HEIF。Ultra HDR / ISO 21496-1 gain-map JPEG 尚未实现；普通 `jpg` 仍为 SDR 输出。
 -   `--jobs INTEGER`: (可选) 批量处理的并发任务数。
 -   `--lens-correct / --no-lens-correct`: (可选) 启用/禁用镜头校正。
 -   `--custom-lensfun-db TEXT`: (可选) 自定义 Lensfun XML 路径。

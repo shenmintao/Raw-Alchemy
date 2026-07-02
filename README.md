@@ -47,7 +47,7 @@ This tool follows these precise color conversion steps:
 -   **Basic Adjustments**: White Balance (Temp/Tint), Saturation, Contrast, Highlights, and Shadows.
 -   **Lens Correction**: Automatic lens distortion correction using Lensfun, with support for custom LCP-converted databases.
 -   **Batch Processing**: Efficiently process entire folders of RAW images.
--   **Multi-Format Output**: Save as 16-bit TIFF, HEIF (10-bit), or JPEG.
+-   **Multi-Format Output**: Save as 16-bit TIFF, HEIF (10-bit), HDR HEIF (BT.2020/PQ), or JPEG.
 
 ## 📸 Samples
 
@@ -120,7 +120,7 @@ The graphical interface provides an intuitive way to process your images.
 #### 3. Export
 *   **Export Current**: Save the currently selected image.
 *   **Export All Marked**: Batch process and save all marked images.
-*   **Formats**: Choose between JPEG, HEIF, or TIFF.
+*   **Formats**: Choose between JPEG, HEIF, HDR HEIF, or TIFF.
 
 ## 🔧 Advanced Usage: Importing Adobe Lens Profiles (LCP)
 
@@ -148,6 +148,8 @@ The conversion script, `lensfun-convert-lcp`, can be found in the `src/raw_alche
 RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_PATH>
 ```
 
+The CLI uses neutral saturation and contrast defaults (`1.0` / `1.0`). GUI defaults are unchanged.
+
 #### Examples
 
 **1. Basic Log Conversion**
@@ -169,13 +171,16 @@ RawAlchemy-v0.1.0-windows.exe [OPTIONS] <INPUT_RAW_PATH> <OUTPUT_PATH>
 
 -   `<INPUT_RAW_PATH>`: (Required) Input RAW file or folder.
 -   `<OUTPUT_PATH>`: (Required) Output file or folder.
--   `--log-space TEXT`: (Required) Target Log color space.
+-   `--log-space TEXT`: (Optional) Target Log color space; defaults to `None` for scene-referred output.
 -   `--lut TEXT`: (Optional) Path to a `.cube` LUT file.
 -   `--exposure FLOAT`: (Optional) Manual exposure adjustment in stops.
 -   `--metering TEXT`: (Optional) Auto exposure mode: `matrix`, `hybrid`, `average`, `center-weighted`, `highlight-safe`.
--   `--format TEXT`: (Optional) Output format: `tif` (default), `heif`, `jpg`.
+-   `--format TEXT`: (Optional) Output format: `tif` (default), `heif`, `hdr-heif`, `jpg`, `dng`.
+
+`hdr-heif` writes a 10-bit BT.2020/PQ HEIF file and uses the PQ output path directly; Log/LUT output is ignored for that format. Ultra HDR / ISO 21496-1 gain-map JPEG is not implemented yet; ordinary `jpg` output remains SDR.
 -   `--jobs INTEGER`: (Optional) Number of concurrent jobs for batch processing.
--   `--lens-correct / --no-lens-correct`: (Optional) Enable/disable lens correction.
+-   `--lens-correct BOOLEAN`: (Optional) Enable/disable lens correction; accepts legacy values such as `false`.
+-   `--no-lens-correct`: (Optional) Disable lens correction.
 -   `--custom-lensfun-db TEXT`: (Optional) Path to custom Lensfun XML.
 
 ## 📋 Supported Log Spaces

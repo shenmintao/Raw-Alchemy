@@ -1,7 +1,13 @@
 import threading
+from functools import lru_cache
+
+import colour
 import taichi as ti
 import numpy as np
 from loguru import logger
+
+from raw_alchemy import config
+from raw_alchemy.colorspace_matrices import working_rgb_to_xyz_d65
 
 # =========================================================
 # Taichi Initialization
@@ -69,6 +75,102 @@ def apply_matrix_inplace(img, matrix):
                                   float(m[0, 0]), float(m[0, 1]), float(m[0, 2]),
                                   float(m[1, 0]), float(m[1, 1]), float(m[1, 2]),
                                   float(m[2, 0]), float(m[2, 1]), float(m[2, 2]))
+
+
+D65_XY = tuple(float(v) for v in colour.CCS_ILLUMINANTS[
+    "CIE 1931 2 Degree Standard Observer"
+]["D65"])
+D65_CCT = 6504.0
+TEMP_MIRED_SHIFT_PER_STEP = 1.0
+TINT_DUV_SHIFT_PER_STEP = -0.0005
+
+
+@lru_cache(maxsize=128)
+def _working_space_adaptation_matrix_cached(
+    source_x: float,
+    source_y: float,
+    target_x: float,
+    target_y: float,
+    working_space: str,
+    transform: str,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    from colour.adaptation import matrix_chromatic_adaptation_VonKries
+
+    source_xyz = colour.xy_to_XYZ((source_x, source_y))
+    target_xyz = colour.xy_to_XYZ((target_x, target_y))
+    cat_xyz = matrix_chromatic_adaptation_VonKries(
+        source_xyz,
+        target_xyz,
+        transform=transform,
+    )
+    rgb_to_xyz = working_rgb_to_xyz_d65(working_space)
+    xyz_to_rgb = np.linalg.inv(rgb_to_xyz)
+    matrix = xyz_to_rgb @ cat_xyz @ rgb_to_xyz
+    return tuple(tuple(float(v) for v in row) for row in matrix)
+
+
+def working_space_adaptation_matrix(
+    source_xy,
+    target_xy,
+    working_space: str | None = None,
+    transform: str = "Bradford",
+) -> np.ndarray:
+    """Return a working-RGB chromatic adaptation matrix."""
+    working_space = working_space or config.WORKING_SPACE
+    matrix = _working_space_adaptation_matrix_cached(
+        round(float(source_xy[0]), 12),
+        round(float(source_xy[1]), 12),
+        round(float(target_xy[0]), 12),
+        round(float(target_xy[1]), 12),
+        working_space,
+        transform,
+    )
+    return np.asarray(matrix, dtype=np.float64)
+
+
+def _white_balance_target_xy(wb_temp: float, wb_tint: float) -> tuple[float, float]:
+    base_mired = 1_000_000.0 / D65_CCT
+    target_mired = np.clip(
+        base_mired + float(wb_temp) * TEMP_MIRED_SHIFT_PER_STEP,
+        1_000_000.0 / 25_000.0,
+        1_000_000.0 / 1_500.0,
+    )
+    cct = 1_000_000.0 / target_mired
+    duv = float(wb_tint) * TINT_DUV_SHIFT_PER_STEP
+    uv = colour.CCT_to_uv(np.array([cct, duv], dtype=np.float64), method="Ohno 2013")
+    xy = colour.UCS_uv_to_xy(uv)
+    return float(xy[0]), float(xy[1])
+
+
+@lru_cache(maxsize=256)
+def _white_balance_matrix_cached(
+    wb_temp: float,
+    wb_tint: float,
+    working_space: str,
+    transform: str,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    if float(wb_temp) == 0.0 and float(wb_tint) == 0.0:
+        return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    target_xy = _white_balance_target_xy(wb_temp, wb_tint)
+    matrix = working_space_adaptation_matrix(D65_XY, target_xy, working_space, transform)
+    return tuple(tuple(float(v) for v in row) for row in matrix)
+
+
+def white_balance_matrix(
+    wb_temp: float,
+    wb_tint: float,
+    working_space: str | None = None,
+    transform: str = "Bradford",
+) -> np.ndarray:
+    """Map UI temp/tint controls to a cached CAT matrix in working RGB."""
+    working_space = working_space or config.WORKING_SPACE
+    matrix = _white_balance_matrix_cached(
+        round(float(wb_temp), 6),
+        round(float(wb_tint), 6),
+        working_space,
+        transform,
+    )
+    return np.asarray(matrix, dtype=np.float64)
 
 
 @ti.kernel
@@ -1709,175 +1811,50 @@ def apply_crop_pixels_gpu(src_buf, dst_buf, x: int, y: int, width: int, height: 
 # =========================================================
 # GPU Log Encoding
 # =========================================================
-# Each log curve is a per-pixel transfer function.
-# We implement the most common ones as Taichi kernels.
-
 @ti.kernel
-def _log_encode_kernel(img: ti.types.ndarray(dtype=ti.f32, ndim=3),
-                        log_type: ti.i32):
-    """
-    GPU log encoding. log_type selects the curve:
-      0 = S-Log3       4 = Canon Log 2    8 = F-Log2
-      1 = V-Log        5 = Canon Log 3    9 = D-Log
-      2 = N-Log        6 = Log3G10       10 = L-Log
-      3 = Arri LogC3   7 = F-Log         11 = Arri LogC4
-    """
-    LOG10E = 0.4342944819032518  # 1 / ln(10), so log10(x) = log(x) * LOG10E
-    LOG2E = 1.4426950408889634   # 1 / ln(2),  so log2(x)  = log(x) * LOG2E
-
+def _apply_1d_lut_inplace_kernel(img: ti.types.ndarray(dtype=ti.f32, ndim=3),
+                                 lut: ti.types.ndarray(dtype=ti.f32, ndim=1),
+                                 domain_min: ti.f32,
+                                 domain_max: ti.f32):
+    scale = (lut.shape[0] - 1) / (domain_max - domain_min)
     for y, x in ti.ndrange(img.shape[0], img.shape[1]):
         for ch in ti.static(range(3)):
             v = img[y, x, ch]
-            result = v  # fallback
-
-            if log_type == 0:
-                # S-Log3
-                if v >= 0.01125000:
-                    result = (420.0 + ti.log(v * 261.5 + 0.01) * LOG10E * 261.5) / 1023.0
-                else:
-                    result = (v * (171.2102946929 - 95.0) / 0.01125000 + 95.0) / 1023.0
-
-            elif log_type == 1:
-                # V-Log
-                b = 0.00873
-                c = 0.241514
-                d = 0.598206
-                if v >= 0.01:
-                    result = c * ti.log(v + 0.00873) * LOG10E + d
-                else:
-                    result = 5.6 * v + 0.125
-
-            elif log_type == 2:
-                # N-Log
-                if v >= 328.0 / 65536.0:
-                    result = (150.0 * ti.log(v) * LOG10E + 619.0) / 1023.0
-                else:
-                    result = 1000.0 / 17.0 * v
-
-            elif log_type == 3:
-                # ARRI LogC3 (EI 800)
-                cut = 0.010591
-                a = 5.555556
-                b = 0.052272
-                c_val = 0.247190
-                d_val = 0.385537
-                e_val = 5.367655
-                f_val = 0.092809
-                if v > cut:
-                    result = c_val * ti.log(a * v + b) * LOG10E + d_val
-                else:
-                    result = e_val * v + f_val
-
-            elif log_type == 4:
-                # Canon Log 2
-                if v >= -0.006:
-                    result = 0.092864 * ti.log(v * 87.099375 + 1.0) * LOG10E + 0.5
-                else:
-                    result = 0.092864 * (v + 0.006) / 0.010797 + 0.5
-
-            elif log_type == 5:
-                # Canon Log 3
-                if v >= -0.014:
-                    result = 0.42889912 * ti.log(v * 14.98325 + 1.0) * LOG10E * 0.36726845 + 0.069886632
-                else:
-                    result = -0.42889912 * ti.log(-v * 14.98325 + 1.0) * LOG10E * 0.36726845 + 0.069886632
-
-            elif log_type == 6:
-                # Log3G10
-                a_val = 0.224282
-                b_val = 155.975327
-                c_val = 0.01
-                g = 15.1927
-                if v >= -c_val:
-                    result = a_val * ti.log((v + c_val) * b_val + 1.0) * LOG10E
-                else:
-                    result = (v + c_val) * g
-
-            elif log_type == 7:
-                # F-Log (Fujifilm)
-                a_val = 0.555556
-                b_val = 0.009468
-                c_val = 0.344676
-                d_val = 0.790453
-                e_val = 8.735631
-                f_val = 0.092864
-                cut_val = 0.00089
-                if v >= cut_val:
-                    result = c_val * ti.log(a_val * v + b_val) * LOG10E + d_val
-                else:
-                    result = e_val * v + f_val
-
-            elif log_type == 8:
-                # F-Log2 (Fujifilm)
-                a_val = 5.555556
-                b_val = 0.064829
-                c_val = 0.245281
-                d_val = 0.384316
-                e_val = 8.799461
-                f_val = 0.092864
-                cut_val = 0.000889
-                if v >= cut_val:
-                    result = c_val * ti.log(a_val * v + b_val) * LOG10E + d_val
-                else:
-                    result = e_val * v + f_val
-
-            elif log_type == 9:
-                # D-Log (DJI)
-                if v <= 0.0078:
-                    result = 6.025 * v + 0.0929
-                else:
-                    result = ti.log(v * 19.0 + 1.0) * LOG10E * 0.256663 + 0.584555
-
-            elif log_type == 10:
-                # L-Log (Leica)
-                if v >= 0.006:
-                    result = 0.432699 * ti.log(20.0 * v + 1.0) * LOG10E + 0.1
-                else:
-                    result = 7.5 * v + 0.055
-
-            elif log_type == 11:
-                # ARRI LogC4
-                a_val = 2231.826309067688
-                b_val = 64.0
-                c_val = 0.0740718950408889
-                s = (7.0 * ti.log(a_val) * LOG2E + 1.0) / 7.0
-                # t derived from continuity
-                t = (ti.pow(2.0, (0.0 - 1.0) / 7.0) - b_val) / a_val
-                if v >= t:
-                    result = (ti.log(a_val * v + b_val) * LOG2E + 1.0) / 14.0 + 0.5
-                else:
-                    result = (v - t) / c_val
-
-            img[y, x, ch] = result
+            if v <= domain_min:
+                img[y, x, ch] = lut[0]
+            elif v >= domain_max:
+                img[y, x, ch] = lut[lut.shape[0] - 1]
+            else:
+                pos = (v - domain_min) * scale
+                i0 = ti.cast(ti.floor(pos), ti.i32)
+                frac = pos - ti.cast(i0, ti.f32)
+                img[y, x, ch] = lut[i0] * (1.0 - frac) + lut[i0 + 1] * frac
 
 
-# Map log space names to log_type indices
-_LOG_TYPE_MAP = {
-    'S-Log3': 0,
-    'V-Log': 1,
-    'N-Log': 2,
-    'Arri LogC3': 3,
-    'Canon Log 2': 4,
-    'Canon Log 3': 5,
-    'Log3G10': 6,
-    'F-Log': 7,
-    'F-Log2': 8,
-    'D-Log': 9,
-    'L-Log': 10,
-    'Arri LogC4': 11,
-}
+def apply_1d_lut_inplace(img, lut, domain_min, domain_max):
+    """Apply a precomputed 1D LUT to an image in-place."""
+    if _is_numpy(lut) and not lut.flags['C_CONTIGUOUS']:
+        lut = np.ascontiguousarray(lut)
+    _apply_1d_lut_inplace_kernel(img, lut, float(domain_min), float(domain_max))
 
 
 def log_encode_gpu(img, log_curve_name):
     """
-    Apply log encoding on GPU. img: ti.ndarray or numpy.
-    log_curve_name: one of the supported log curve names.
-    Returns True if handled on GPU, False if fallback to CPU is needed.
+    Apply log encoding via a pipeline-provided 1D LUT.
+
+    This compatibility wrapper keeps older callers working while log curve
+    generation lives in the pipeline layer.
     """
-    log_type = _LOG_TYPE_MAP.get(log_curve_name, -1)
-    if log_type < 0:
+    from raw_alchemy.pipeline.log_encoding import (
+        LOG_LUT_DOMAIN_MAX,
+        LOG_LUT_DOMAIN_MIN,
+        get_log_lut,
+    )
+
+    lut = get_log_lut(log_curve_name)
+    if lut.size == 0:
         return False
-    _log_encode_kernel(img, log_type)
+    apply_1d_lut_inplace(img, lut, LOG_LUT_DOMAIN_MIN, LOG_LUT_DOMAIN_MAX)
     return True
 
 
@@ -1985,7 +1962,7 @@ def warmup():
     _crop_kernel(geom_src, crop_dst, 0, 0)
 
     # 17. Log encoding (warm up with S-Log3)
-    _log_encode_kernel(geom_src, 0)
+    log_encode_gpu(geom_src, "S-Log3")
 
     # 18. Fused exposure+adjust+grade kernel warmup
     _fused_expose_adjust_srgb_kernel(

@@ -6,6 +6,7 @@ from typing import Optional, Any
 from loguru import logger
 import sys
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -13,9 +14,17 @@ from pathlib import Path
 def get_log_file_path() -> str:
     """获取日志文件路径"""
     # 在用户目录下创建日志文件夹
-    log_dir = os.path.expanduser('~/.raw_alchemy/logs')
-    os.makedirs(log_dir, exist_ok=True)
-    return os.path.join(log_dir, "raw_alchemy.log")
+    log_dir = os.environ.get('RAW_ALCHEMY_LOG_DIR') or os.path.expanduser('~/.raw_alchemy/logs')
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "raw_alchemy.log")
+        with open(log_path, "a", encoding="utf-8"):
+            pass
+    except OSError:
+        log_dir = os.path.join(tempfile.gettempdir(), 'raw_alchemy', 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "raw_alchemy.log")
+    return log_path
 
 
 # 配置全局 loguru logger

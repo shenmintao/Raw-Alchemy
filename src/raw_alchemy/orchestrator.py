@@ -19,14 +19,15 @@ def process_path(
     # New Params
     wb_temp: float = 0.0,
     wb_tint: float = 0.0,
-    saturation: float = 1.25,
-    contrast: float = 1.1,
+    saturation: float = 1.0,
+    contrast: float = 1.0,
     highlight: float = 0.0,
     shadow: float = 0.0,
     # Geometry
     rotation: int = 0,
     flip_horizontal: bool = False,
     flip_vertical: bool = False,
+    perspective_corners: tuple | None = None,
     crop: tuple = (0.0, 0.0, 1.0, 1.0),
     # Denoising
     denoise_enabled: bool = False,
@@ -37,6 +38,8 @@ def process_path(
     Orchestrates the processing of a single file or a directory of files.
     Updated to support GUI Progress Bar signaling.
     """
+    hdr_output = output_format in {'hdr-heif', 'hdr.heif'}
+    normalized_output_format = 'hdr.heif' if hdr_output else output_format
     
     # --- Helper Functions ---
     def log_message(msg):
@@ -53,7 +56,7 @@ def process_path(
         if hasattr(logger_func, 'put'):
             logger_func.put(data)
 
-    output_ext = f".{output_format}"
+    output_ext = f".{normalized_output_format}"
 
     # ============================
     #      Batch Processing
@@ -99,8 +102,11 @@ def process_path(
                     rotation=rotation,
                     flip_horizontal=flip_horizontal,
                     flip_vertical=flip_vertical,
+                    perspective_corners=perspective_corners,
+                    crop=crop,
                     denoise_enabled=denoise_enabled,
                     sharpen_strength=sharpen_strength,
+                    hdr_output=hdr_output,
                 ): filename for filename in raw_files
             }
             
@@ -154,9 +160,11 @@ def process_path(
                 rotation=rotation,
                 flip_horizontal=flip_horizontal,
                 flip_vertical=flip_vertical,
+                perspective_corners=perspective_corners,
                 crop=crop,
                 denoise_enabled=denoise_enabled,
                 sharpen_strength=sharpen_strength,
+                hdr_output=hdr_output,
             )
         finally:
             # 发送完成信号
