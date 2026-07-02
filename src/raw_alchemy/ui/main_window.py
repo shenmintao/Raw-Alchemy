@@ -464,6 +464,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.viewport.compare_released.connect(self.show_processed)
         self.viewport.viewport_resized.connect(self._on_viewport_resized)
         self.viewport.zoom_changed.connect(self._on_viewport_zoom_changed)
+        self.viewport.roi_update_needed.connect(self._on_viewport_roi_update_needed)
 
         # Overlay label for status text (on top of viewport)
         self.preview_lbl = QLabel(tr('no_image_selected'))
@@ -717,7 +718,15 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             return
         self._zoom_update_timer.start()
 
-    def _add_preview_output_params(self, params):
+    def _on_viewport_roi_update_needed(self):
+        """Pan left the rendered ROI coverage (T7.5): re-render, debounced."""
+        if not self.current_raw_path:
+            return
+        if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
+            return
+        self._zoom_update_timer.start()
+
+    def _add_preview_output_params(self, params, include_visible_rect=True):
         params = params.copy()
         size = self.viewport.size()
         params['viewport_size'] = (size.width(), size.height())
@@ -726,6 +735,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             params['device_pixel_ratio'] = float(self.viewport.devicePixelRatioF())
         except Exception:
             params['device_pixel_ratio'] = 1.0
+        if include_visible_rect:
+            # Lets the worker do zoom>fit ROI rendering (T7.5). Excluded for
+            # baseline renders, which must always be full-frame.
+            visible_rect = self.viewport.visible_source_rect()
+            if visible_rect:
+                params['preview_visible_rect'] = visible_rect
         return params
 
     def _get_preview_params(self):
@@ -746,7 +761,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self.baseline_processor.cache_manager = self.processor.cache_manager
             self.baseline_processor.update_preview(
                 self.current_raw_path,
-                self._add_preview_output_params(current_params),
+                self._add_preview_output_params(current_params, include_visible_rect=False),
             )
 
         InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
@@ -767,7 +782,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.baseline_processor.cache_manager = self.processor.cache_manager
         self.baseline_processor.update_preview(
             self.current_raw_path,
-            self._add_preview_output_params(baseline_params),
+            self._add_preview_output_params(baseline_params, include_visible_rect=False),
         )
 
     def on_process_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
@@ -794,26 +809,33 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
                 self.on_perspective_ready(img_uint8, None)
             return
 
+        # zoom>fit ROI results (T7.5) carry the ROI rect on source_size and
+        # contain only the visible region: they update the viewport's ROI
+        # overlay but must not feed full-frame consumers (gallery thumbnail,
+        # compare/baseline states).
+        roi_rect = getattr(source_size, 'roi_rect', None)
+
         h, w, c = img_uint8.shape
         img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(img)
 
-        # Update thumbnail without scanning the full gallery.
-        item = self.gallery_items_by_path.get(image_path)
-        if item is not None:
-            scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
-            item.setIcon(QIcon(scaled))
-            rect = self.gallery_list.visualItemRect(item)
-            self.gallery_list.viewport().update(rect)
+        if roi_rect is None:
+            # Update thumbnail without scanning the full gallery.
+            item = self.gallery_items_by_path.get(image_path)
+            if item is not None:
+                scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
+                item.setIcon(QIcon(scaled))
+                rect = self.gallery_list.visualItemRect(item)
+                self.gallery_list.viewport().update(rect)
 
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
 
-        self.current.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
+        if roi_rect is None:
+            self.current.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
+            if self.original.full is None:
+                self.original.update_full(pixmap.copy(), None, img_uint8.copy(), source_size=source_size)
         if self.current_raw_path:
              self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
-
-        if self.original.full is None:
-            self.original.update_full(pixmap.copy(), None, img_uint8.copy(), source_size=source_size)
 
         if self.right_panel.auto_exp_radio.isChecked():
             self.right_panel.auto_ev_value = applied_ev
@@ -827,7 +849,10 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self.right_panel.exp_slider.valueChanged.connect(self.right_panel.exp_slider_callback)
 
         # Display via OpenGL viewport first.
-        self.viewport.set_image(img_uint8, source_size=source_size)
+        if roi_rect is not None:
+            self.viewport.set_roi_image(img_uint8, source_size, roi_rect)
+        else:
+            self.viewport.set_image(img_uint8, source_size=source_size)
         self.preview_lbl.setText("")
 
         # Defer visible scope update to the next event loop iteration.

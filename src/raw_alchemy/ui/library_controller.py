@@ -444,3 +444,10 @@ class LibraryControllerMixin:
             return
         if self.current.uint8_data is not None:
             self.viewport.set_image(self.current.uint8_data, source_size=self.current.source_size)
+        # Compare showed a full frame, which drops any ROI overlay (T7.5).
+        # Zoomed past fit, re-request the detail render — usually a pure
+        # output-cache hit, so the overlay reappears immediately.
+        if self.viewport.preview_zoom() > 1.0 and getattr(
+            self, 'processor_connection_mode', 'normal'
+        ) == 'normal':
+            self._zoom_update_timer.start()

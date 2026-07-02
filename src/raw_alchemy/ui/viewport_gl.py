@@ -77,6 +77,9 @@ class ImageViewportGL(QOpenGLWidget):
     # Signals for A/B comparison (right-click hold)
     compare_pressed = Signal()
     compare_released = Signal()
+    # Emitted while panning when the visible region leaves the rendered ROI
+    # texture's coverage (T7.5) — the owner should request a re-render.
+    roi_update_needed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -108,6 +111,19 @@ class ImageViewportGL(QOpenGLWidget):
         self._pending_data: Optional[np.ndarray] = None
         # Last uploaded image (kept for GL context recovery after minimize/restore)
         self._last_image: Optional[np.ndarray] = None
+
+        # ===== zoom>fit ROI overlay (T7.5) =====
+        # A second texture holding just the visible region (plus margins) at
+        # native resolution, drawn on top of the full-frame texture (which
+        # acts as the backdrop so pans past the margin never flash black).
+        self._roi_texture_id = 0
+        self._roi_img_width = 0
+        self._roi_img_height = 0
+        self._roi_pending_data: Optional[np.ndarray] = None
+        self._roi_last_image: Optional[np.ndarray] = None
+        # ROI rect (x, y, w, h) in full-frame pixel coordinates.
+        self._roi_rect_px: Optional[tuple] = None
+        self._has_roi = False
 
     def initializeGL(self):
         """Set up OpenGL state, shaders, buffers."""
@@ -146,14 +162,12 @@ class ImageViewportGL(QOpenGLWidget):
 
         GL.glBindVertexArray(0)
 
-        # --- Texture ---
-        self._texture_id = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture_id)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        # --- Textures (base full-frame + ROI overlay) ---
+        self._texture_id = self._create_texture()
+        self._roi_texture_id = self._create_texture()
+        # Fresh GL context: force (re)allocation on the next upload.
+        self._img_width = self._img_height = 0
+        self._roi_img_width = self._roi_img_height = 0
 
         # --- PBO for async pixel upload ---
         self._pbo_id = GL.glGenBuffers(1)
@@ -161,9 +175,22 @@ class ImageViewportGL(QOpenGLWidget):
         self._initialized = True
         logger.debug("[ViewportGL] OpenGL initialized.")
 
-        # Recover texture after GL context recreation (e.g. minimize/restore)
+        # Recover textures after GL context recreation (e.g. minimize/restore)
         if self._last_image is not None:
             self._pending_data = self._last_image
+        if self._roi_last_image is not None:
+            self._roi_pending_data = self._roi_last_image
+
+    @staticmethod
+    def _create_texture():
+        texture_id = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        return texture_id
 
     def resizeGL(self, w, h):
         GL.glViewport(0, 0, w, h)
@@ -194,19 +221,37 @@ class ImageViewportGL(QOpenGLWidget):
             return z, z * vp_aspect / img_aspect
         return z * img_aspect / vp_aspect, z
 
+    def _roi_rect_norm(self) -> Optional[tuple]:
+        """ROI rect normalized to the displayed frame, or None."""
+        if self._roi_rect_px is None:
+            return None
+        display_w, display_h = self._display_dimensions()
+        if display_w <= 0 or display_h <= 0:
+            return None
+        x, y, w, h = self._roi_rect_px
+        return (x / display_w, y / display_h, (x + w) / display_w, (y + h) / display_h)
+
     def paintGL(self):
-        """Render the current texture."""
+        """Render the base texture, then the ROI overlay on top (T7.5)."""
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
 
-        if not self._has_image:
+        if not self._has_image and not self._has_roi:
             return
 
         # Upload pending data via PBO
         if self._pending_data is not None:
-            self._upload_via_pbo(self._pending_data)
+            self._img_width, self._img_height = self._upload_via_pbo(
+                self._pending_data, self._texture_id,
+                self._img_width, self._img_height,
+            )
             self._pending_data = None
+        if self._roi_pending_data is not None:
+            self._roi_img_width, self._roi_img_height = self._upload_via_pbo(
+                self._roi_pending_data, self._roi_texture_id,
+                self._roi_img_width, self._roi_img_height,
+            )
+            self._roi_pending_data = None
 
-        # Draw textured quad
         self._shader_program.bind()
 
         # Compute aspect-correct zoom from the full source dimensions, not the
@@ -214,26 +259,55 @@ class ImageViewportGL(QOpenGLWidget):
         # the image while the user is zooming.
         scale_x, scale_y = self._display_scale()
 
+        # Full-frame backdrop quad.
+        if self._has_image:
+            self._draw_quad(
+                self._texture_id,
+                scale_x, scale_y,
+                self._offset_x, self._offset_y,
+            )
+
+        # ROI overlay quad: the same unit quad, positioned over the ROI's
+        # sub-rectangle of the image via per-draw offset/scale uniforms.
+        roi_norm = self._roi_rect_norm() if self._has_roi else None
+        if roi_norm is not None:
+            x0, y0, x1, y1 = roi_norm
+            roi_scale_x = (x1 - x0) * scale_x
+            roi_scale_y = (y1 - y0) * scale_y
+            roi_offset_x = (x0 + x1 - 1.0) * scale_x + self._offset_x
+            roi_offset_y = (1.0 - y0 - y1) * scale_y + self._offset_y
+            self._draw_quad(
+                self._roi_texture_id,
+                roi_scale_x, roi_scale_y,
+                roi_offset_x, roi_offset_y,
+            )
+
+        self._shader_program.release()
+
+    def _draw_quad(self, texture_id, scale_x, scale_y, offset_x, offset_y):
+        """Draw the unit quad with the given texture and NDC placement."""
         # Set uniforms via raw GL calls (PySide6 setUniformValue doesn't support str+float)
         scale_loc = self._shader_program.uniformLocation("u_scale")
         offset_loc = self._shader_program.uniformLocation("u_offset")
         tex_loc = self._shader_program.uniformLocation("u_texture")
 
         GL.glUniform2f(scale_loc, scale_x, scale_y)
-        GL.glUniform2f(offset_loc, self._offset_x, self._offset_y)
+        GL.glUniform2f(offset_loc, offset_x, offset_y)
 
         GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture_id)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
         GL.glUniform1i(tex_loc, 0)
 
         GL.glBindVertexArray(self._vao)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
         GL.glBindVertexArray(0)
 
-        self._shader_program.release()
+    def _upload_via_pbo(self, data: np.ndarray, texture_id, tex_width, tex_height):
+        """Upload pixel data to a texture via PBO (async-friendly).
 
-    def _upload_via_pbo(self, data: np.ndarray):
-        """Upload pixel data to texture via PBO (async-friendly)."""
+        Returns the texture's (width, height) after the upload so the caller
+        can track per-texture allocation state.
+        """
         h, w = data.shape[:2]
         data_size = data.nbytes
 
@@ -241,11 +315,11 @@ class ImageViewportGL(QOpenGLWidget):
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
 
         # Resize texture if image size changed
-        if w != self._img_width or h != self._img_height:
-            self._img_width = w
-            self._img_height = h
+        if w != tex_width or h != tex_height:
+            tex_width = w
+            tex_height = h
 
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture_id)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
             GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8,
                             w, h, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, None)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
@@ -263,20 +337,24 @@ class ImageViewportGL(QOpenGLWidget):
         else:
             logger.warning(f"[ViewportGL] glMapBuffer failed for {w}x{h} image, skipping frame")
             GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
-            return
+            return tex_width, tex_height
 
         # PBO → texture (GPU-side transfer)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture_id)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
         GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h,
                            GL.GL_RGB, GL.GL_UNSIGNED_BYTE, None)  # None = read from PBO
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+        return tex_width, tex_height
 
     def set_image(self, img_uint8: np.ndarray, source_size=None):
         """
         Update the displayed image.
         img_uint8: HxWx3 uint8 numpy array (RGB).
         This schedules a PBO upload on the next paintGL.
+
+        A full-frame image supersedes any ROI overlay (T7.5): the overlay is
+        dropped so a stale detail crop is never drawn over fresh content.
         """
         if img_uint8 is None or img_uint8.size == 0:
             return
@@ -293,7 +371,85 @@ class ImageViewportGL(QOpenGLWidget):
             self._source_width = img_uint8.shape[1]
             self._source_height = img_uint8.shape[0]
         self._has_image = True
+        self._clear_roi_state()
         self.update()  # Schedule repaint
+
+    def set_roi_image(self, img_uint8: np.ndarray, source_size, roi_rect):
+        """Update the ROI overlay texture (T7.5).
+
+        img_uint8: the rendered ROI (HxWx3 uint8 RGB).
+        source_size: (w, h) of the *full* frame the ROI belongs to — keeps
+            the viewport geometry (fit/zoom/pan) identical to a full render.
+        roi_rect: (x, y, w, h) ROI placement in full-frame pixels.
+
+        The existing full-frame texture is kept underneath as the backdrop,
+        so panning past the rendered margin degrades to the backdrop instead
+        of flashing black.
+        """
+        if img_uint8 is None or img_uint8.size == 0 or not roi_rect:
+            return
+        if not img_uint8.flags['C_CONTIGUOUS']:
+            img_uint8 = np.ascontiguousarray(img_uint8)
+
+        if source_size:
+            self._source_width = max(1, int(source_size[0]))
+            self._source_height = max(1, int(source_size[1]))
+        self._roi_pending_data = img_uint8
+        self._roi_last_image = img_uint8
+        self._roi_rect_px = tuple(int(v) for v in roi_rect)
+        self._has_roi = True
+        self.update()
+
+    def _clear_roi_state(self):
+        self._has_roi = False
+        self._roi_pending_data = None
+        self._roi_last_image = None
+        self._roi_rect_px = None
+
+    def has_roi_image(self) -> bool:
+        return self._has_roi
+
+    def visible_source_rect(self) -> Optional[tuple]:
+        """Visible region of the displayed frame, normalized to [0, 1].
+
+        Returns (x0, y0, x1, y1) with y pointing down (image convention),
+        clamped to the frame; None when nothing is displayed yet. This is
+        what the worker inverts into the zoom>fit source ROI (T7.5).
+        """
+        if not self._has_image and not self._has_roi:
+            return None
+        scale_x, scale_y = self._display_scale()
+        if scale_x <= 0.0 or scale_y <= 0.0:
+            return None
+
+        x0 = ((-1.0 - self._offset_x) / scale_x + 1.0) / 2.0
+        x1 = ((1.0 - self._offset_x) / scale_x + 1.0) / 2.0
+        y0 = (1.0 - (1.0 - self._offset_y) / scale_y) / 2.0
+        y1 = (1.0 - (-1.0 - self._offset_y) / scale_y) / 2.0
+
+        x0, x1 = max(0.0, min(x0, 1.0)), max(0.0, min(x1, 1.0))
+        y0, y1 = max(0.0, min(y0, 1.0)), max(0.0, min(y1, 1.0))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (x0, y0, x1, y1)
+
+    def _visible_within_roi(self) -> bool:
+        """True when the ROI texture still covers the visible region."""
+        if not self._has_roi:
+            return True
+        roi_norm = self._roi_rect_norm()
+        if roi_norm is None:
+            return True
+        visible = self.visible_source_rect()
+        if visible is None:
+            return True
+        tol = 1e-3
+        return (
+            visible[0] >= roi_norm[0] - tol
+            and visible[1] >= roi_norm[1] - tol
+            and visible[2] <= roi_norm[2] + tol
+            and visible[3] <= roi_norm[3] + tol
+        )
 
     def set_image_float(self, img_float: np.ndarray):
         """
@@ -311,6 +467,7 @@ class ImageViewportGL(QOpenGLWidget):
         self._has_image = False
         self._pending_data = None
         self._last_image = None
+        self._clear_roi_state()
         self._source_width = 0
         self._source_height = 0
         self._zoom = 1.0
@@ -419,6 +576,11 @@ class ImageViewportGL(QOpenGLWidget):
             self._last_mouse_pos = pos
             self._clamp_offset()
             self.update()
+            # Pans inside the ROI margin cost nothing (quads just move);
+            # once the visible region leaves the rendered coverage, ask the
+            # owner for an incremental ROI re-render (T7.5).
+            if self._has_roi and not self._visible_within_roi():
+                self.roi_update_needed.emit()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """Double click to toggle fit/100%."""

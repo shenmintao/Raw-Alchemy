@@ -9,6 +9,7 @@ All image data lives on GPU as ti.ndarray. Data crosses CPU-GPU boundary only:
 Taichi has a single global instance per process - all kernel calls are
 serialized. This QThread processes requests sequentially, which is safe.
 """
+import math
 import threading
 import time
 import os
@@ -29,7 +30,7 @@ from raw_alchemy.math_ops import (
 from raw_alchemy.pipeline.request import ProcessRequest, ProcessorParams
 from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
 from raw_alchemy.pipeline.executor import PipelineAborted, PreviewExecutor
-from raw_alchemy.pipeline.ops import _as_hashable, build_op_list
+from raw_alchemy.pipeline.ops import Op, _as_hashable, build_op_list
 from raw_alchemy.gpu_buffer import GpuImage, acquire_ndarray, gpu_pool, release_ndarray
 from raw_alchemy.onnx.denoiser import denoise_raw, clear_session as denoise_clear_session
 
@@ -37,6 +38,35 @@ from raw_alchemy.onnx.denoiser import denoise_raw, clear_session as denoise_clea
 PROXY_TARGET_PIXELS = 3_000_000
 PROXY_MIN_SOURCE_PIXELS = 4_000_000
 FULL_REFINE_IDLE_SECONDS = 1.0
+
+# ===== zoom>fit ROI rendering (T7.5) =====
+# Margin added around the visible region, per side, as a fraction of the
+# visible span (0.25 per side => the ROI spans ~1.5x the viewport, so small
+# pans stay inside the rendered region and cost zero pipeline work).
+ROI_MARGIN_FRACTION = 0.25
+# ROI edges snap outward to this pixel grid so tiny pan/zoom jitters map to
+# the same ROI rect (stable op/prefix/output-cache keys).
+ROI_ALIGN = 32
+# When the snapped ROI would cover almost the whole frame there is nothing
+# to save — render the plain full frame instead (legacy path).
+ROI_FULL_COVERAGE_FRACTION = 0.9
+# Safety cap for the ROI output texture (>= 4K viewport * 1.5 margin^2).
+ROI_MAX_OUTPUT_PIXELS = 24_000_000
+
+
+class RoiSourceSize(tuple):
+    """(width, height) of the full preview frame, plus the ROI pixel rect.
+
+    Behaves exactly like the plain ``(w, h)`` tuple emitted with full-frame
+    results (indexing/equality/unpacking), so every existing consumer of
+    ``result_ready``'s ``source_size`` keeps working. ROI-aware consumers
+    read ``roi_rect`` = (x, y, w, h) in full-frame pixel coordinates.
+    """
+
+    def __new__(cls, size, roi_rect):
+        obj = super().__new__(cls, (int(size[0]), int(size[1])))
+        obj.roi_rect = tuple(int(v) for v in roi_rect)
+        return obj
 
 
 class ImageProcessor(QThread):
@@ -634,12 +664,18 @@ class ImageProcessor(QThread):
 
     @staticmethod
     def _make_view_key(params):
-        """Key over the output resampling state only (T7.4): zoom/viewport."""
+        """Key over the output resampling state only (T7.4): zoom/viewport.
+
+        The quantized ROI rect (T7.5) is view state too: panning beyond the
+        rendered margin changes which pixels are output, but never which
+        color pipeline produced them.
+        """
         viewport_size = params.get('viewport_size')
         return (
             _as_hashable(viewport_size) if viewport_size else None,
             round(float(params.get('preview_zoom', 1.0) or 1.0), 3),
             round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2),
+            _as_hashable(params.get('_preview_roi')),
         )
 
     @classmethod
@@ -676,6 +712,136 @@ class ImageProcessor(QThread):
             target_w = max(1, int(target_w * scale))
             target_h = max(1, int(target_h * scale))
 
+        return target_w, target_h
+
+    @staticmethod
+    def _pipeline_output_dims(src_w: int, src_h: int, params: ProcessorParams):
+        """Dimensions of the pipeline output *before* the ROI crop (T7.5).
+
+        Mirrors the shape-changing ops exactly: geometry (90/270 rotation
+        swaps axes; flips keep shape), perspective (same shape) and the user
+        crop (integer snapping replicated from apply_crop_gpu). Color ops
+        never change shape.
+        """
+        w, h = int(src_w), int(src_h)
+        rotation = int(params.get('rotation', 0) or 0) % 360
+        if rotation in (90, 270):
+            w, h = h, w
+
+        crop = params.get('crop', (0.0, 0.0, 1.0, 1.0))
+        if crop and tuple(crop) != (0.0, 0.0, 1.0, 1.0):
+            x_norm, y_norm, w_norm, h_norm = (float(v) for v in crop)
+            if w_norm > 0 and h_norm > 0:
+                cx = max(0, min(int(x_norm * w), w - 1))
+                cy = max(0, min(int(y_norm * h), h - 1))
+                w = max(1, min(int(w_norm * w), w - cx))
+                h = max(1, min(int(h_norm * h), h - cy))
+        return w, h
+
+    def _compute_preview_roi(self, params: ProcessorParams):
+        """Resolve the zoom>fit visible-region ROI for this request (T7.5).
+
+        Returns ``((x, y, w, h), (full_w, full_h))`` — the ROI pixel rect in
+        pipeline-output coordinates plus the full pipeline-output size — or
+        None when ROI rendering does not apply (fit view, no viewport info,
+        idle full refine, or the ROI would cover ~the whole frame anyway).
+
+        The visible rect comes from the viewport (normalized to the displayed
+        frame); it is expanded by ROI_MARGIN_FRACTION per side so pans inside
+        the margin need no pipeline work, then snapped outward to a ROI_ALIGN
+        pixel grid so jittery pan/zoom values reuse the same cache keys.
+        """
+        if params.get('_force_full_preview', False):
+            return None
+        visible = params.get('preview_visible_rect')
+        if not visible or not params.get('viewport_size'):
+            return None
+        zoom = float(params.get('preview_zoom', 1.0) or 1.0)
+        if zoom <= 1.001:
+            return None
+        if self.cpu_linear is None:
+            return None
+
+        src_h, src_w = self.cpu_linear.shape[:2]
+        full_w, full_h = self._pipeline_output_dims(src_w, src_h, params)
+
+        try:
+            x0, y0, x1, y1 = (float(v) for v in visible)
+        except (TypeError, ValueError):
+            return None
+        x0, x1 = max(0.0, min(x0, 1.0)), max(0.0, min(x1, 1.0))
+        y0, y1 = max(0.0, min(y0, 1.0)), max(0.0, min(y1, 1.0))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        margin_x = (x1 - x0) * ROI_MARGIN_FRACTION
+        margin_y = (y1 - y0) * ROI_MARGIN_FRACTION
+        x0 = max(0.0, x0 - margin_x)
+        x1 = min(1.0, x1 + margin_x)
+        y0 = max(0.0, y0 - margin_y)
+        y1 = min(1.0, y1 + margin_y)
+
+        # Snap outward to the alignment grid, clamped to the frame.
+        px0 = max(0, (int(math.floor(x0 * full_w)) // ROI_ALIGN) * ROI_ALIGN)
+        py0 = max(0, (int(math.floor(y0 * full_h)) // ROI_ALIGN) * ROI_ALIGN)
+        px1 = min(full_w, ((int(math.ceil(x1 * full_w)) + ROI_ALIGN - 1) // ROI_ALIGN) * ROI_ALIGN)
+        py1 = min(full_h, ((int(math.ceil(y1 * full_h)) + ROI_ALIGN - 1) // ROI_ALIGN) * ROI_ALIGN)
+        roi_w = px1 - px0
+        roi_h = py1 - py0
+        if roi_w <= 0 or roi_h <= 0:
+            return None
+        if roi_w * roi_h >= ROI_FULL_COVERAGE_FRACTION * full_w * full_h:
+            return None
+        return (px0, py0, roi_w, roi_h), (full_w, full_h)
+
+    @staticmethod
+    def _insert_roi_op(ops: list, roi_rect) -> list:
+        """Insert the ROI crop after the shape ops, before the color ops.
+
+        The exposure op is always present and is the first color op, so the
+        ROI goes right before it: denoise/lens/geometry/perspective/crop run
+        (and prefix-cache) on the full frame — keeping their outputs valid
+        across pans — while everything downstream runs on the small ROI.
+        """
+        index = next(
+            (i for i, op in enumerate(ops) if op.name == "exposure"), len(ops)
+        )
+        ops = list(ops)
+        ops.insert(index, Op("roi", tuple(int(v) for v in roi_rect)))
+        return ops
+
+    @staticmethod
+    def _make_roi_target_size(
+        roi_w: int, roi_h: int, full_w: int, full_h: int, params: ProcessorParams
+    ):
+        """Output size for a ROI render (T7.5).
+
+        The display scale (screen pixels per source pixel) is derived from
+        the *full* frame — the same fit*zoom the viewport uses — then applied
+        to the ROI, capped at 1:1 native resolution. This is what lifts the
+        12MP full-frame cap: at 100%+ the visible region is output
+        pixel-for-pixel instead of a downscaled whole frame.
+        """
+        viewport_size = params.get('viewport_size')
+        if not viewport_size or full_w <= 0 or full_h <= 0:
+            return roi_w, roi_h
+        try:
+            vp_w = max(1, int(viewport_size[0]))
+            vp_h = max(1, int(viewport_size[1]))
+        except (TypeError, ValueError, IndexError):
+            return roi_w, roi_h
+
+        dpr = max(1.0, float(params.get('device_pixel_ratio', 1.0) or 1.0))
+        zoom = max(1.0, float(params.get('preview_zoom', 1.0) or 1.0))
+        fit_scale = min(vp_w * dpr / full_w, vp_h * dpr / full_h, 1.0)
+        scale = min(fit_scale * zoom, 1.0)
+
+        target_w = max(1, int(round(roi_w * scale)))
+        target_h = max(1, int(round(roi_h * scale)))
+        if target_w * target_h > ROI_MAX_OUTPUT_PIXELS:
+            shrink = (ROI_MAX_OUTPUT_PIXELS / float(target_w * target_h)) ** 0.5
+            target_w = max(1, int(target_w * shrink))
+            target_h = max(1, int(target_h * shrink))
         return target_w, target_h
 
     def _should_use_proxy_preview(self, params: ProcessorParams) -> bool:
@@ -991,6 +1157,12 @@ class ImageProcessor(QThread):
             use_proxy = self._should_use_proxy_preview(params)
             preview_source = 'proxy' if use_proxy else 'full'
             params['_preview_source'] = preview_source
+            # zoom>fit ROI rendering (T7.5): resolve the visible-region crop
+            # before the output key so the view key covers the ROI rect.
+            roi_info = None if use_proxy else self._compute_preview_roi(params)
+            if roi_info is not None:
+                params['_preview_roi'] = roi_info[0]
+                params['_roi_full_size'] = roi_info[1]
             output_key = self._make_output_key(params)
             cached_item = self.cache_manager.get(request.path)
             cached_output = cached_item.get_output(output_key) if cached_item else None
@@ -1017,6 +1189,11 @@ class ImageProcessor(QThread):
             self._invalidate_executor_prefix_if_needed(params)
 
             ops = build_op_list(params)
+            if roi_info is not None:
+                # The ROI crop is a preview-only op: it only narrows the
+                # source region, so the color-pipeline parameter caches
+                # (pipeline key, metering, lens/denoise) stay untouched.
+                ops = self._insert_roi_op(ops, roi_info[0])
             executor_source = self._select_executor_source(use_proxy)
             executor = self._get_preview_executor()
             # Cooperative cancellation (T7.3): a newer user request aborts
@@ -1072,7 +1249,21 @@ class ImageProcessor(QThread):
                 graded_arr = self.gpu_graded.arr
                 source_h, source_w = processed.shape[:2]
 
-            target_w, target_h = self._make_preview_target_size(source_w, source_h, params)
+            if roi_info is not None:
+                # ROI render (T7.5): the executor output is the ROI at native
+                # resolution; size it by the full-frame display scale and
+                # report the *full* frame as source_size (plus the ROI rect)
+                # so the viewport geometry stays stable.
+                roi_rect, (full_w, full_h) = roi_info
+                target_w, target_h = self._make_roi_target_size(
+                    source_w, source_h, full_w, full_h, params
+                )
+                output_source_size = RoiSourceSize((full_w, full_h), roi_rect)
+            else:
+                target_w, target_h = self._make_preview_target_size(
+                    source_w, source_h, params
+                )
+                output_source_size = (source_w, source_h)
 
             if self._gpu_uint8 is None or self._gpu_uint8.shape != (target_h, target_w, 3):
                 self._release_gpu_uint8()
@@ -1084,7 +1275,6 @@ class ImageProcessor(QThread):
                 resize_float_to_uint8_gpu(graded_arr, self._gpu_uint8)
 
             img_uint8 = self._gpu_uint8.to_numpy()
-            output_source_size = (source_w, source_h)
 
             t_end = time.perf_counter()
             self.last_preview_source = preview_source
@@ -1092,7 +1282,8 @@ class ImageProcessor(QThread):
             logger.info(
                 f"[Worker] Unified pipeline: {(t_end - t_start)*1000:.0f}ms total, "
                 f"output: {(t_end - t_out)*1000:.0f}ms "
-                f"source={preview_source} "
+                f"source={preview_source}"
+                f"{' roi=' + str(params['_preview_roi']) if roi_info is not None else ''} "
                 f"({source_w}x{source_h} -> {target_w}x{target_h}, ops={len(ops)})"
             )
 

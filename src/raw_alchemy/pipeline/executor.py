@@ -8,6 +8,7 @@ from raw_alchemy import metering, utils
 from raw_alchemy.gpu_buffer import GpuImage
 from raw_alchemy.math_ops import (
     apply_crop_gpu,
+    apply_crop_pixels_gpu,
     apply_gain_inplace,
     apply_geometry_gpu,
     apply_highlight_shadow_inplace,
@@ -183,6 +184,18 @@ class _BaseExecutor:
         if op.name == "crop":
             dst = GpuImage()
             apply_crop_gpu(buf, dst, op.params[0])
+            buf.clear()
+            return dst
+
+        if op.name == "roi":
+            # Preview-only visible-region crop (T7.5): integer pixel rect in
+            # the coordinate space of the buffer at this pipeline position
+            # (after geometry/perspective/crop, before the color ops). The
+            # worker injects it so zoom>fit runs process only the on-screen
+            # region plus margins; export op lists never contain it.
+            x, y, w, h = op.params
+            dst = GpuImage()
+            apply_crop_pixels_gpu(buf, dst, int(x), int(y), int(w), int(h))
             buf.clear()
             return dst
 
