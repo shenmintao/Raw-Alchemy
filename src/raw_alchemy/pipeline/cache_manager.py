@@ -25,6 +25,14 @@ class CachedImage:
     evicting whole entries, and aliased arrays (e.g. ``corrected_data`` is
     the same object as ``linear_data`` when lens correction is a passthrough)
     are only counted once.
+
+    Threading: entries are shared between two processor worker threads (the
+    main and baseline processors share one manager) and are degraded in place
+    by lock-held eviction (``set_limit_mb`` on the GUI thread). ``self.lock``
+    guards the output slots, the cached-array fields and the size accounting.
+    Lock order is ``manager.lock -> entry.lock`` (eviction and
+    ``notify_entry_updated`` take the entry lock while holding the manager
+    lock); entry methods must therefore never call back into the manager.
     """
 
     # Field-level eviction stages, applied in order before a whole entry is
@@ -45,6 +53,10 @@ class CachedImage:
         proxy_corrected_data: Optional[np.ndarray] = None,
         proxy_lens_key: Any = None,
     ):
+        # Entry-level lock (see class docstring). Reentrant because
+        # drop_stage() re-accounts via update_size() while already holding it.
+        self.lock = threading.RLock()
+
         self.path = path
         self.linear_data = linear_data
         self.proxy_linear = proxy_linear
@@ -97,20 +109,21 @@ class CachedImage:
             seen.add(key)
             return arr.nbytes / (1024 * 1024)
 
-        self.field_sizes_mb = {
-            'linear': unique_mb(self.linear_data),
-            'proxy': unique_mb(self.proxy_linear) + unique_mb(self.proxy_corrected_data),
-            'corrected': unique_mb(self.corrected_data),
-            'denoise': (
-                unique_mb(self.denoise_full)
-                + unique_mb(self.denoise_original)
-                + unique_mb(self.sharpened_data)
-            ),
-            'output': unique_mb(self.output_uint8)
-            + sum(unique_mb(img) for img, _ev, _size in self._output_slots.values()),
-        }
-        self.size_mb = sum(self.field_sizes_mb.values())
-        return self.size_mb
+        with self.lock:
+            self.field_sizes_mb = {
+                'linear': unique_mb(self.linear_data),
+                'proxy': unique_mb(self.proxy_linear) + unique_mb(self.proxy_corrected_data),
+                'corrected': unique_mb(self.corrected_data),
+                'denoise': (
+                    unique_mb(self.denoise_full)
+                    + unique_mb(self.denoise_original)
+                    + unique_mb(self.sharpened_data)
+                ),
+                'output': unique_mb(self.output_uint8)
+                + sum(unique_mb(img) for img, _ev, _size in self._output_slots.values()),
+            }
+            self.size_mb = sum(self.field_sizes_mb.values())
+            return self.size_mb
 
     def get_output(self, key):
         """Look up a cached final output by its output key (T7.4).
@@ -118,22 +131,22 @@ class CachedImage:
         Returns ``(uint8_image, applied_ev, source_size)`` or None. Checks
         the primary (most recent) slot first, then the secondary slots;
         secondary hits are marked most-recently-used.
+
+        Reads the primary fields exactly once, under the entry lock, and
+        returns local references: a concurrent field-level eviction
+        (settings-page cap change on another thread) can therefore never
+        produce a torn ``(None, ev, size)`` hit or a key/image mismatch.
         """
         if key is None:
             return None
-        if self.output_key == key and self.output_uint8 is not None:
-            return (self.output_uint8, self.output_ev, self.output_source_size)
-        slot = self._output_slots.get(key)
-        if slot is not None:
-            try:
+        with self.lock:
+            img = self.output_uint8
+            if self.output_key == key and img is not None:
+                return (img, self.output_ev, self.output_source_size)
+            slot = self._output_slots.get(key)
+            if slot is not None:
                 self._output_slots.move_to_end(key)
-            except KeyError:
-                # A concurrent field-level eviction (settings-page cap change
-                # on another thread) may clear the slots between the get and
-                # the LRU touch; the already-fetched slot is still valid.
-                pass
             return slot
-        return None
 
     def store_output(self, key, img_uint8, applied_ev, source_size):
         """Store a final output, keeping up to OUTPUT_SLOT_LIMIT slots (T7.4).
@@ -143,60 +156,67 @@ class CachedImage:
         are evicted LRU beyond the limit — so a fit view and the current
         zoom level can each keep their output alive at the same time.
         """
-        if (
-            self.output_uint8 is not None
-            and self.output_key is not None
-            and self.output_key != key
-        ):
-            self._output_slots[self.output_key] = (
-                self.output_uint8,
-                self.output_ev,
-                self.output_source_size,
-            )
-            self._output_slots.move_to_end(self.output_key)
-        self._output_slots.pop(key, None)
-        self.output_uint8 = img_uint8
-        self.output_key = key
-        self.output_ev = applied_ev
-        self.output_source_size = source_size
-        while len(self._output_slots) > OUTPUT_SLOT_LIMIT - 1:
-            self._output_slots.popitem(last=False)
+        with self.lock:
+            if (
+                self.output_uint8 is not None
+                and self.output_key is not None
+                and self.output_key != key
+            ):
+                self._output_slots[self.output_key] = (
+                    self.output_uint8,
+                    self.output_ev,
+                    self.output_source_size,
+                )
+                self._output_slots.move_to_end(self.output_key)
+            self._output_slots.pop(key, None)
+            self.output_uint8 = img_uint8
+            self.output_key = key
+            self.output_ev = applied_ev
+            self.output_source_size = source_size
+            while len(self._output_slots) > OUTPUT_SLOT_LIMIT - 1:
+                self._output_slots.popitem(last=False)
 
     def drop_stage(self, stage: str) -> float:
         """Drop one eviction stage's arrays (and their validity keys).
 
-        Returns the freed size in MB (0.0 when the stage held nothing, or
-        only aliases of arrays still referenced by other fields).
+        Returns the entry-size delta in MB: usually the freed size, 0.0 when
+        the stage held nothing (or only aliases of arrays still referenced by
+        other fields), and possibly *negative* — the re-account runs over the
+        whole entry, so it also picks up in-place growth a worker published
+        but has not re-accounted via ``notify_entry_updated`` yet. Callers
+        must apply the delta unconditionally to keep the running counter in
+        sync with the entries.
         """
-        if stage == "corrected":
-            if self.corrected_data is None:
-                return 0.0
-            self.corrected_data = None
-            self.lens_key = None
-        elif stage == "output":
-            if self.output_uint8 is None and not self._output_slots:
-                return 0.0
-            self.output_uint8 = None
-            self.output_key = None
-            self._output_slots.clear()
-        elif stage == "denoise":
-            if (
-                self.denoise_full is None
-                and self.denoise_original is None
-                and self.sharpened_data is None
-            ):
-                return 0.0
-            self.denoise_full = None
-            self.denoise_original = None
-            self.denoise_key = None
-            self.sharpened_data = None
-            self.sharpen_key = None
-        else:
-            raise ValueError(f"Unknown eviction stage: {stage}")
+        with self.lock:
+            if stage == "corrected":
+                if self.corrected_data is None:
+                    return 0.0
+                self.corrected_data = None
+                self.lens_key = None
+            elif stage == "output":
+                if self.output_uint8 is None and not self._output_slots:
+                    return 0.0
+                self.output_uint8 = None
+                self.output_key = None
+                self._output_slots.clear()
+            elif stage == "denoise":
+                if (
+                    self.denoise_full is None
+                    and self.denoise_original is None
+                    and self.sharpened_data is None
+                ):
+                    return 0.0
+                self.denoise_full = None
+                self.denoise_original = None
+                self.denoise_key = None
+                self.sharpened_data = None
+                self.sharpen_key = None
+            else:
+                raise ValueError(f"Unknown eviction stage: {stage}")
 
-        before = self.size_mb
-        self.update_size()
-        return before - self.size_mb
+            before = self.size_mb
+            self.update_size()
+            return before - self.size_mb
 
 
 class ImageCacheManager:
@@ -266,9 +286,11 @@ class ImageCacheManager:
             item = self.cache.get(path)
             if item is None:
                 return
-            old_size = item.size_mb
-            item.update_size()
-            self.current_memory_mb += item.size_mb - old_size
+            # manager.lock -> entry.lock, the same order eviction uses.
+            with item.lock:
+                old_size = item.size_mb
+                item.update_size()
+                self.current_memory_mb += item.size_mb - old_size
             self.cache.move_to_end(path)
             self._evict_if_needed()
 
@@ -309,8 +331,13 @@ class ImageCacheManager:
                 if self.current_memory_mb <= quota:
                     break
                 freed = item.drop_stage(stage)
+                # Apply the delta unconditionally: drop_stage re-accounts the
+                # whole entry, so a negative delta (unaccounted in-place
+                # growth discovered before the worker's notify_entry_updated)
+                # must also land in the counter, or it drifts from the
+                # entries permanently.
+                self.current_memory_mb -= freed
                 if freed > 0.0:
-                    self.current_memory_mb -= freed
                     dropped_fields += 1
                     logger.debug(
                         f"[Cache] Evicted field '{stage}' of {path} "

@@ -499,23 +499,24 @@ class ImageProcessor(QThread):
 
         if cached_item:
             logger.info(f"[Worker] Cache Hit: {os.path.basename(path)}")
-            self.cpu_linear = cached_item.linear_data
-            self.cpu_proxy_linear = cached_item.proxy_linear
-            self.exif_data = cached_item.exif_data
-            self.exif_metadata = cached_item.exif_metadata
-            self.cached_lens_key = cached_item.lens_key
-            self.cached_proxy_lens_key = cached_item.proxy_lens_key
+            # Snapshot under the entry lock so the correlated (data, key)
+            # pairs stay consistent against a concurrent field-level eviction
+            # (GUI-thread cap change) or the baseline processor's write-backs.
+            with cached_item.lock:
+                self.cpu_linear = cached_item.linear_data
+                self.cpu_proxy_linear = cached_item.proxy_linear
+                self.exif_data = cached_item.exif_data
+                self.exif_metadata = cached_item.exif_metadata
+                self.cached_lens_key = cached_item.lens_key
+                self.cached_proxy_lens_key = cached_item.proxy_lens_key
 
-            if cached_item.corrected_data is not None:
                 self.cpu_corrected = cached_item.corrected_data
-            else:
-                self.cpu_corrected = None
-            self.cpu_proxy_corrected = cached_item.proxy_corrected_data
+                self.cpu_proxy_corrected = cached_item.proxy_corrected_data
 
-            # Restore denoise cache
-            self.cached_denoise_full = cached_item.denoise_full
-            self.cached_denoise_original = cached_item.denoise_original
-            self.last_denoise_key = cached_item.denoise_key
+                # Restore denoise cache
+                self.cached_denoise_full = cached_item.denoise_full
+                self.cached_denoise_original = cached_item.denoise_original
+                self.last_denoise_key = cached_item.denoise_key
 
         else:
             logger.info(f"[Worker] Cache Miss - Loading: {os.path.basename(path)}")
@@ -548,7 +549,9 @@ class ImageProcessor(QThread):
 
         # Reset pipeline caches for new image
         if path != self.current_path:
-            if cached_item and cached_item.corrected_data is not None:
+            # Decide from the locked snapshot, not a re-read of the entry (a
+            # concurrent eviction may have cleared the field since).
+            if cached_item and self.cpu_corrected is not None:
                 # Cache hit with lens correction: only invalidate downstream
                 self.gpu_graded.clear()
                 self._release_gpu_uint8()
@@ -1027,17 +1030,28 @@ class ImageProcessor(QThread):
 
         cached_item = self.cache_manager.get(self._executor_path) if self._executor_path else None
         if cached_item:
-            if self._executor_using_proxy:
-                cached_item.proxy_corrected_data = corrected
-                cached_item.proxy_lens_key = current_lens_key
-            else:
-                cached_item.corrected_data = corrected
-                cached_item.lens_key = current_lens_key
-                if cached_item.proxy_linear is not None:
-                    cached_item.proxy_corrected_data = self._make_proxy(corrected)
+            # Compute the proxy resize outside the entry lock, then publish
+            # the correlated (data, lens_key) pairs atomically so a lock-held
+            # field-level eviction on another thread can never observe (or
+            # produce) a torn pair.
+            proxy_corrected = None
+            if not self._executor_using_proxy and cached_item.proxy_linear is not None:
+                proxy_corrected = self._make_proxy(corrected)
+            with cached_item.lock:
+                if self._executor_using_proxy:
+                    cached_item.proxy_corrected_data = corrected
                     cached_item.proxy_lens_key = current_lens_key
+                else:
+                    cached_item.corrected_data = corrected
+                    cached_item.lens_key = current_lens_key
+                    if proxy_corrected is not None:
+                        cached_item.proxy_corrected_data = proxy_corrected
+                        cached_item.proxy_lens_key = current_lens_key
             # Re-account the entry and apply quota eviction (T7.6): a
             # full-size corrected write-back can push the cache over budget.
+            # Must run outside the entry lock — it takes manager.lock then
+            # entry.lock (the eviction order); nesting it inside the entry
+            # lock would invert the order and deadlock.
             self.cache_manager.notify_entry_updated(self._executor_path)
 
         return corrected
