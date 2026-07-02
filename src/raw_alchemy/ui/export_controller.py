@@ -69,7 +69,14 @@ class ExportControllerMixin:
             )
             self.btn_export_curr.setEnabled(False)
 
-            cached_data = self.processor.get_cached_for_export()
+            # Pass the current UI params: the worker key-validates its
+            # cached corrected data against them and returns None when the
+            # preview state and the cached export source have diverged
+            # (e.g. after an output-cache-hit round trip) — in that case
+            # the full re-processing path below keeps export == preview.
+            cached_data = self.processor.get_cached_for_export(
+                self.right_panel.get_params()
+            )
             if cached_data is not None:
                 self.run_export(
                     self.current_raw_path,

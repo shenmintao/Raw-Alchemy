@@ -3,11 +3,11 @@ from PySide6.QtCore import Signal, QThread, QObject
 
 from qfluentwidgets import (
     SubtitleLabel, StrongBodyLabel, BodyLabel, CaptionLabel,
-    SimpleCardWidget, ScrollArea, ComboBox, PrimaryPushButton, 
-    PushButton, ProgressBar, InfoBar, InfoBarPosition, SwitchButton
+    SimpleCardWidget, ScrollArea, ComboBox, PrimaryPushButton,
+    PushButton, ProgressBar, InfoBar, InfoBarPosition, SwitchButton, SpinBox
 )
 
-from raw_alchemy import i18n
+from raw_alchemy import config, i18n
 from raw_alchemy.i18n import tr
 
 
@@ -32,6 +32,9 @@ class CudaDownloadWorker(QObject):
 class SettingsPanel(QWidget):
     """Settings panel widget"""
     write_sidecar_changed = Signal(bool)
+    cache_limit_changed = Signal(int)
+    thumb_cache_changed = Signal(bool)
+    thumb_cache_clear_requested = Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,7 +91,56 @@ class SettingsPanel(QWidget):
         editing_layout.addWidget(editing_title)
         editing_layout.addWidget(self.write_sidecar_switch)
         settings_layout.addWidget(editing_card)
-        
+
+        # Performance / memory Settings Card (T7.6)
+        perf_card = SimpleCardWidget()
+        perf_layout = QVBoxLayout(perf_card)
+        perf_layout.setSpacing(10)
+        perf_title = StrongBodyLabel(tr('performance'))
+        perf_layout.addWidget(perf_title)
+
+        cache_row = QHBoxLayout()
+        cache_row.addWidget(BodyLabel(tr('cache_limit')))
+        self.cache_limit_spin = SpinBox()
+        self.cache_limit_spin.setRange(1024, 65536)
+        self.cache_limit_spin.setSingleStep(1024)
+        self.cache_limit_spin.setSuffix(" MB")
+        self.cache_limit_spin.setValue(int(config.CACHE_LIMIT_MB))
+        self.cache_limit_spin.valueChanged.connect(self.cache_limit_changed.emit)
+        cache_row.addWidget(self.cache_limit_spin)
+        cache_row.addStretch()
+        perf_layout.addLayout(cache_row)
+
+        cache_hint = CaptionLabel(tr('cache_limit_hint'))
+        cache_hint.setStyleSheet("color: gray;")
+        perf_layout.addWidget(cache_hint)
+        settings_layout.addWidget(perf_card)
+
+        # Thumbnail cache Settings Card (T7.8)
+        thumb_card = SimpleCardWidget()
+        thumb_layout = QVBoxLayout(thumb_card)
+        thumb_layout.setSpacing(10)
+        thumb_title = StrongBodyLabel(tr('thumb_cache'))
+        thumb_layout.addWidget(thumb_title)
+
+        self.thumb_cache_switch = SwitchButton(text=tr('thumb_cache_enable'))
+        self.thumb_cache_switch.setChecked(True)
+        self.thumb_cache_switch.checkedChanged.connect(self.thumb_cache_changed.emit)
+        thumb_layout.addWidget(self.thumb_cache_switch)
+
+        thumb_btn_row = QHBoxLayout()
+        self.clear_thumb_cache_btn = PushButton(tr('clear_thumb_cache'))
+        self.clear_thumb_cache_btn.clicked.connect(self.thumb_cache_clear_requested.emit)
+        thumb_btn_row.addWidget(self.clear_thumb_cache_btn)
+        thumb_btn_row.addStretch()
+        thumb_layout.addLayout(thumb_btn_row)
+
+        thumb_hint = CaptionLabel(tr('thumb_cache_hint'))
+        thumb_hint.setStyleSheet("color: gray;")
+        thumb_layout.addWidget(thumb_hint)
+        settings_layout.addWidget(thumb_card)
+
+
         # GPU Acceleration Settings Card
         gpu_card = SimpleCardWidget()
         gpu_layout = QVBoxLayout(gpu_card)
@@ -147,6 +199,16 @@ class SettingsPanel(QWidget):
         self.write_sidecar_switch.blockSignals(True)
         self.write_sidecar_switch.setChecked(bool(enabled))
         self.write_sidecar_switch.blockSignals(False)
+
+    def set_cache_limit_mb(self, limit_mb: int):
+        self.cache_limit_spin.blockSignals(True)
+        self.cache_limit_spin.setValue(int(limit_mb))
+        self.cache_limit_spin.blockSignals(False)
+
+    def set_thumb_cache_enabled(self, enabled: bool):
+        self.thumb_cache_switch.blockSignals(True)
+        self.thumb_cache_switch.setChecked(bool(enabled))
+        self.thumb_cache_switch.blockSignals(False)
     
     def _update_cuda_status(self):
         """Update CUDA status display based on current state."""

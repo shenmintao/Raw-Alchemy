@@ -1,6 +1,6 @@
 import os
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QFileDialog, QListWidgetItem, QMessageBox, QTreeView
 from qfluentwidgets import InfoBar
@@ -92,19 +92,108 @@ class LibraryControllerMixin:
         self._scroll_target_path = None
 
     def start_thumbnail_scan(self, folder):
-        if self.thumb_worker:
-            self.thumb_worker.stop()
-            self.thumb_worker.wait()
+        # Never wait() on the UI thread: retire the old worker asynchronously
+        # (stop flag + finished -> deleteLater) and start the new one at once.
+        self._retire_thumbnail_worker()
 
         self.loading_label.setText(tr("loading_thumbnails"))
         self.loading_label.show()
 
-        self.thumb_worker = ThumbnailWorker(folder)
-        self.thumb_worker.placeholder_ready.connect(self.add_gallery_item)
-        self.thumb_worker.thumbnail_ready.connect(self.update_gallery_item)
-        self.thumb_worker.progress_update.connect(self.on_thumbnail_progress)
-        self.thumb_worker.finished_scanning.connect(self.on_thumbnail_finished)
-        self.thumb_worker.start()
+        # T7.8: the shared thumbnail cache (disk + session memory) makes a
+        # revisit of this folder redisplay from cache instead of re-decoding.
+        worker = ThumbnailWorker(folder, disk_cache=getattr(self, "thumb_cache", None))
+        self.thumb_worker = worker
+        worker.placeholders_ready.connect(self._on_thumbnail_placeholders)
+        worker.thumbnail_ready.connect(self._on_thumbnail_image_ready)
+        worker.progress_update.connect(self._on_thumbnail_progress_update)
+        worker.finished_scanning.connect(self._on_thumbnail_scan_finished)
+        worker.start(QThread.Priority.LowPriority)
+
+    def _retire_thumbnail_worker(self):
+        """Stop the current worker without blocking the UI thread."""
+        worker = getattr(self, "thumb_worker", None)
+        self.thumb_worker = None
+        if worker is None:
+            return
+        worker.stop()
+        if not worker.isRunning():
+            worker.deleteLater()
+            return
+        # Keep a python reference until the thread finishes, otherwise the
+        # QThread C++ object could be destroyed while still running.
+        self._retired_thumb_workers.append(worker)
+        worker.finished.connect(self._on_retired_thumb_worker_finished)
+        if worker.isFinished():
+            # finished may have been emitted before we connected
+            self._reap_thumbnail_worker(worker)
+
+    def _on_retired_thumb_worker_finished(self):
+        worker = self.sender()
+        if worker is not None:
+            self._reap_thumbnail_worker(worker)
+
+    def _reap_thumbnail_worker(self, worker):
+        if worker in self._retired_thumb_workers:
+            self._retired_thumb_workers.remove(worker)
+            worker.deleteLater()
+
+    # --- Worker signal handlers -------------------------------------------
+    # A retired worker may still have queued emissions in flight; guard every
+    # handler so stale signals from a previous folder never touch the gallery.
+
+    def _on_thumbnail_placeholders(self, paths, image):
+        if self.sender() is not self.thumb_worker:
+            return
+        self.add_gallery_items(paths, image)
+        self._update_thumbnail_priority()
+
+    def _on_thumbnail_image_ready(self, path, image):
+        if self.sender() is not self.thumb_worker:
+            return
+        self.update_gallery_item(path, image)
+
+    def _on_thumbnail_progress_update(self, current, total):
+        if self.sender() is not self.thumb_worker:
+            return
+        self.on_thumbnail_progress(current, total)
+
+    def _on_thumbnail_scan_finished(self):
+        if self.sender() is not self.thumb_worker:
+            return
+        self.on_thumbnail_finished()
+
+    # --- Viewport-priority scheduling --------------------------------------
+
+    def _on_gallery_scrolled(self, _value=0):
+        self._thumb_priority_timer.start()
+
+    def _update_thumbnail_priority(self):
+        worker = getattr(self, "thumb_worker", None)
+        if worker is None:
+            return
+        worker.set_priority_paths(self._visible_gallery_paths())
+
+    def _visible_gallery_paths(self):
+        """Paths of gallery items in (or within one viewport height of) the
+        visible area, in row order."""
+        gallery = self.gallery_list
+        viewport_rect = gallery.viewport().rect()
+        if not viewport_rect.isValid():
+            return []
+        probe = viewport_rect.adjusted(
+            0, -viewport_rect.height(), 0, viewport_rect.height()
+        )
+        paths = []
+        seen_visible = False
+        for row in range(gallery.count()):
+            item = gallery.item(row)
+            rect = gallery.visualItemRect(item)
+            if rect.intersects(probe):
+                paths.append(item.data(Qt.ItemDataRole.UserRole))
+                seen_visible = True
+            elif seen_visible and rect.top() > probe.bottom():
+                break  # rows are laid out top-to-bottom; rest is below
+        return paths
 
     def update_status(self, text):
         self.loading_label.setText(text)
@@ -119,6 +208,23 @@ class LibraryControllerMixin:
     def on_thumbnail_finished(self):
         self.loading_label.hide()
         self._preload_neighbors(0, count=2)
+
+    def add_gallery_items(self, paths, image):
+        """Add a batch of placeholder items sharing one QIcon (single relayout)."""
+        icon = QIcon(QPixmap.fromImage(image))
+        self.gallery_list.setUpdatesEnabled(False)
+        try:
+            for path in paths:
+                name = os.path.basename(path)
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                item.setIcon(icon)
+                is_marked = path in self.marked_files
+                item.setText(f"{MARK_PREFIX} {name}" if is_marked else name)
+                self.gallery_list.addItem(item)
+                self.gallery_items_by_path[path] = item
+        finally:
+            self.gallery_list.setUpdatesEnabled(True)
 
     def add_gallery_item(self, path, image):
         name = os.path.basename(path)
@@ -338,3 +444,10 @@ class LibraryControllerMixin:
             return
         if self.current.uint8_data is not None:
             self.viewport.set_image(self.current.uint8_data, source_size=self.current.source_size)
+        # Compare showed a full frame, which drops any ROI overlay (T7.5).
+        # Zoomed past fit, re-request the detail render — usually a pure
+        # output-cache hit, so the overlay reappears immediately.
+        if self.viewport.preview_zoom() > 1.0 and getattr(
+            self, 'processor_connection_mode', 'normal'
+        ) == 'normal':
+            self._zoom_update_timer.start()

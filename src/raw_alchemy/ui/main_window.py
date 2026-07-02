@@ -16,8 +16,9 @@ from qfluentwidgets import (
     ToolButton, PushButton,
 )
 
-from raw_alchemy import lensfun_wrapper, i18n, sidecar
+from raw_alchemy import config, lensfun_wrapper, i18n, sidecar
 from raw_alchemy.i18n import tr
+from raw_alchemy.thumb_cache import ThumbnailCache
 from loguru import logger
 
 # New structure imports
@@ -62,7 +63,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.file_params_cache = {}  # path -> params dict
         self.file_baseline_params_cache = {}  # path -> baseline params dict
         self.write_sidecar_enabled = True
-        
+
+        # Persistent thumbnail cache (T7.8); shared across folder switches
+        # and toggled from Settings.
+        self.thumb_cache = ThumbnailCache()
+        self.thumb_cache_enabled = True
+
         # Last used paths for file dialogs
         self.last_folder_path = None  # Last opened gallery folder
         self.last_lut_folder_path = None  # Last LUT folder
@@ -83,6 +89,16 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
 
         # Workers
         self.thumb_worker = None
+        self._retired_thumb_workers = []
+
+        # Debounced viewport-priority updates for the thumbnail worker
+        self._thumb_priority_timer = QTimer()
+        self._thumb_priority_timer.setSingleShot(True)
+        self._thumb_priority_timer.setInterval(100)
+        self._thumb_priority_timer.timeout.connect(self._update_thumbnail_priority)
+        self.gallery_list.verticalScrollBar().valueChanged.connect(
+            self._on_gallery_scrolled
+        )
         self.processor = ImageProcessor()
         self.processor.result_ready.connect(self.on_process_result)
         self.processor.load_complete.connect(self.on_load_complete)
@@ -205,7 +221,20 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.write_sidecar_enabled = settings.get('write_sidecar', True)
         if hasattr(self, 'settings_widget'):
             self.settings_widget.set_write_sidecar_enabled(self.write_sidecar_enabled)
-    
+
+        try:
+            self.cache_limit_mb = int(settings.get('cache_limit_mb', config.CACHE_LIMIT_MB))
+        except (TypeError, ValueError):
+            self.cache_limit_mb = int(config.CACHE_LIMIT_MB)
+        self._apply_cache_limit(self.cache_limit_mb)
+        if hasattr(self, 'settings_widget'):
+            self.settings_widget.set_cache_limit_mb(self.cache_limit_mb)
+
+        self.thumb_cache_enabled = bool(settings.get('thumb_cache', True))
+        self.thumb_cache.set_enabled(self.thumb_cache_enabled)
+        if hasattr(self, 'settings_widget'):
+            self.settings_widget.set_thumb_cache_enabled(self.thumb_cache_enabled)
+
     def restore_ui(self):
         """Restore UI state from saved settings"""
         if self.last_lut_folder_path and os.path.exists(self.last_lut_folder_path):
@@ -272,6 +301,8 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             'last_lensfun_db_path': self.last_lensfun_db_path,
             'last_export_path': self.last_export_path,
             'write_sidecar': self.write_sidecar_enabled,
+            'cache_limit_mb': int(getattr(self, 'cache_limit_mb', config.CACHE_LIMIT_MB)),
+            'thumb_cache': bool(getattr(self, 'thumb_cache_enabled', True)),
         }
         i18n.save_app_settings(settings)
 
@@ -433,6 +464,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.viewport.compare_released.connect(self.show_processed)
         self.viewport.viewport_resized.connect(self._on_viewport_resized)
         self.viewport.zoom_changed.connect(self._on_viewport_zoom_changed)
+        self.viewport.roi_update_needed.connect(self._on_viewport_roi_update_needed)
 
         # Overlay label for status text (on top of viewport)
         self.preview_lbl = QLabel(tr('no_image_selected'))
@@ -532,7 +564,33 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.settings_widget = SettingsPanel()
         self.settings_widget.setObjectName("settingsInterface")
         self.settings_widget.write_sidecar_changed.connect(self.on_write_sidecar_changed)
+        self.settings_widget.cache_limit_changed.connect(self.on_cache_limit_changed)
+        self.settings_widget.thumb_cache_changed.connect(self.on_thumb_cache_changed)
+        self.settings_widget.thumb_cache_clear_requested.connect(
+            self.on_thumb_cache_clear_requested
+        )
         self.addSubInterface(self.settings_widget, FIF.SETTING, tr('settings'))
+
+    def on_cache_limit_changed(self, limit_mb):
+        self.cache_limit_mb = int(limit_mb)
+        self._apply_cache_limit(self.cache_limit_mb)
+
+    def on_thumb_cache_changed(self, enabled):
+        """Toggle the persistent thumbnail cache (T7.8). Off = legacy
+        behavior: every folder visit re-extracts thumbnails."""
+        self.thumb_cache_enabled = bool(enabled)
+        self.thumb_cache.set_enabled(self.thumb_cache_enabled)
+
+    def on_thumb_cache_clear_requested(self):
+        removed = self.thumb_cache.clear()
+        InfoBar.success(tr('thumb_cache_cleared'), str(removed), parent=self)
+
+    def _apply_cache_limit(self, limit_mb):
+        """Apply the image-cache memory cap to all processors (T7.6)."""
+        for processor in (self.processor, self.baseline_processor):
+            manager = getattr(processor, 'cache_manager', None)
+            if manager is not None:
+                manager.set_limit_mb(limit_mb)
 
     def on_write_sidecar_changed(self, enabled):
         self.write_sidecar_enabled = bool(enabled)
@@ -660,7 +718,15 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             return
         self._zoom_update_timer.start()
 
-    def _add_preview_output_params(self, params):
+    def _on_viewport_roi_update_needed(self):
+        """Pan left the rendered ROI coverage (T7.5): re-render, debounced."""
+        if not self.current_raw_path:
+            return
+        if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
+            return
+        self._zoom_update_timer.start()
+
+    def _add_preview_output_params(self, params, include_visible_rect=True):
         params = params.copy()
         size = self.viewport.size()
         params['viewport_size'] = (size.width(), size.height())
@@ -669,6 +735,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             params['device_pixel_ratio'] = float(self.viewport.devicePixelRatioF())
         except Exception:
             params['device_pixel_ratio'] = 1.0
+        if include_visible_rect:
+            # Lets the worker do zoom>fit ROI rendering (T7.5). Excluded for
+            # baseline renders, which must always be full-frame.
+            visible_rect = self.viewport.visible_source_rect()
+            if visible_rect:
+                params['preview_visible_rect'] = visible_rect
         return params
 
     def _get_preview_params(self):
@@ -689,7 +761,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self.baseline_processor.cache_manager = self.processor.cache_manager
             self.baseline_processor.update_preview(
                 self.current_raw_path,
-                self._add_preview_output_params(current_params),
+                self._add_preview_output_params(current_params, include_visible_rect=False),
             )
 
         InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
@@ -710,7 +782,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.baseline_processor.cache_manager = self.processor.cache_manager
         self.baseline_processor.update_preview(
             self.current_raw_path,
-            self._add_preview_output_params(baseline_params),
+            self._add_preview_output_params(baseline_params, include_visible_rect=False),
         )
 
     def on_process_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
@@ -737,26 +809,33 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
                 self.on_perspective_ready(img_uint8, None)
             return
 
+        # zoom>fit ROI results (T7.5) carry the ROI rect on source_size and
+        # contain only the visible region: they update the viewport's ROI
+        # overlay but must not feed full-frame consumers (gallery thumbnail,
+        # compare/baseline states).
+        roi_rect = getattr(source_size, 'roi_rect', None)
+
         h, w, c = img_uint8.shape
         img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(img)
 
-        # Update thumbnail without scanning the full gallery.
-        item = self.gallery_items_by_path.get(image_path)
-        if item is not None:
-            scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
-            item.setIcon(QIcon(scaled))
-            rect = self.gallery_list.visualItemRect(item)
-            self.gallery_list.viewport().update(rect)
+        if roi_rect is None:
+            # Update thumbnail without scanning the full gallery.
+            item = self.gallery_items_by_path.get(image_path)
+            if item is not None:
+                scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
+                item.setIcon(QIcon(scaled))
+                rect = self.gallery_list.visualItemRect(item)
+                self.gallery_list.viewport().update(rect)
 
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
 
-        self.current.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
+        if roi_rect is None:
+            self.current.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
+            if self.original.full is None:
+                self.original.update_full(pixmap.copy(), None, img_uint8.copy(), source_size=source_size)
         if self.current_raw_path:
              self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
-
-        if self.original.full is None:
-            self.original.update_full(pixmap.copy(), None, img_uint8.copy(), source_size=source_size)
 
         if self.right_panel.auto_exp_radio.isChecked():
             self.right_panel.auto_ev_value = applied_ev
@@ -770,12 +849,31 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self.right_panel.exp_slider.valueChanged.connect(self.right_panel.exp_slider_callback)
 
         # Display via OpenGL viewport first.
-        self.viewport.set_image(img_uint8, source_size=source_size)
+        if roi_rect is not None:
+            self.viewport.set_roi_image(img_uint8, source_size, roi_rect)
+        else:
+            self.viewport.set_image(img_uint8, source_size=source_size)
         self.preview_lbl.setText("")
 
         # Defer visible scope update to the next event loop iteration.
-        img_for_hist = img_uint8
-        QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+        img_for_hist = self._scope_source_for_result(img_uint8, roi_rect)
+        if img_for_hist is not None:
+            QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+
+    @staticmethod
+    def _scope_source_for_result(img_uint8, roi_rect):
+        """Statistics source for the scopes (histogram/waveform) from a
+        processing result, or None when the result must not feed them.
+
+        Scopes are whole-frame statistics: a zoom>fit ROI render (T7.5)
+        contains only the visible region plus margins, so feeding it would
+        silently turn the scopes into visible-area statistics that jump on
+        every pan (m3). ROI results keep the last full-frame scope data on
+        display; only full-frame results refresh the scopes.
+        """
+        if roi_rect is not None:
+            return None
+        return img_uint8
 
     def _update_histogram_async(self, img_uint8):
         """Deferred scope update; runs after viewport display."""
@@ -843,10 +941,18 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self._preload_neighbors_timer.stop()
         if hasattr(self, '_zoom_update_timer'):
             self._zoom_update_timer.stop()
-        if self.thumb_worker and self.thumb_worker.isRunning():
-            self.thumb_worker.stop()
-            self.thumb_worker.quit()
-            self.thumb_worker.wait()
+        if hasattr(self, '_thumb_priority_timer'):
+            self._thumb_priority_timer.stop()
+        thumb_workers = list(getattr(self, '_retired_thumb_workers', []))
+        if self.thumb_worker:
+            thumb_workers.append(self.thumb_worker)
+        for worker in thumb_workers:
+            worker.stop()
+        for worker in thumb_workers:
+            # Joins past the 2s grace when an in-flight rawpy decode
+            # overruns it: a QThread destroyed while running is a Qt
+            # qFatal abort, so exiting may block on one decode (m1/m5).
+            worker.stop_and_join(2000)
         if hasattr(self, 'right_panel'):
             self.right_panel.shutdown_scope_workers()
         self.processor.stop_and_cleanup()

@@ -488,3 +488,418 @@ def test_image_processor_full_export_request_uses_worker_handler(monkeypatch):
     assert emitted == [(True, "")]
     assert captured["payload"]["input_path"] == "synthetic.raw"
     assert captured["payload"]["output_path"] == "out.tif"
+
+
+def _install_executor_spies(monkeypatch, preview):
+    """Count op applications on `preview` and GPU clip calls (T7.1 guards)."""
+    from raw_alchemy.pipeline import executor as executor_module
+
+    op_calls = []
+    original_apply = preview._apply_op
+
+    def counting_apply(buf, op):
+        op_calls.append(op.name)
+        return original_apply(buf, op)
+
+    monkeypatch.setattr(preview, "_apply_op", counting_apply)
+
+    clip_calls = []
+    original_clip = executor_module.clip_inplace
+
+    def counting_clip(arr):
+        clip_calls.append(1)
+        return original_clip(arr)
+
+    monkeypatch.setattr(executor_module, "clip_inplace", counting_clip)
+    return op_calls, clip_calls
+
+
+def test_preview_executor_same_source_rerun_hits_cache_without_gpu(monkeypatch):
+    rng = np.random.default_rng(7)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    assert len(ops) >= 3
+
+    op_calls, clip_calls = _install_executor_spies(monkeypatch, preview)
+
+    first = preview.run_result(ops, source=src)
+    assert len(op_calls) == len(ops)
+    assert len(clip_calls) == 1
+
+    # Same source object + identical op list (e.g. only zoom/viewport changed):
+    # no op kernel may re-run and no GPU clip round-trip may happen.
+    second = preview.run_result(ops, source=src)
+    assert len(op_calls) == len(ops)
+    assert len(clip_calls) == 1
+    assert second.applied_ev == first.applied_ev
+    np.testing.assert_array_equal(second.image, first.image)
+
+
+def test_preview_executor_prefix_cache_survives_tail_param_change(monkeypatch):
+    rng = np.random.default_rng(11)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    preview.run_result(ops, source=src)
+
+    op_calls, _ = _install_executor_spies(monkeypatch, preview)
+
+    # Change only the sat_contrast op: the shared [exposure, white_balance]
+    # prefix must come from cache, so only the changed suffix re-runs.
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    assert changed_ops[:2] == ops[:2]
+    preview.run_result(changed_ops, source=src)
+    assert op_calls == [op.name for op in changed_ops[2:]]
+
+
+def test_preview_executor_source_swap_clears_cache(monkeypatch):
+    rng = np.random.default_rng(23)
+    src_a = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    src_b = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src_a)
+    ops = build_op_list(_case({"exposure": 0.5, "saturation": 1.1}))
+
+    op_calls, clip_calls = _install_executor_spies(monkeypatch, preview)
+
+    first = preview.run_result(ops, source=src_a)
+    assert len(op_calls) == len(ops)
+
+    # New source object: caches must be dropped and the full chain re-run.
+    second = preview.run_result(ops, source=src_b)
+    assert len(op_calls) == 2 * len(ops)
+    assert len(clip_calls) == 2
+    assert not np.array_equal(second.image, first.image)
+
+    # And the caches are now keyed to the new source.
+    third = preview.run_result(ops, source=src_b)
+    assert len(op_calls) == 2 * len(ops)
+    np.testing.assert_array_equal(third.image, second.image)
+
+
+def test_set_source_reports_change_only_for_new_objects():
+    rng = np.random.default_rng(31)
+    src64 = rng.uniform(0.02, 0.65, size=(4, 4, 3))  # float64: forces a conversion copy
+    preview = PreviewExecutor()
+
+    assert preview.set_source(src64) is True
+    # The internal float32 copy must not make the same input count as a change.
+    assert preview.set_source(src64) is False
+
+    src32 = src64.astype(np.float32)
+    assert preview.set_source(src32) is True
+    assert preview.set_source(src32) is False
+
+
+def test_image_processor_zoom_only_change_hits_executor_cache(monkeypatch):
+    from raw_alchemy.pipeline.cache_manager import CachedImage
+    from raw_alchemy.pipeline.executor import _BaseExecutor
+    from raw_alchemy.pipeline.request import ProcessRequest
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    op_calls = []
+    original_apply = _BaseExecutor._apply_op
+
+    def counting_apply(self, buf, op):
+        op_calls.append(op.name)
+        return original_apply(self, buf, op)
+
+    monkeypatch.setattr(_BaseExecutor, "_apply_op", counting_apply)
+
+    params = _case(
+        {
+            "exposure": 1.0,
+            "wb_temp": 5.0,
+            "saturation": 1.1,
+            "viewport_size": (32, 32),
+            "preview_zoom": 2.0,
+            "device_pixel_ratio": 1.0,
+        }
+    )
+    source = np.full((64, 64, 3), 0.18, dtype=np.float32)
+    path = "synthetic.raw"
+    processor = ImageProcessor()
+    processor.cpu_linear = source
+    processor.current_path = path
+    processor.exif_data = None
+    processor.cache_manager.put(path, CachedImage(path, source, None, None))
+
+    processor._do_process(ProcessRequest(path, dict(params), 1))
+    first_run_ops = len(op_calls)
+    assert first_run_ops > 0
+
+    # Zoom-only changes keep the op list identical: from the *second* request
+    # onward the executor cache must fully absorb the pipeline (T7.1).
+    processor._do_process(ProcessRequest(path, dict(params, preview_zoom=3.0), 2))
+    assert len(op_calls) == first_run_ops
+    processor._do_process(ProcessRequest(path, dict(params, preview_zoom=4.0), 3))
+    assert len(op_calls) == first_run_ops
+
+    # A tail slider change re-runs only the changed suffix, not the full chain.
+    processor._do_process(ProcessRequest(path, dict(params, saturation=1.3), 4))
+    suffix_ops = len(op_calls) - first_run_ops
+    assert 0 < suffix_ops < first_run_ops
+
+
+def test_preview_executor_trim_respects_budget_and_keeps_short_prefixes(monkeypatch):
+    rng = np.random.default_rng(41)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    assert len(ops) >= 3
+    result = preview.run_result(ops, source=src)
+
+    entry_bytes = result.image.nbytes  # all cached results share this shape
+    assert preview.cache_bytes() == (len(ops) + 1) * entry_bytes  # prefixes + final
+
+    # Budget for the final result plus one prefix: the longest prefixes must
+    # be dropped first, keeping the (expensive-to-recompute) shortest one.
+    budget = 2 * entry_bytes
+    freed = preview.trim(budget)
+    assert freed == (len(ops) - 1) * entry_bytes
+    assert preview.cache_bytes() <= budget
+    assert set(preview._prefix_lengths.values()) == {1}
+
+    # The surviving final result still powers the full-hit path.
+    rerun = preview.run_result(ops, source=src)
+    np.testing.assert_array_equal(rerun.image, result.image)
+
+    # A tail change after trim resumes from the surviving length-1 prefix.
+    op_calls, _ = _install_executor_spies(monkeypatch, preview)
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    preview.run_result(changed_ops, source=src)
+    assert op_calls == [op.name for op in changed_ops[1:]]
+
+
+def test_preview_executor_trim_to_zero_then_recompute():
+    rng = np.random.default_rng(43)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.25, "saturation": 1.2}))
+    first = preview.run_result(ops, source=src)
+
+    freed = preview.trim(0)
+    assert freed > 0
+    assert preview.cache_bytes() == 0
+    assert preview._prefix_cache == {}
+    assert preview._prefix_lengths == {}
+    assert preview._final_cache == {}
+
+    again = preview.run_result(ops, source=src)
+    np.testing.assert_array_equal(again.image, first.image)
+
+
+def test_image_processor_applies_executor_cache_budget(monkeypatch):
+    from raw_alchemy.pipeline.cache_manager import CachedImage
+    from raw_alchemy.pipeline.executor import PreviewExecutor as ExecutorClass
+    from raw_alchemy.pipeline.request import ProcessRequest
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    trim_calls = []
+    original_trim = ExecutorClass.trim
+
+    def spy_trim(self, budget_bytes):
+        trim_calls.append(budget_bytes)
+        return original_trim(self, budget_bytes)
+
+    monkeypatch.setattr(ExecutorClass, "trim", spy_trim)
+
+    source = np.full((8, 8, 3), 0.18, dtype=np.float32)
+    path = "synthetic.raw"
+    processor = ImageProcessor()
+    processor.cpu_linear = source
+    processor.current_path = path
+    processor.exif_data = None
+    processor.cache_manager.put(path, CachedImage(path, source, None, None))
+
+    processor._do_process(ProcessRequest(path, _case({"exposure": 1.0}), 1))
+
+    assert trim_calls == [int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024]
+
+
+# =====================================================================
+# T7.2 — GPU residency: prefix cache holds GPU buffers, zero host
+# round-trips between ops, only the final uint8 is read back.
+# =====================================================================
+
+
+def _install_transfer_spies(monkeypatch):
+    """Count every host<->device transfer made through GpuImage."""
+    from raw_alchemy.gpu_buffer import GpuImage
+
+    uploads = []
+    downloads = []
+    original_upload = GpuImage.upload
+    original_to_numpy = GpuImage.to_numpy
+
+    def spy_upload(self, np_array):
+        uploads.append(np_array.nbytes)
+        return original_upload(self, np_array)
+
+    def spy_to_numpy(self):
+        downloads.append(self.nbytes)
+        return original_to_numpy(self)
+
+    monkeypatch.setattr(GpuImage, "upload", spy_upload)
+    monkeypatch.setattr(GpuImage, "to_numpy", spy_to_numpy)
+    return uploads, downloads
+
+
+def test_preview_executor_run_stays_gpu_resident(monkeypatch):
+    rng = np.random.default_rng(51)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    assert len(ops) >= 3
+
+    uploads, downloads = _install_transfer_spies(monkeypatch)
+
+    result = preview.run_result(ops, source=src)
+    # Exactly one host->device transfer (source ingestion), zero device->host
+    # transfers: prefix snapshots are GPU-to-GPU copies (T7.2).
+    assert len(uploads) == 1
+    assert downloads == []
+    assert result.gpu is not None and result.gpu.valid
+
+    # The host image is downloaded lazily, exactly once, on demand.
+    image = result.image
+    assert len(downloads) == 1
+    assert image.shape == src.shape
+
+    # A tail-only change resumes from the GPU-resident prefix: no upload of
+    # the source and still no readback of intermediate stages.
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    assert changed_ops[:2] == ops[:2]
+    preview.run_result(changed_ops, source=src)
+    assert len(uploads) == 1
+    assert len(downloads) == 1
+
+
+def test_pipeline_result_survives_cache_eviction_and_pool_reuse():
+    rng = np.random.default_rng(53)
+    src_a = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    src_b = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    expected = ExportExecutor().run(ops, src_a.copy())
+
+    preview = PreviewExecutor(src_a)
+    held = preview.run_result(ops, source=src_a)
+
+    # Swapping the source clears the executor caches and recycles buffers
+    # through the pool; the handed-out result must keep its own GPU buffer
+    # alive and untouched (no use-after-release).
+    preview.run_result(ops, source=src_b)
+    preview.run_result(build_op_list(_case({"exposure": 1.5})), source=src_b)
+
+    np.testing.assert_allclose(held.image, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_preview_executor_drops_stale_prefix_generations():
+    rng = np.random.default_rng(59)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    preview.run_result(ops, source=src)
+    assert len(preview._prefix_cache) == len(ops)
+
+    # Only the shared [exposure, white_balance] prefix survives a tail change;
+    # stale generations are recycled instead of accumulating VRAM.
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    preview.run_result(changed_ops, source=src)
+    assert len(preview._prefix_cache) == len(changed_ops)
+    assert set(preview._prefix_lengths.values()) == set(range(1, len(changed_ops) + 1))
+
+    entry_bytes = src.nbytes
+    assert preview.cache_bytes() == (len(changed_ops) + 1) * entry_bytes
+
+
+def test_image_processor_reads_back_only_final_uint8(monkeypatch):
+    from raw_alchemy.pipeline.cache_manager import CachedImage
+    from raw_alchemy.pipeline.request import ProcessRequest
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    params = _case(
+        {
+            "exposure": 1.0,
+            "wb_temp": 5.0,
+            "saturation": 1.1,
+            # Viewport >= source: target size == source size, so the output
+            # is a direct float->uint8 conversion (bit-exact comparison below).
+            "viewport_size": (64, 64),
+            "preview_zoom": 1.0,
+            "device_pixel_ratio": 1.0,
+        }
+    )
+    source = np.random.default_rng(61).uniform(0.05, 0.5, size=(32, 32, 3)).astype(np.float32)
+    path = "synthetic.raw"
+    processor = ImageProcessor()
+    processor.cpu_linear = source
+    processor.current_path = path
+    processor.exif_data = None
+    processor.cache_manager.put(path, CachedImage(path, source, None, None))
+
+    emitted = []
+    processor.result_ready.connect(
+        lambda img, *_args: emitted.append(img.copy())
+    )
+
+    uploads, downloads = _install_transfer_spies(monkeypatch)
+
+    processor._do_process(ProcessRequest(path, dict(params), 1))
+
+    # One upload (pipeline source), zero float32 readbacks: the preview is
+    # converted to uint8 on-device and only the small uint8 image crosses
+    # back to the host (T7.2).
+    assert len(uploads) == 1
+    assert downloads == []
+    assert len(emitted) == 1
+    assert emitted[0].dtype == np.uint8
+
+    # Full-hit rerun (zoom-only style): still zero float32 traffic.
+    processor._do_process(ProcessRequest(path, dict(params), 2))
+    assert len(uploads) == 1
+    assert downloads == []
+
+    # The emitted uint8 matches the executor's post-clip output converted on
+    # the CPU: round(clip(x) * 255).
+    expected_float = ExportExecutor().run(build_op_list(params), source.copy())
+    expected_uint8 = np.floor(
+        np.clip(expected_float, 0.0, 1.0).astype(np.float32) * 255.0 + 0.5
+    ).astype(np.uint8)
+    assert emitted[0].shape == expected_uint8.shape
+    np.testing.assert_array_equal(emitted[0], expected_uint8)
+
+
+def test_repeated_slider_interactions_keep_cache_and_pool_bounded():
+    """T7.2 acceptance guard: continuous tail-op changes must not grow VRAM.
+
+    Both the executor caches (latest prefix generation + single final) and
+    the buffer pool (recycled scratch) stay bounded across many interactions.
+    """
+    from raw_alchemy.gpu_buffer import gpu_pool
+
+    gpu_pool().clear()
+    rng = np.random.default_rng(67)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    entry_bytes = src.nbytes
+
+    ops_len = None
+    for i in range(50):
+        ops = build_op_list(
+            _case({"exposure": 0.5, "saturation": 1.05 + (i % 7) * 0.05})
+        )
+        if ops_len is None:
+            ops_len = len(ops)
+        assert len(ops) == ops_len
+        preview.run_result(ops, source=src)
+
+        assert preview.cache_bytes() <= (ops_len + 1) * entry_bytes
+        assert len(preview._prefix_cache) <= ops_len
+
+    # Steady state: exactly one generation of prefixes plus one final, and a
+    # small constant number of recycled buffers in the pool.
+    assert preview.cache_bytes() == (ops_len + 1) * entry_bytes
+    assert gpu_pool().free_bytes() <= 8 * entry_bytes
+    gpu_pool().clear()
