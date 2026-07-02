@@ -9,6 +9,13 @@ from loguru import logger
 from raw_alchemy import config
 
 
+# Maximum number of final uint8 outputs kept per cached image (T7.4): the
+# most recent output (primary slot) plus a few secondary slots so e.g. the
+# fit view and the current zoom level each keep one — a fit<->100% round
+# trip then costs zero recomputation.
+OUTPUT_SLOT_LIMIT = 4
+
+
 class CachedImage:
     """
     Container for cached image data.
@@ -57,11 +64,15 @@ class CachedImage:
         self.sharpened_data = None
         self.sharpen_key = None
 
-        # Final output cache (uint8 sRGB, ~25MB for 45MP)
+        # Final output cache (uint8 sRGB, ~25MB for 45MP). The most recent
+        # output lives in these primary fields; older outputs for other
+        # output keys (different zoom/viewport, T7.4) are kept in
+        # ``_output_slots`` up to OUTPUT_SLOT_LIMIT total.
         self.output_uint8 = None
         self.output_key = None
         self.output_ev = 0.0
         self.output_source_size = None
+        self._output_slots: collections.OrderedDict = collections.OrderedDict()
 
         # Approximate size in MB, per category and total.
         self.field_sizes_mb: dict[str, float] = {}
@@ -95,10 +106,61 @@ class CachedImage:
                 + unique_mb(self.denoise_original)
                 + unique_mb(self.sharpened_data)
             ),
-            'output': unique_mb(self.output_uint8),
+            'output': unique_mb(self.output_uint8)
+            + sum(unique_mb(img) for img, _ev, _size in self._output_slots.values()),
         }
         self.size_mb = sum(self.field_sizes_mb.values())
         return self.size_mb
+
+    def get_output(self, key):
+        """Look up a cached final output by its output key (T7.4).
+
+        Returns ``(uint8_image, applied_ev, source_size)`` or None. Checks
+        the primary (most recent) slot first, then the secondary slots;
+        secondary hits are marked most-recently-used.
+        """
+        if key is None:
+            return None
+        if self.output_key == key and self.output_uint8 is not None:
+            return (self.output_uint8, self.output_ev, self.output_source_size)
+        slot = self._output_slots.get(key)
+        if slot is not None:
+            try:
+                self._output_slots.move_to_end(key)
+            except KeyError:
+                # A concurrent field-level eviction (settings-page cap change
+                # on another thread) may clear the slots between the get and
+                # the LRU touch; the already-fetched slot is still valid.
+                pass
+            return slot
+        return None
+
+    def store_output(self, key, img_uint8, applied_ev, source_size):
+        """Store a final output, keeping up to OUTPUT_SLOT_LIMIT slots (T7.4).
+
+        The new output becomes the primary slot; the previous primary (if it
+        held a different key) is demoted to a secondary slot. Oldest slots
+        are evicted LRU beyond the limit — so a fit view and the current
+        zoom level can each keep their output alive at the same time.
+        """
+        if (
+            self.output_uint8 is not None
+            and self.output_key is not None
+            and self.output_key != key
+        ):
+            self._output_slots[self.output_key] = (
+                self.output_uint8,
+                self.output_ev,
+                self.output_source_size,
+            )
+            self._output_slots.move_to_end(self.output_key)
+        self._output_slots.pop(key, None)
+        self.output_uint8 = img_uint8
+        self.output_key = key
+        self.output_ev = applied_ev
+        self.output_source_size = source_size
+        while len(self._output_slots) > OUTPUT_SLOT_LIMIT - 1:
+            self._output_slots.popitem(last=False)
 
     def drop_stage(self, stage: str) -> float:
         """Drop one eviction stage's arrays (and their validity keys).
@@ -112,10 +174,11 @@ class CachedImage:
             self.corrected_data = None
             self.lens_key = None
         elif stage == "output":
-            if self.output_uint8 is None:
+            if self.output_uint8 is None and not self._output_slots:
                 return 0.0
             self.output_uint8 = None
             self.output_key = None
+            self._output_slots.clear()
         elif stage == "denoise":
             if (
                 self.denoise_full is None

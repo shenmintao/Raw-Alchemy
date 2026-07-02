@@ -29,7 +29,7 @@ from raw_alchemy.math_ops import (
 from raw_alchemy.pipeline.request import ProcessRequest, ProcessorParams
 from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
 from raw_alchemy.pipeline.executor import PipelineAborted, PreviewExecutor
-from raw_alchemy.pipeline.ops import build_op_list
+from raw_alchemy.pipeline.ops import _as_hashable, build_op_list
 from raw_alchemy.gpu_buffer import GpuImage, acquire_ndarray, gpu_pool, release_ndarray
 from raw_alchemy.onnx.denoiser import denoise_raw, clear_session as denoise_clear_session
 
@@ -104,12 +104,14 @@ class ImageProcessor(QThread):
 
         self._should_stop = False
         self._gpu_uint8 = None      # Pre-allocated GPU uint8 buffer (ti.ndarray)
-        self.preview_executor: Optional[PreviewExecutor] = None
+        # Proxy and full previews each keep their own executor (T7.4), so a
+        # zoom across 1.0 or an idle full refine never evicts the other
+        # side's prefix/final caches. Keyed by source mode: 'proxy' / 'full'.
+        self._preview_executors: dict[str, PreviewExecutor] = {}
         self._executor_path: Optional[str] = None
         self._executor_params: ProcessorParams = {}
         self._executor_using_proxy = False
         self._executor_corrected_source: Optional[np.ndarray] = None
-        self._last_executor_source_mode: Optional[str] = None
         self._full_refine_request: Optional[ProcessRequest] = None
         self._full_refine_due = 0.0
         # Most recent user interaction (load/preview request) timestamp,
@@ -520,8 +522,7 @@ class ImageProcessor(QThread):
                 # Cache hit with lens correction: only invalidate downstream
                 self.gpu_graded.clear()
                 self._release_gpu_uint8()
-                if self.preview_executor is not None:
-                    self.preview_executor.clear_cache()
+                self._clear_all_executor_caches()
                 self.last_metering_key = None
                 self.cached_auto_ev = 0.0
             else:
@@ -545,9 +546,7 @@ class ImageProcessor(QThread):
         self.gpu_graded.clear()
         self._release_gpu_uint8()
         self._full_refine_request = None
-        if self.preview_executor is not None:
-            self.preview_executor.clear_cache()
-        self._last_executor_source_mode = None
+        self._clear_all_executor_caches()
         self.cached_auto_ev = 0.0
         # Force immediate GPU memory release: collect dead GpuImages into the
         # pool first, then drop the pool's free buffers (image switch — T7.2
@@ -562,9 +561,7 @@ class ImageProcessor(QThread):
             self.gpu_graded.clear()
             self._release_gpu_uint8()
             self._full_refine_request = None
-            if self.preview_executor is not None:
-                self.preview_executor.clear_cache()
-            self._last_executor_source_mode = None
+            self._clear_all_executor_caches()
             gpu_pool().clear()
             logger.debug("[Worker] GPU buffers released.")
         except Exception as e:
@@ -609,8 +606,15 @@ class ImageProcessor(QThread):
     # =================================================================
 
     @staticmethod
-    def _make_output_key(params):
-        return (
+    def _make_pipeline_key(params):
+        """Key over everything that changes the color pipeline result (T7.4).
+
+        Covers the source identity (proxy/full, denoise, lens) and every op
+        parameter — but *no* view state (zoom/viewport/DPR). Two requests
+        with equal pipeline keys share the same GPU-resident pipeline
+        output; only the final resampling to uint8 differs.
+        """
+        return _as_hashable((
             params.get('_preview_source', 'full'),
             params.get('denoise_enabled', False),
             params.get('lens_correct'), params.get('custom_db_path'),
@@ -626,10 +630,22 @@ class ImageProcessor(QThread):
             params.get('saturation', 1.0), params.get('contrast', 1.0),
             params.get('log_space'), params.get('lut_path'),
             params.get('sharpen_strength', 0.0),
-            params.get('viewport_size'),
+        ))
+
+    @staticmethod
+    def _make_view_key(params):
+        """Key over the output resampling state only (T7.4): zoom/viewport."""
+        viewport_size = params.get('viewport_size')
+        return (
+            _as_hashable(viewport_size) if viewport_size else None,
             round(float(params.get('preview_zoom', 1.0) or 1.0), 3),
             round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2),
         )
+
+    @classmethod
+    def _make_output_key(cls, params):
+        """(pipeline key, view key) pair identifying one uint8 output slot."""
+        return (cls._make_pipeline_key(params), cls._make_view_key(params))
 
     @staticmethod
     def _make_preview_target_size(src_w: int, src_h: int, params: ProcessorParams):
@@ -691,15 +707,50 @@ class ImageProcessor(QThread):
             )
             self._full_refine_due = time.perf_counter() + FULL_REFINE_IDLE_SECONDS
 
+    def _executor_source_mode(self) -> str:
+        return 'proxy' if self._executor_using_proxy else 'full'
+
+    @property
+    def preview_executor(self) -> Optional[PreviewExecutor]:
+        """Executor for the current source mode (T7.4 proxy/full split)."""
+        return self._preview_executors.get(self._executor_source_mode())
+
+    def _clear_all_executor_caches(self):
+        """Drop the pipeline caches of both the proxy and full executors."""
+        for executor in self._preview_executors.values():
+            executor.clear_cache()
+
     def _get_preview_executor(self) -> PreviewExecutor:
-        if self.preview_executor is None:
-            self.preview_executor = PreviewExecutor(
+        mode = self._executor_source_mode()
+        executor = self._preview_executors.get(mode)
+        if executor is None:
+            executor = PreviewExecutor(
                 denoiser=self._executor_denoise,
                 lens_corrector=self._executor_lens_correct,
                 auto_gain_resolver=self._executor_auto_gain,
                 round_exposure_gain=True,
             )
-        return self.preview_executor
+            self._preview_executors[mode] = executor
+        return executor
+
+    def _trim_executor_caches(self, budget_bytes: Optional[int] = None):
+        """Apply the shared cache byte budget across both executors (T7.4).
+
+        The proxy executor powers slider interactivity and its stages are
+        small (<=4MP), so it gets first claim on the budget; the full
+        executor absorbs whatever remains. With a single executor this
+        degenerates to the T7.6 behavior (one trim with the full budget).
+        """
+        if budget_bytes is None:
+            budget_bytes = int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024
+        remaining = max(0, int(budget_bytes))
+        proxy = self._preview_executors.get('proxy')
+        if proxy is not None:
+            proxy.trim(remaining)
+            remaining = max(0, remaining - proxy.cache_bytes())
+        full = self._preview_executors.get('full')
+        if full is not None:
+            full.trim(remaining)
 
     def _executor_denoise(self, src: np.ndarray) -> np.ndarray:
         path = self._executor_path
@@ -895,16 +946,18 @@ class ImageProcessor(QThread):
         caches when the source *array object* actually changes, so that the
         prefix cache survives across requests that reuse the same source.
         This method owns the semantic invalidations the executor cannot see:
-        proxy/full source-mode switches, and lens/denoise state changes whose
-        cached op outputs (denoise/lens_correct callbacks) depend on worker
-        state not captured by the op parameters themselves.
+        lens/denoise state changes whose cached op outputs (denoise /
+        lens_correct callbacks) depend on worker state not captured by the
+        op parameters themselves.
+
+        Since T7.4 proxy and full previews use separate executors, a
+        proxy/full source-mode switch (zoom across 1.0, idle full refine)
+        no longer clears anything — each executor's caches survive until *its*
+        source or semantic state changes. Only the current mode's executor
+        is checked here; the other mode re-validates on its next request.
         """
-        source_mode = 'proxy' if self._executor_using_proxy else 'full'
-        if self.preview_executor is None:
-            # Executor not created yet (first request): nothing to clear, but
-            # still record the mode its cache is about to be built from, so
-            # the *second* request does not spuriously invalidate it.
-            self._last_executor_source_mode = source_mode
+        executor = self.preview_executor  # current source mode's executor
+        if executor is None:
             return
 
         denoise_enabled = params.get('denoise_enabled', False)
@@ -916,16 +969,13 @@ class ImageProcessor(QThread):
         current_lens_key = self.cached_proxy_lens_key if self._executor_using_proxy else self.cached_lens_key
 
         needs_clear = False
-        if source_mode != self._last_executor_source_mode:
-            needs_clear = True
         if denoise_enabled and self.cached_denoise_full is None:
             needs_clear = True
         if desired_lens_key != current_lens_key:
             needs_clear = True
 
         if needs_clear:
-            self.preview_executor.clear_cache()
-        self._last_executor_source_mode = source_mode
+            executor.clear_cache()
 
     def _do_process(self, request: ProcessRequest):
         t_start = time.perf_counter()
@@ -943,18 +993,20 @@ class ImageProcessor(QThread):
             params['_preview_source'] = preview_source
             output_key = self._make_output_key(params)
             cached_item = self.cache_manager.get(request.path)
-            if cached_item and cached_item.output_key == output_key and cached_item.output_uint8 is not None:
+            cached_output = cached_item.get_output(output_key) if cached_item else None
+            if cached_output is not None:
                 logger.info(f"[Worker] Output Cache Hit: {os.path.basename(request.path)}")
+                cached_uint8, cached_ev, cached_source_size = cached_output
                 self.last_preview_source = preview_source
                 self.preview_source_changed.emit(preview_source)
                 if use_proxy:
                     self._schedule_full_refinement(request, params)
                 self.result_ready.emit(
-                    cached_item.output_uint8,
+                    cached_uint8,
                     request.path,
                     request.request_id,
-                    cached_item.output_ev,
-                    cached_item.output_source_size,
+                    cached_ev,
+                    cached_source_size,
                 )
                 return
 
@@ -977,10 +1029,11 @@ class ImageProcessor(QThread):
             )
             self._sync_executor_export_source(params)
             # Prefix-cache byte budget (T7.6): VRAM budget since T7.2 moved
-            # pipeline residency to the GPU. Even if trim() evicts `result`
+            # pipeline residency to the GPU; shared across the proxy/full
+            # executor pair since T7.4. Even if the trim evicts `result`
             # from the final cache, the local reference keeps its GPU buffer
             # alive for the output stage below.
-            executor.trim(int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024)
+            self._trim_executor_caches()
 
             applied_ev = float(result.applied_ev)
             self.last_applied_ev = applied_ev
@@ -1045,10 +1098,12 @@ class ImageProcessor(QThread):
 
             cached_item = self.cache_manager.get(request.path)
             if cached_item:
-                cached_item.output_uint8 = img_uint8.copy()
-                cached_item.output_key = output_key
-                cached_item.output_ev = applied_ev
-                cached_item.output_source_size = output_source_size
+                # Multi-slot output cache (T7.4): keeps a few recent outputs
+                # keyed by (pipeline key, view key), so e.g. fit and the
+                # current zoom level survive side by side.
+                cached_item.store_output(
+                    output_key, img_uint8.copy(), applied_ev, output_source_size
+                )
                 self.cache_manager.notify_entry_updated(request.path)
 
             self.result_ready.emit(
