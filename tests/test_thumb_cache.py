@@ -430,3 +430,109 @@ def test_start_thumbnail_scan_passes_shared_cache_to_worker(monkeypatch, tmp_pat
     plain = _Harness()
     plain.start_thumbnail_scan(str(tmp_path))
     assert plain.thumb_worker.disk_cache is None
+
+
+# --- m2: concurrent prune robustness ------------------------------------------
+
+
+def test_prune_concurrent_deletion_does_not_over_evict(monkeypatch, tmp_path):
+    """When a rival prune/clear already unlinked a file, the losing prune
+    must still deduct its size from the running total; skipping the
+    deduction made concurrent prunes evict up to 2x the excess, deleting
+    perfectly valid (newest) entries."""
+    _ensure_qapp(monkeypatch)
+    from raw_alchemy.thumb_cache import ThumbnailCache
+
+    cache_dir = tmp_path / "thumbs"
+    cache_dir.mkdir()
+    now = time.time()
+    paths = []
+    for i in range(4):
+        p = cache_dir / f"{i:040x}.jpg"
+        p.write_bytes(b"x" * 10_000)
+        os.utime(str(p), (now - 500 + i * 60, now - 500 + i * 60))
+        paths.append(str(p))
+
+    cache = ThumbnailCache(cache_dir=str(cache_dir))
+
+    real_unlink = os.unlink
+    raced = {"done": False}
+
+    def racing_unlink(path, *args, **kwargs):
+        # First unlink of this prune: the rival prune wins the race and
+        # removes the two oldest entries first, so ours fails with
+        # FileNotFoundError.
+        if not raced["done"] and path in paths[:2]:
+            raced["done"] = True
+            real_unlink(paths[0])
+            real_unlink(paths[1])
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", racing_unlink)
+
+    # 40KB total, budget 25KB: once the two (already gone) oldest entries
+    # are accounted for we are at 20KB <= 25KB — the two newest entries
+    # must survive. Without the deduction the prune would keep going and
+    # empty the whole directory.
+    cache.prune(max_bytes=25_000, max_files=10**6)
+    assert [os.path.exists(p) for p in paths] == [False, False, True, True]
+
+
+def test_prune_async_start_race_single_flight(monkeypatch, tmp_path):
+    """prune_async published the new thread and released the lock *before*
+    start(): a second caller then saw is_alive() == False and launched a
+    duplicate prune. Starting inside the lock closes the window."""
+    import threading
+
+    _ensure_qapp(monkeypatch)
+    from raw_alchemy import thumb_cache
+    from raw_alchemy.thumb_cache import ThumbnailCache
+
+    cache = ThumbnailCache(cache_dir=str(tmp_path / "thumbs"))
+
+    prune_gate = threading.Event()
+    monkeypatch.setattr(cache, "_prune_guarded", lambda: prune_gate.wait(5.0))
+
+    real_thread_cls = threading.Thread
+    created = []
+    entered_start = threading.Event()
+    release_start = threading.Event()
+
+    class GatedThread(real_thread_cls):
+        def start(self):
+            created.append(self)
+            entered_start.set()
+            release_start.wait(5.0)
+            real_thread_cls.start(self)
+
+    monkeypatch.setattr(thumb_cache.threading, "Thread", GatedThread)
+
+    first_result = []
+    first = real_thread_cls(
+        target=lambda: first_result.append(cache.prune_async())
+    )
+    first.start()
+    assert entered_start.wait(5.0)
+
+    # Race a second caller into prune_async while the first is still inside
+    # Thread.start() (the pre-fix window: published but not yet alive).
+    second_result = []
+    second = real_thread_cls(
+        target=lambda: second_result.append(cache.prune_async())
+    )
+    second.start()
+
+    deadline = time.time() + 1.0
+    while time.time() < deadline and len(created) < 2:
+        time.sleep(0.02)
+    duplicates = len(created)
+
+    release_start.set()
+    first.join(5.0)
+    second.join(5.0)
+    assert duplicates == 1  # single flight: no duplicate prune thread
+    assert first_result == second_result == [created[0]]
+
+    prune_gate.set()
+    created[0].join(5.0)
+    assert not created[0].is_alive()

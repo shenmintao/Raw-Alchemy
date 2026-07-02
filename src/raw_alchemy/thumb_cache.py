@@ -256,6 +256,13 @@ class ThumbnailCache:
                 break
             try:
                 os.unlink(path)
+            except FileNotFoundError:
+                # Already deleted by a concurrent prune/clear: its bytes are
+                # gone either way, so account for it — skipping the deduction
+                # here made concurrent prunes evict up to 2x the excess (m2).
+                total -= size
+                count -= 1
+                continue
             except OSError:
                 continue
             total -= size
@@ -277,7 +284,12 @@ class ThumbnailCache:
                 target=self._prune_guarded, name="thumb-cache-prune", daemon=True
             )
             self._prune_thread = thread
-        thread.start()
+            # Start inside the lock: a not-yet-started thread reports
+            # is_alive() == False, so publishing before start let a second
+            # caller sneak in and launch a duplicate prune (m2 single-flight
+            # race). prune() itself never takes self._lock, so the new
+            # thread cannot deadlock against this critical section.
+            thread.start()
         return thread
 
     def _prune_guarded(self):

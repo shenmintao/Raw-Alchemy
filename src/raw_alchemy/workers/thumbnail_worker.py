@@ -390,3 +390,30 @@ class ThumbnailWorker(QThread):
 
     def stop(self):
         self.stopped = True
+
+    def stop_and_join(self, grace_ms=2000):
+        """Stop the worker and join it, never leaving a running QThread.
+
+        ``stop()`` is checked before each decode stage, so the thread
+        normally exits within the grace period. But an in-flight rawpy
+        decode (a Method-2 half_size postprocess on a large RAW can take
+        seconds) is not interruptible, so the bounded wait can time out.
+        A QThread that is destroyed while still running makes Qt abort
+        with a qFatal ("QThread: Destroyed while thread is still
+        running"), so on timeout this falls back to a blocking join —
+        bounded by the decode already in flight (m1/m5).
+
+        Returns True when the thread finished within the grace period.
+        """
+        self.stop()
+        if not self.isRunning():
+            return True
+        self.quit()
+        if self.wait(int(grace_ms)):
+            return True
+        logger.warning(
+            "[Thumbs] worker still decoding after "
+            f"{int(grace_ms)}ms grace; blocking until it finishes"
+        )
+        self.wait()
+        return False

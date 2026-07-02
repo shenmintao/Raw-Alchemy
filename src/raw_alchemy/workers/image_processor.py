@@ -280,13 +280,18 @@ class ImageProcessor(QThread):
         return None
 
     def _interactive_abort_requested(self) -> bool:
-        """True when a newer user request is waiting (T7.3 abort predicate).
+        """True when a newer user request is waiting (T7.3 abort predicate)
+        or shutdown was requested (m7).
 
         Injected into PreviewExecutor.run_result as ``should_abort`` and
         polled at op boundaries; also checked between _do_preload stages.
+        Including ``_should_stop`` lets stop_and_cleanup() cancel a long
+        in-flight run at the next op boundary instead of timing out its
+        wait() while kernels are still running (the abort surfaces as
+        PipelineAborted, which _do_process already drops silently).
         """
         with self.lock:
-            return self.pending_request is not None
+            return self.pending_request is not None or self._should_stop
 
     # =================================================================
     # Loading

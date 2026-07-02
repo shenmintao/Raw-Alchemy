@@ -856,8 +856,24 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.preview_lbl.setText("")
 
         # Defer visible scope update to the next event loop iteration.
-        img_for_hist = img_uint8
-        QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+        img_for_hist = self._scope_source_for_result(img_uint8, roi_rect)
+        if img_for_hist is not None:
+            QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+
+    @staticmethod
+    def _scope_source_for_result(img_uint8, roi_rect):
+        """Statistics source for the scopes (histogram/waveform) from a
+        processing result, or None when the result must not feed them.
+
+        Scopes are whole-frame statistics: a zoom>fit ROI render (T7.5)
+        contains only the visible region plus margins, so feeding it would
+        silently turn the scopes into visible-area statistics that jump on
+        every pan (m3). ROI results keep the last full-frame scope data on
+        display; only full-frame results refresh the scopes.
+        """
+        if roi_rect is not None:
+            return None
+        return img_uint8
 
     def _update_histogram_async(self, img_uint8):
         """Deferred scope update; runs after viewport display."""
@@ -933,10 +949,10 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         for worker in thumb_workers:
             worker.stop()
         for worker in thumb_workers:
-            if worker.isRunning():
-                worker.quit()
-                # stop() is checked before each decode, so this is bounded
-                worker.wait(2000)
+            # Joins past the 2s grace when an in-flight rawpy decode
+            # overruns it: a QThread destroyed while running is a Qt
+            # qFatal abort, so exiting may block on one decode (m1/m5).
+            worker.stop_and_join(2000)
         if hasattr(self, 'right_panel'):
             self.right_panel.shutdown_scope_workers()
         self.processor.stop_and_cleanup()

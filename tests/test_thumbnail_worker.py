@@ -444,3 +444,47 @@ def test_update_thumbnail_priority_forwards_visible_paths(monkeypatch):
     harness.thumb_worker = None
     harness._update_thumbnail_priority()  # no worker -> no crash
     assert worker.priorities == [["/x/b.raf", "/x/c.raf"]]
+
+
+# =====================================================================
+# m1/m5 — shutdown join must never leave a running QThread behind
+# =====================================================================
+
+
+def test_stop_and_join_outwaits_uninterruptible_decode(monkeypatch, tmp_path):
+    """closeEvent used a bare wait(2000): a rawpy half_size postprocess in
+    flight cannot observe stop() and can overrun the grace period, after
+    which the still-running QThread would be destroyed with the window —
+    a Qt qFatal abort on exit. stop_and_join must keep waiting past the
+    grace until the thread has actually finished."""
+    _ensure_qapp(monkeypatch)
+    from raw_alchemy.workers.thumbnail_worker import ThumbnailWorker
+
+    (tmp_path / "big.raf").write_bytes(b"raw")
+
+    decode_started = threading.Event()
+
+    def slow_extract(full_path, stop_check=None):
+        # Models the Method-2 fallback: inside the C decode, stop_check
+        # cannot run, so the job outlives any bounded grace period.
+        decode_started.set()
+        time.sleep(1.0)
+        return None
+
+    monkeypatch.setattr(
+        ThumbnailWorker, "extract_thumbnail", staticmethod(slow_extract)
+    )
+
+    worker = ThumbnailWorker(str(tmp_path), max_workers=1)
+    worker.start()
+    assert decode_started.wait(5.0)
+
+    joined_in_grace = worker.stop_and_join(grace_ms=100)
+
+    # The in-flight decode overran the grace period (the old code path
+    # would have returned here with the QThread still running) ...
+    assert joined_in_grace is False
+    # ... but the thread was joined to completion regardless: destroying
+    # a running QThread aborts the whole process with a Qt fatal error.
+    assert not worker.isRunning()
+    assert worker.isFinished()

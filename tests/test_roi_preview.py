@@ -379,3 +379,250 @@ def test_viewport_roi_uniform_placement_math(monkeypatch):
     assert roi_offset_y == pytest.approx(1.5)  # above center at zoom 2
 
     viewport.deleteLater()
+
+
+# =====================================================================
+# m4 — resident source: ROI changes must not re-upload the source
+# =====================================================================
+
+
+def _install_upload_spy(monkeypatch):
+    from raw_alchemy.gpu_buffer import GpuImage
+
+    uploads = []
+    original_upload = GpuImage.upload
+
+    def spy_upload(self, np_array):
+        uploads.append(np_array.nbytes)
+        return original_upload(self, np_array)
+
+    monkeypatch.setattr(GpuImage, "upload", spy_upload)
+    return uploads
+
+
+def test_roi_change_reuses_resident_source_without_reupload(monkeypatch):
+    """In the default unedited case the roi op sits at position 0, so a
+    cross-margin pan / zoom-tier change invalidates every nonzero prefix.
+    The executor must resume from the device-resident length-0 source
+    entry instead of re-uploading the full float32 frame over PCIe (m4)."""
+    from raw_alchemy.pipeline.executor import ExportExecutor
+
+    processor, source = _make_processor()
+    path = processor.current_path
+
+    emitted = []
+    processor.result_ready.connect(
+        lambda img, img_path, request_id, ev, size: emitted.append((img.copy(), size))
+    )
+    uploads = _install_upload_spy(monkeypatch)
+
+    center = _view_params((0.375, 0.375, 0.625, 0.625), zoom=4.0)
+    processor._do_process(ProcessRequest(path, dict(center), 1))
+    assert uploads == [source.nbytes]  # single source ingestion
+
+    # Cross-margin pan: new ROI rect, all nonzero prefixes stale — but the
+    # source comes from the resident copy, no second host->device transfer.
+    big_pan = _view_params((0.7, 0.7, 0.95, 0.95), zoom=4.0)
+    new_roi = processor._compute_preview_roi(big_pan)[0]
+    assert new_roi != processor._compute_preview_roi(center)[0]
+    processor._do_process(ProcessRequest(path, dict(big_pan), 2))
+    assert uploads == [source.nbytes]
+
+    # Another cross-margin move: still zero further uploads.
+    third_pan = _view_params((0.05, 0.05, 0.3, 0.3), zoom=4.0)
+    third_roi = processor._compute_preview_roi(third_pan)[0]
+    assert third_roi not in (new_roi, processor._compute_preview_roi(center)[0])
+    processor._do_process(ProcessRequest(path, dict(third_pan), 3))
+    assert uploads == [source.nbytes]
+
+    # The renders resumed from the resident source are pixel-correct: each
+    # equals the same crop of a from-scratch full-frame reference (the
+    # worker's preview executors round the exposure gain; match that).
+    expected_float = ExportExecutor(round_exposure_gain=True).run(
+        build_op_list(center), source.copy()
+    )
+    expected_uint8 = np.floor(
+        np.clip(expected_float, 0.0, 1.0).astype(np.float32) * 255.0 + 0.5
+    ).astype(np.uint8)
+    assert len(emitted) == 3
+    for (img, size), rect in zip(emitted[1:], (new_roi, third_roi)):
+        x, y, w, h = rect
+        assert getattr(size, "roi_rect", None) == rect
+        np.testing.assert_array_equal(img, expected_uint8[y:y + h, x:x + w])
+
+
+def test_source_residency_accounting_trim_and_reingest():
+    """The length-0 source entry participates in cache_bytes()/trim() like
+    any prefix: it survives ROI-rect generations, is evicted only after
+    all longer (cheaper-to-recompute) prefixes, and a zero budget clears
+    it; the next run then re-ingests and re-caches the source."""
+    from raw_alchemy.pipeline.executor import (
+        ExportExecutor,
+        PreviewExecutor,
+        _SOURCE_PREFIX_KEY,
+    )
+
+    rng = np.random.default_rng(77)
+    src = rng.uniform(0.02, 0.65, size=(16, 16, 3)).astype(np.float32)
+    ops = build_op_list(_case({"exposure": 0.5, "saturation": 1.1}))
+    roi_ops_a = ImageProcessor._insert_roi_op(ops, (0, 0, 8, 8))
+    roi_ops_b = ImageProcessor._insert_roi_op(ops, (8, 8, 8, 8))
+    n = len(roi_ops_b)
+    roi_bytes = 8 * 8 * 3 * 4  # float32 ROI-sized stage entries
+
+    preview = PreviewExecutor(src)
+    preview.run_result(roi_ops_a, source=src)
+    assert preview._prefix_lengths.get(_SOURCE_PREFIX_KEY) == 0
+    assert preview.cache_bytes() == src.nbytes + (n + 1) * roi_bytes
+
+    # A different rect drops the stale roi-tagged generation but keeps the
+    # source entry (its validity depends only on the source array).
+    result_b = preview.run_result(roi_ops_b, source=src)
+    assert preview._prefix_lengths.get(_SOURCE_PREFIX_KEY) == 0
+    assert preview.cache_bytes() == src.nbytes + (n + 1) * roi_bytes
+    expected_b = ExportExecutor().run(roi_ops_b, src.copy())
+    np.testing.assert_allclose(result_b.image, expected_b, rtol=1e-5, atol=1e-5)
+
+    # Trim evicts longest prefixes first; the source entry outlives them
+    # (dropping it would force a PCIe re-upload, the cost m4 removes).
+    freed = preview.trim(src.nbytes + 2 * roi_bytes)
+    assert freed == (n - 1) * roi_bytes
+    assert set(preview._prefix_lengths.values()) == {0, 1}
+
+    # A zero budget clears the source entry too (T7.6 semantics intact).
+    preview.trim(0)
+    assert preview.cache_bytes() == 0
+    assert _SOURCE_PREFIX_KEY not in preview._prefix_cache
+
+    # The next run re-ingests the source and re-caches the residency.
+    again = preview.run_result(roi_ops_b, source=src)
+    np.testing.assert_allclose(again.image, expected_b, rtol=1e-5, atol=1e-5)
+    assert preview._prefix_lengths.get(_SOURCE_PREFIX_KEY) == 0
+
+
+def test_non_roi_runs_do_not_create_source_residency():
+    """Full-frame (non-ROI) runs keep their T7.2 behavior: the nonzero
+    prefixes already cover incremental resume, so no length-0 entry is
+    added (and the T7.2/T7.6 exact accounting stays unchanged)."""
+    from raw_alchemy.pipeline.executor import PreviewExecutor, _SOURCE_PREFIX_KEY
+
+    rng = np.random.default_rng(79)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "saturation": 1.1}))
+    preview.run_result(ops, source=src)
+
+    assert _SOURCE_PREFIX_KEY not in preview._prefix_cache
+    assert len(preview._prefix_cache) == len(ops)
+    assert preview.cache_bytes() == (len(ops) + 1) * src.nbytes
+
+
+# =====================================================================
+# m3 — ROI results must not feed the scopes (histogram/waveform)
+# =====================================================================
+
+
+class _ScopeHarness:
+    """Bare-attribute stand-in for MainWindow.on_process_result's `self`."""
+
+    def __init__(self, path):
+        self.denoise_progress_dialog = None
+        self.current_raw_path = path
+        self.current_request_id = 7
+        self.gallery_items_by_path = {}
+        self.file_params_cache = {}
+        self.scope_updates = []
+        self.roi_overlays = []
+        self.full_frames = []
+        harness = self
+
+        class _State:
+            full = None
+
+            @staticmethod
+            def update_full(*args, **kwargs):
+                pass
+
+        self.current = _State()
+        self.original = _State()
+
+        class _Radio:
+            @staticmethod
+            def isChecked():
+                return False
+
+        class _Panel:
+            auto_exp_radio = _Radio()
+
+            @staticmethod
+            def get_params():
+                return {}
+
+        self.right_panel = _Panel()
+
+        class _Viewport:
+            @staticmethod
+            def set_roi_image(img, source_size, roi_rect):
+                harness.roi_overlays.append((img, roi_rect))
+
+            @staticmethod
+            def set_image(img, source_size=None):
+                harness.full_frames.append(img)
+
+        self.viewport = _Viewport()
+
+        class _Label:
+            @staticmethod
+            def setText(text):
+                pass
+
+        self.preview_lbl = _Label()
+
+    def _update_histogram_async(self, img):
+        self.scope_updates.append(img)
+
+
+def _pump_until(app, predicate, timeout=2.0):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_roi_results_do_not_feed_scopes_but_full_frames_do(monkeypatch):
+    """Scopes are whole-frame statistics: feeding them the zoom>fit ROI crop
+    silently turned the histogram/waveform into visible-area statistics
+    that jump on every pan (m3). ROI results must update only the viewport
+    overlay; the last full-frame scope data stays."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+
+    from raw_alchemy.ui.main_window import MainWindow
+
+    harness = _ScopeHarness("photo.raw")
+    harness._scope_source_for_result = MainWindow._scope_source_for_result
+
+    # Control: a full-frame result refreshes the scopes (deferred update).
+    img_full = np.full((64, 64, 3), 40, np.uint8)
+    MainWindow.on_process_result(harness, img_full, "photo.raw", 7, 0.5, (64, 64))
+    assert _pump_until(app, lambda: harness.scope_updates)
+    assert len(harness.scope_updates) == 1
+    assert harness.scope_updates[0] is img_full
+    assert len(harness.full_frames) == 1
+
+    # ROI result: viewport overlay updates, the scopes must not.
+    roi_img = np.full((16, 16, 3), 250, np.uint8)
+    roi_size = RoiSourceSize((64, 64), (8, 8, 16, 16))
+    MainWindow.on_process_result(harness, roi_img, "photo.raw", 7, 0.5, roi_size)
+    assert not _pump_until(app, lambda: len(harness.scope_updates) > 1, timeout=0.3)
+    assert harness.roi_overlays and harness.roi_overlays[-1][1] == (8, 8, 16, 16)
+    assert len(harness.scope_updates) == 1  # last full-frame data retained

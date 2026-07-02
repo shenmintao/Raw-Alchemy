@@ -340,6 +340,16 @@ class ExportExecutor(_BaseExecutor):
         return self._run_direct_result(ops, source)
 
 
+# Prefix-cache key of the length-0 prefix (the ingested source itself),
+# matching the hash(tuple(ops[:i])) keying scheme at i == 0. A ROI render
+# (T7.5) puts the roi op at position 0 when no shape ops precede it, so a
+# ROI rect change invalidates *every* nonzero prefix; without a resident
+# source the executor then re-uploads the full-resolution float32 source
+# over PCIe on each cross-margin pan / zoom-tier change (m4). The length-0
+# entry turns that into a device-to-device copy.
+_SOURCE_PREFIX_KEY = hash(())
+
+
 class PreviewExecutor(_BaseExecutor):
     def __init__(self, source: np.ndarray | None = None, **kwargs):
         # GPU-resident, pre-clip op outputs keyed by hash(tuple(ops[:i]))
@@ -493,8 +503,11 @@ class PreviewExecutor(_BaseExecutor):
         self._drop_final_entries()
         # Keep only the latest generation of prefixes: entries outside the
         # current op sequence can never hit again (their tail params changed),
-        # so recycle their VRAM before allocating this run's buffers.
+        # so recycle their VRAM before allocating this run's buffers. The
+        # length-0 source entry is never stale for op changes — its validity
+        # depends only on the source, and set_source clears it on change.
         current_keys = set(prefix_keys)
+        current_keys.add(_SOURCE_PREFIX_KEY)
         self._drop_prefix_entries(
             [key for key in self._prefix_cache if key not in current_keys]
         )
@@ -505,8 +518,28 @@ class PreviewExecutor(_BaseExecutor):
             # zero host traffic (T7.2).
             buf.copy_from(cached_stage.gpu)
         else:
-            # Single host->device upload per run (source ingestion only).
-            buf.upload(src)
+            source_stage = self._prefix_cache.get(_SOURCE_PREFIX_KEY)
+            if source_stage is not None:
+                # From-scratch run with a resident source (m4): device copy
+                # instead of re-uploading the full float32 source over PCIe.
+                buf.copy_from(source_stage.gpu)
+            else:
+                # Single host->device upload per run (source ingestion only).
+                buf.upload(src)
+                if any(op.name == "roi" for op in ops):
+                    # ROI runs re-start from scratch whenever the rect
+                    # changes (the roi op sits at/near position 0), so keep
+                    # the ingested source device-resident as the length-0
+                    # prefix. It participates in cache_bytes()/trim() like
+                    # any prefix; length 0 makes trim drop it after all
+                    # longer (cheaper-to-recompute) prefixes. Non-ROI runs
+                    # skip it: their nonzero prefixes already cover resume.
+                    snapshot = GpuImage()
+                    snapshot.copy_from(buf)
+                    self._prefix_cache[_SOURCE_PREFIX_KEY] = _CachedStage(
+                        snapshot, 0.0
+                    )
+                    self._prefix_lengths[_SOURCE_PREFIX_KEY] = 0
 
         for index, op in enumerate(ops[start_index:], start=start_index + 1):
             # Cooperative cancellation (T7.3): checked at every op boundary.

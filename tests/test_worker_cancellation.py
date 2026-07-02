@@ -382,3 +382,55 @@ def test_due_full_refine_is_postponed_by_recent_interaction():
         )
         processor._full_refine_due = time.perf_counter() - 0.001
     assert processor._take_next_request() is refine
+
+
+# =====================================================================
+# m7 — shutdown participates in the cooperative abort predicate
+# =====================================================================
+
+
+def test_abort_predicate_includes_shutdown_stop():
+    """stop_and_cleanup() sets _should_stop; the T7.3 abort predicate must
+    report it so an in-flight run is cancelled at the next op boundary
+    instead of running to completion past the shutdown wait timeout."""
+    processor = ImageProcessor()
+    assert processor._interactive_abort_requested() is False
+    processor._should_stop = True
+    assert processor._interactive_abort_requested() is True
+
+
+def test_shutdown_aborts_inflight_run_silently(monkeypatch):
+    source = np.full((32, 32, 3), 0.18, dtype=np.float32)
+    path = "synthetic.raw"
+    processor = _make_processor(path, source)
+
+    emitted, errors = [], []
+    processor.result_ready.connect(
+        lambda img, img_path, request_id, ev, size: emitted.append(request_id)
+    )
+    processor.error_occurred.connect(lambda msg: errors.append(msg))
+
+    params = _case({"exposure": 1.0, "wb_temp": 5.0, "saturation": 1.1})
+    ops = build_op_list(params)
+    assert len(ops) >= 2
+
+    op_calls = []
+    original_apply = _BaseExecutor._apply_op
+
+    def stopping_apply(self, buf, op):
+        op_calls.append(op.name)
+        if len(op_calls) == 1:
+            # stop_and_cleanup() runs on the GUI thread mid-render.
+            processor._should_stop = True
+        return original_apply(self, buf, op)
+
+    monkeypatch.setattr(_BaseExecutor, "_apply_op", stopping_apply)
+
+    processor._do_process(ProcessRequest(path, dict(params), 1))
+
+    # Aborted at the first op boundary: the shutdown request cancels the
+    # in-flight run (silent drop — no result, no error) so the worker loop
+    # can observe _should_stop instead of finishing a long render first.
+    assert op_calls == [ops[0].name]
+    assert emitted == []
+    assert errors == []
