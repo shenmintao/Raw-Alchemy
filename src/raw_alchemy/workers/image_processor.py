@@ -499,7 +499,7 @@ class ImageProcessor(QThread):
                 self.gpu_graded.clear()
                 self._gpu_uint8 = None
                 if self.preview_executor is not None:
-                    self.preview_executor._prefix_cache.clear()
+                    self.preview_executor.clear_cache()
                 self.last_metering_key = None
                 self.cached_auto_ev = 0.0
             else:
@@ -518,7 +518,7 @@ class ImageProcessor(QThread):
         self._gpu_uint8 = None
         self._full_refine_request = None
         if self.preview_executor is not None:
-            self.preview_executor._prefix_cache.clear()
+            self.preview_executor.clear_cache()
         self._last_executor_source_mode = None
         self.cached_auto_ev = 0.0
         # Force immediate GPU memory release
@@ -532,7 +532,7 @@ class ImageProcessor(QThread):
             self._gpu_uint8 = None
             self._full_refine_request = None
             if self.preview_executor is not None:
-                self.preview_executor._prefix_cache.clear()
+                self.preview_executor.clear_cache()
             self._last_executor_source_mode = None
             logger.debug("[Worker] GPU buffers released.")
         except Exception as e:
@@ -858,10 +858,24 @@ class ImageProcessor(QThread):
             self.cpu_corrected = self.cpu_linear
 
     def _invalidate_executor_prefix_if_needed(self, params: ProcessorParams):
+        """Semantic invalidation of the executor's pipeline caches.
+
+        Division of labor (T7.1): PreviewExecutor.set_source only clears its
+        caches when the source *array object* actually changes, so that the
+        prefix cache survives across requests that reuse the same source.
+        This method owns the semantic invalidations the executor cannot see:
+        proxy/full source-mode switches, and lens/denoise state changes whose
+        cached op outputs (denoise/lens_correct callbacks) depend on worker
+        state not captured by the op parameters themselves.
+        """
+        source_mode = 'proxy' if self._executor_using_proxy else 'full'
         if self.preview_executor is None:
+            # Executor not created yet (first request): nothing to clear, but
+            # still record the mode its cache is about to be built from, so
+            # the *second* request does not spuriously invalidate it.
+            self._last_executor_source_mode = source_mode
             return
 
-        source_mode = 'proxy' if self._executor_using_proxy else 'full'
         denoise_enabled = params.get('denoise_enabled', False)
         desired_lens_key = (
             params.get('lens_correct'),
@@ -879,7 +893,7 @@ class ImageProcessor(QThread):
             needs_clear = True
 
         if needs_clear:
-            self.preview_executor._prefix_cache.clear()
+            self.preview_executor.clear_cache()
         self._last_executor_source_mode = source_mode
 
     def _do_process(self, request: ProcessRequest):

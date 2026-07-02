@@ -47,6 +47,7 @@ class _BaseExecutor:
         round_exposure_gain: bool = False,
     ):
         self._source: np.ndarray | None = None
+        self._source_input: np.ndarray | None = None
         self.denoiser = denoiser
         self.lens_corrector = lens_corrector
         self.auto_gain_resolver = auto_gain_resolver
@@ -55,14 +56,24 @@ class _BaseExecutor:
         if source is not None:
             self.set_source(source)
 
-    def set_source(self, source: np.ndarray):
-        if self._source is source:
-            return
+    def set_source(self, source: np.ndarray) -> bool:
+        """Set the pipeline source array.
+
+        Returns True only when the source actually changed. Identity is
+        checked against both the internally stored array and the original
+        caller-provided object, so repeatedly passing the same array never
+        counts as a change even when a dtype/contiguity conversion forced an
+        internal copy on first ingestion.
+        """
+        if source is self._source or source is self._source_input:
+            return False
+        self._source_input = source
         if source.dtype != np.float32:
             source = source.astype(np.float32)
         if not source.flags["C_CONTIGUOUS"]:
             source = np.ascontiguousarray(source)
         self._source = source
+        return True
 
     def _resolve_source(self, source: np.ndarray | None) -> np.ndarray:
         if source is not None:
@@ -261,11 +272,27 @@ class ExportExecutor(_BaseExecutor):
 class PreviewExecutor(_BaseExecutor):
     def __init__(self, source: np.ndarray | None = None, **kwargs):
         self._prefix_cache: dict[int, PipelineResult] = {}
+        # Post-clip final result of the most recent run, keyed by
+        # hash(tuple(ops)). Kept to a single entry to bound memory until
+        # T7.2/T7.6 introduce proper cache budgets.
+        self._final_cache: dict[int, PipelineResult] = {}
         super().__init__(source, **kwargs)
 
-    def set_source(self, source: np.ndarray):
-        super().set_source(source)
+    def set_source(self, source: np.ndarray) -> bool:
+        # Only invalidate the caches when the source array actually changed.
+        # The GUI worker passes `source=` on every request, so clearing
+        # unconditionally here would reduce the prefix-cache hit rate to zero.
+        # Semantic invalidation (proxy/full switch, lens/denoise state) is the
+        # worker's job: see ImageProcessor._invalidate_executor_prefix_if_needed.
+        changed = super().set_source(source)
+        if changed:
+            self.clear_cache()
+        return changed
+
+    def clear_cache(self):
+        """Drop all cached intermediate and final pipeline results."""
         self._prefix_cache.clear()
+        self._final_cache.clear()
 
     def run(self, ops: Sequence[Op], source: np.ndarray | None = None) -> np.ndarray:
         return self.run_result(ops, source).image
@@ -274,6 +301,15 @@ class PreviewExecutor(_BaseExecutor):
         if source is not None:
             self.set_source(source)
         src = self._resolve_source(None)
+
+        # Full hit (same source, identical op list — e.g. only zoom/viewport
+        # changed): return the cached post-clip result directly, skipping the
+        # upload -> clip_inplace -> to_numpy GPU round-trip entirely.
+        ops_key = hash(tuple(ops))
+        final_result = self._final_cache.get(ops_key)
+        if final_result is not None:
+            self.last_applied_ev = final_result.applied_ev
+            return final_result
 
         start_index = 0
         cached_result = None
@@ -291,10 +327,14 @@ class PreviewExecutor(_BaseExecutor):
 
         for index, op in enumerate(ops[start_index:], start=start_index + 1):
             buf = self._apply_op(buf, op)
+            # to_numpy() already returns a fresh host array; no extra copy.
             self._prefix_cache[hash(tuple(ops[:index]))] = PipelineResult(
-                buf.to_numpy().copy(),
+                buf.to_numpy(),
                 self.last_applied_ev,
             )
 
         clip_inplace(buf.arr)
-        return PipelineResult(buf.to_numpy(), self.last_applied_ev)
+        result = PipelineResult(buf.to_numpy(), self.last_applied_ev)
+        self._final_cache.clear()
+        self._final_cache[ops_key] = result
+        return result

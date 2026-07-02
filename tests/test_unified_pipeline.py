@@ -488,3 +488,154 @@ def test_image_processor_full_export_request_uses_worker_handler(monkeypatch):
     assert emitted == [(True, "")]
     assert captured["payload"]["input_path"] == "synthetic.raw"
     assert captured["payload"]["output_path"] == "out.tif"
+
+
+def _install_executor_spies(monkeypatch, preview):
+    """Count op applications on `preview` and GPU clip calls (T7.1 guards)."""
+    from raw_alchemy.pipeline import executor as executor_module
+
+    op_calls = []
+    original_apply = preview._apply_op
+
+    def counting_apply(buf, op):
+        op_calls.append(op.name)
+        return original_apply(buf, op)
+
+    monkeypatch.setattr(preview, "_apply_op", counting_apply)
+
+    clip_calls = []
+    original_clip = executor_module.clip_inplace
+
+    def counting_clip(arr):
+        clip_calls.append(1)
+        return original_clip(arr)
+
+    monkeypatch.setattr(executor_module, "clip_inplace", counting_clip)
+    return op_calls, clip_calls
+
+
+def test_preview_executor_same_source_rerun_hits_cache_without_gpu(monkeypatch):
+    rng = np.random.default_rng(7)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    assert len(ops) >= 3
+
+    op_calls, clip_calls = _install_executor_spies(monkeypatch, preview)
+
+    first = preview.run_result(ops, source=src)
+    assert len(op_calls) == len(ops)
+    assert len(clip_calls) == 1
+
+    # Same source object + identical op list (e.g. only zoom/viewport changed):
+    # no op kernel may re-run and no GPU clip round-trip may happen.
+    second = preview.run_result(ops, source=src)
+    assert len(op_calls) == len(ops)
+    assert len(clip_calls) == 1
+    assert second.applied_ev == first.applied_ev
+    np.testing.assert_array_equal(second.image, first.image)
+
+
+def test_preview_executor_prefix_cache_survives_tail_param_change(monkeypatch):
+    rng = np.random.default_rng(11)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    preview.run_result(ops, source=src)
+
+    op_calls, _ = _install_executor_spies(monkeypatch, preview)
+
+    # Change only the sat_contrast op: the shared [exposure, white_balance]
+    # prefix must come from cache, so only the changed suffix re-runs.
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    assert changed_ops[:2] == ops[:2]
+    preview.run_result(changed_ops, source=src)
+    assert op_calls == [op.name for op in changed_ops[2:]]
+
+
+def test_preview_executor_source_swap_clears_cache(monkeypatch):
+    rng = np.random.default_rng(23)
+    src_a = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    src_b = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src_a)
+    ops = build_op_list(_case({"exposure": 0.5, "saturation": 1.1}))
+
+    op_calls, clip_calls = _install_executor_spies(monkeypatch, preview)
+
+    first = preview.run_result(ops, source=src_a)
+    assert len(op_calls) == len(ops)
+
+    # New source object: caches must be dropped and the full chain re-run.
+    second = preview.run_result(ops, source=src_b)
+    assert len(op_calls) == 2 * len(ops)
+    assert len(clip_calls) == 2
+    assert not np.array_equal(second.image, first.image)
+
+    # And the caches are now keyed to the new source.
+    third = preview.run_result(ops, source=src_b)
+    assert len(op_calls) == 2 * len(ops)
+    np.testing.assert_array_equal(third.image, second.image)
+
+
+def test_set_source_reports_change_only_for_new_objects():
+    rng = np.random.default_rng(31)
+    src64 = rng.uniform(0.02, 0.65, size=(4, 4, 3))  # float64: forces a conversion copy
+    preview = PreviewExecutor()
+
+    assert preview.set_source(src64) is True
+    # The internal float32 copy must not make the same input count as a change.
+    assert preview.set_source(src64) is False
+
+    src32 = src64.astype(np.float32)
+    assert preview.set_source(src32) is True
+    assert preview.set_source(src32) is False
+
+
+def test_image_processor_zoom_only_change_hits_executor_cache(monkeypatch):
+    from raw_alchemy.pipeline.cache_manager import CachedImage
+    from raw_alchemy.pipeline.executor import _BaseExecutor
+    from raw_alchemy.pipeline.request import ProcessRequest
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    op_calls = []
+    original_apply = _BaseExecutor._apply_op
+
+    def counting_apply(self, buf, op):
+        op_calls.append(op.name)
+        return original_apply(self, buf, op)
+
+    monkeypatch.setattr(_BaseExecutor, "_apply_op", counting_apply)
+
+    params = _case(
+        {
+            "exposure": 1.0,
+            "wb_temp": 5.0,
+            "saturation": 1.1,
+            "viewport_size": (32, 32),
+            "preview_zoom": 2.0,
+            "device_pixel_ratio": 1.0,
+        }
+    )
+    source = np.full((64, 64, 3), 0.18, dtype=np.float32)
+    path = "synthetic.raw"
+    processor = ImageProcessor()
+    processor.cpu_linear = source
+    processor.current_path = path
+    processor.exif_data = None
+    processor.cache_manager.put(path, CachedImage(path, source, None, None))
+
+    processor._do_process(ProcessRequest(path, dict(params), 1))
+    first_run_ops = len(op_calls)
+    assert first_run_ops > 0
+
+    # Zoom-only changes keep the op list identical: from the *second* request
+    # onward the executor cache must fully absorb the pipeline (T7.1).
+    processor._do_process(ProcessRequest(path, dict(params, preview_zoom=3.0), 2))
+    assert len(op_calls) == first_run_ops
+    processor._do_process(ProcessRequest(path, dict(params, preview_zoom=4.0), 3))
+    assert len(op_calls) == first_run_ops
+
+    # A tail slider change re-runs only the changed suffix, not the full chain.
+    processor._do_process(ProcessRequest(path, dict(params, saturation=1.3), 4))
+    suffix_ops = len(op_calls) - first_run_ops
+    assert 0 < suffix_ops < first_run_ops
