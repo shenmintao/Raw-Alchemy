@@ -58,6 +58,19 @@ METERING_MODES = [
 ]
 
 # ==========================================
+#           Host memory governance (T7.6)
+# ==========================================
+
+# Absolute cap (MB) for the decoded-image cache. Adjustable in Settings.
+CACHE_LIMIT_MB = 6144
+# Relative cap as a fraction of available memory; effective quota is
+# min(relative, absolute).
+CACHE_MEMORY_FRACTION = 0.5
+# Byte budget (MB) for the preview pipeline prefix cache. Host RAM budget
+# until T7.2 moves pipeline residency to the GPU (VRAM budget thereafter).
+EXECUTOR_CACHE_LIMIT_MB = 4096
+
+# ==========================================
 #           GUI 閰嶇疆
 # ==========================================
 

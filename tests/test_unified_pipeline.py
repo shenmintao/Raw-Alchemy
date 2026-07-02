@@ -639,3 +639,79 @@ def test_image_processor_zoom_only_change_hits_executor_cache(monkeypatch):
     processor._do_process(ProcessRequest(path, dict(params, saturation=1.3), 4))
     suffix_ops = len(op_calls) - first_run_ops
     assert 0 < suffix_ops < first_run_ops
+
+
+def test_preview_executor_trim_respects_budget_and_keeps_short_prefixes(monkeypatch):
+    rng = np.random.default_rng(41)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    assert len(ops) >= 3
+    result = preview.run_result(ops, source=src)
+
+    entry_bytes = result.image.nbytes  # all cached results share this shape
+    assert preview.cache_bytes() == (len(ops) + 1) * entry_bytes  # prefixes + final
+
+    # Budget for the final result plus one prefix: the longest prefixes must
+    # be dropped first, keeping the (expensive-to-recompute) shortest one.
+    budget = 2 * entry_bytes
+    freed = preview.trim(budget)
+    assert freed == (len(ops) - 1) * entry_bytes
+    assert preview.cache_bytes() <= budget
+    assert set(preview._prefix_lengths.values()) == {1}
+
+    # The surviving final result still powers the full-hit path.
+    rerun = preview.run_result(ops, source=src)
+    np.testing.assert_array_equal(rerun.image, result.image)
+
+    # A tail change after trim resumes from the surviving length-1 prefix.
+    op_calls, _ = _install_executor_spies(monkeypatch, preview)
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    preview.run_result(changed_ops, source=src)
+    assert op_calls == [op.name for op in changed_ops[1:]]
+
+
+def test_preview_executor_trim_to_zero_then_recompute():
+    rng = np.random.default_rng(43)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.25, "saturation": 1.2}))
+    first = preview.run_result(ops, source=src)
+
+    freed = preview.trim(0)
+    assert freed > 0
+    assert preview.cache_bytes() == 0
+    assert preview._prefix_cache == {}
+    assert preview._prefix_lengths == {}
+    assert preview._final_cache == {}
+
+    again = preview.run_result(ops, source=src)
+    np.testing.assert_array_equal(again.image, first.image)
+
+
+def test_image_processor_applies_executor_cache_budget(monkeypatch):
+    from raw_alchemy.pipeline.cache_manager import CachedImage
+    from raw_alchemy.pipeline.executor import PreviewExecutor as ExecutorClass
+    from raw_alchemy.pipeline.request import ProcessRequest
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    trim_calls = []
+    original_trim = ExecutorClass.trim
+
+    def spy_trim(self, budget_bytes):
+        trim_calls.append(budget_bytes)
+        return original_trim(self, budget_bytes)
+
+    monkeypatch.setattr(ExecutorClass, "trim", spy_trim)
+
+    source = np.full((8, 8, 3), 0.18, dtype=np.float32)
+    path = "synthetic.raw"
+    processor = ImageProcessor()
+    processor.cpu_linear = source
+    processor.current_path = path
+    processor.exif_data = None
+    processor.cache_manager.put(path, CachedImage(path, source, None, None))
+
+    processor._do_process(ProcessRequest(path, _case({"exposure": 1.0}), 1))
+
+    assert trim_calls == [int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024]

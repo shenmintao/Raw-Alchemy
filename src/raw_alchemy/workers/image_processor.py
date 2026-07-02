@@ -778,7 +778,6 @@ class ImageProcessor(QThread):
 
         cached_item = self.cache_manager.get(self._executor_path) if self._executor_path else None
         if cached_item:
-            old_size = cached_item.size_mb
             if self._executor_using_proxy:
                 cached_item.proxy_corrected_data = corrected
                 cached_item.proxy_lens_key = current_lens_key
@@ -788,9 +787,9 @@ class ImageProcessor(QThread):
                 if cached_item.proxy_linear is not None:
                     cached_item.proxy_corrected_data = self._make_proxy(corrected)
                     cached_item.proxy_lens_key = current_lens_key
-            cached_item.update_size()
-            with self.cache_manager.lock:
-                self.cache_manager.current_memory_mb += cached_item.size_mb - old_size
+            # Re-account the entry and apply quota eviction (T7.6): a
+            # full-size corrected write-back can push the cache over budget.
+            self.cache_manager.notify_entry_updated(self._executor_path)
 
         return corrected
 
@@ -935,8 +934,12 @@ class ImageProcessor(QThread):
 
             ops = build_op_list(params)
             executor_source = self._select_executor_source(use_proxy)
-            result = self._get_preview_executor().run_result(ops, source=executor_source)
+            executor = self._get_preview_executor()
+            result = executor.run_result(ops, source=executor_source)
             self._sync_executor_export_source(params)
+            # Prefix-cache byte budget (T7.6): host RAM budget until T7.2
+            # moves pipeline residency to the GPU (VRAM budget thereafter).
+            executor.trim(int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024)
 
             processed = result.image
             if processed.dtype != np.float32:
@@ -983,14 +986,11 @@ class ImageProcessor(QThread):
 
             cached_item = self.cache_manager.get(request.path)
             if cached_item:
-                old_size = cached_item.size_mb
                 cached_item.output_uint8 = img_uint8.copy()
                 cached_item.output_key = output_key
                 cached_item.output_ev = applied_ev
                 cached_item.output_source_size = output_source_size
-                cached_item.update_size()
-                with self.cache_manager.lock:
-                    self.cache_manager.current_memory_mb += cached_item.size_mb - old_size
+                self.cache_manager.notify_entry_updated(request.path)
 
             self.result_ready.emit(
                 img_uint8,

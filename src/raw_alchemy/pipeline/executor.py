@@ -272,9 +272,12 @@ class ExportExecutor(_BaseExecutor):
 class PreviewExecutor(_BaseExecutor):
     def __init__(self, source: np.ndarray | None = None, **kwargs):
         self._prefix_cache: dict[int, PipelineResult] = {}
+        # Prefix length (op count) per prefix-cache key, used by trim() to
+        # drop the cheapest-to-recompute (longest) prefixes first.
+        self._prefix_lengths: dict[int, int] = {}
         # Post-clip final result of the most recent run, keyed by
-        # hash(tuple(ops)). Kept to a single entry to bound memory until
-        # T7.2/T7.6 introduce proper cache budgets.
+        # hash(tuple(ops)). Kept to a single entry; trim() enforces the
+        # overall byte budget (T7.6).
         self._final_cache: dict[int, PipelineResult] = {}
         super().__init__(source, **kwargs)
 
@@ -292,7 +295,42 @@ class PreviewExecutor(_BaseExecutor):
     def clear_cache(self):
         """Drop all cached intermediate and final pipeline results."""
         self._prefix_cache.clear()
+        self._prefix_lengths.clear()
         self._final_cache.clear()
+
+    def cache_bytes(self) -> int:
+        """Total bytes held by the prefix/final result caches (T7.6).
+
+        Host RAM today; becomes a VRAM figure once T7.2 moves pipeline
+        residency to the GPU.
+        """
+        total = sum(result.image.nbytes for result in self._prefix_cache.values())
+        total += sum(result.image.nbytes for result in self._final_cache.values())
+        return int(total)
+
+    def trim(self, budget_bytes: int) -> int:
+        """Evict cached pipeline results until ``cache_bytes() <= budget``.
+
+        Longest prefixes are dropped first: tail (color) ops are cheap to
+        re-run, while short prefixes hold the expensive early stages
+        (denoise, lens correction, geometry). The final post-clip result is
+        dropped last because it powers the zoom-only full-hit path (T7.1).
+        Returns the number of bytes freed.
+        """
+        budget = max(0, int(budget_bytes))
+        total = self.cache_bytes()
+        freed = 0
+        while total - freed > budget and self._prefix_lengths:
+            key = max(self._prefix_lengths, key=self._prefix_lengths.get)
+            self._prefix_lengths.pop(key)
+            result = self._prefix_cache.pop(key, None)
+            if result is not None:
+                freed += result.image.nbytes
+        if total - freed > budget and self._final_cache:
+            for result in self._final_cache.values():
+                freed += result.image.nbytes
+            self._final_cache.clear()
+        return freed
 
     def run(self, ops: Sequence[Op], source: np.ndarray | None = None) -> np.ndarray:
         return self.run_result(ops, source).image
@@ -328,10 +366,12 @@ class PreviewExecutor(_BaseExecutor):
         for index, op in enumerate(ops[start_index:], start=start_index + 1):
             buf = self._apply_op(buf, op)
             # to_numpy() already returns a fresh host array; no extra copy.
-            self._prefix_cache[hash(tuple(ops[:index]))] = PipelineResult(
+            prefix_key = hash(tuple(ops[:index]))
+            self._prefix_cache[prefix_key] = PipelineResult(
                 buf.to_numpy(),
                 self.last_applied_ev,
             )
+            self._prefix_lengths[prefix_key] = index
 
         clip_inplace(buf.arr)
         result = PipelineResult(buf.to_numpy(), self.last_applied_ev)

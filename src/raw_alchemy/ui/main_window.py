@@ -16,7 +16,7 @@ from qfluentwidgets import (
     ToolButton, PushButton,
 )
 
-from raw_alchemy import lensfun_wrapper, i18n, sidecar
+from raw_alchemy import config, lensfun_wrapper, i18n, sidecar
 from raw_alchemy.i18n import tr
 from loguru import logger
 
@@ -215,7 +215,15 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.write_sidecar_enabled = settings.get('write_sidecar', True)
         if hasattr(self, 'settings_widget'):
             self.settings_widget.set_write_sidecar_enabled(self.write_sidecar_enabled)
-    
+
+        try:
+            self.cache_limit_mb = int(settings.get('cache_limit_mb', config.CACHE_LIMIT_MB))
+        except (TypeError, ValueError):
+            self.cache_limit_mb = int(config.CACHE_LIMIT_MB)
+        self._apply_cache_limit(self.cache_limit_mb)
+        if hasattr(self, 'settings_widget'):
+            self.settings_widget.set_cache_limit_mb(self.cache_limit_mb)
+
     def restore_ui(self):
         """Restore UI state from saved settings"""
         if self.last_lut_folder_path and os.path.exists(self.last_lut_folder_path):
@@ -282,6 +290,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             'last_lensfun_db_path': self.last_lensfun_db_path,
             'last_export_path': self.last_export_path,
             'write_sidecar': self.write_sidecar_enabled,
+            'cache_limit_mb': int(getattr(self, 'cache_limit_mb', config.CACHE_LIMIT_MB)),
         }
         i18n.save_app_settings(settings)
 
@@ -542,7 +551,19 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.settings_widget = SettingsPanel()
         self.settings_widget.setObjectName("settingsInterface")
         self.settings_widget.write_sidecar_changed.connect(self.on_write_sidecar_changed)
+        self.settings_widget.cache_limit_changed.connect(self.on_cache_limit_changed)
         self.addSubInterface(self.settings_widget, FIF.SETTING, tr('settings'))
+
+    def on_cache_limit_changed(self, limit_mb):
+        self.cache_limit_mb = int(limit_mb)
+        self._apply_cache_limit(self.cache_limit_mb)
+
+    def _apply_cache_limit(self, limit_mb):
+        """Apply the image-cache memory cap to all processors (T7.6)."""
+        for processor in (self.processor, self.baseline_processor):
+            manager = getattr(processor, 'cache_manager', None)
+            if manager is not None:
+                manager.set_limit_mb(limit_mb)
 
     def on_write_sidecar_changed(self, enabled):
         self.write_sidecar_enabled = bool(enabled)
