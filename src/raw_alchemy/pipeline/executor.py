@@ -28,6 +28,17 @@ from raw_alchemy.pipeline.ops import Op
 
 ImageCallback = Callable[[np.ndarray], np.ndarray]
 AutoGainResolver = Callable[[np.ndarray, str], float]
+AbortCallback = Callable[[], bool]
+
+
+class PipelineAborted(Exception):
+    """A preview run was cooperatively cancelled between ops (T7.3).
+
+    Raised by PreviewExecutor.run_result when its ``should_abort`` callback
+    reports that a newer request superseded the in-flight one. Prefix-cache
+    entries built before the abort are kept, so the superseding run resumes
+    from the completed stages. Callers must discard the run silently (no
+    result emission)."""
 
 
 class PipelineResult:
@@ -411,10 +422,28 @@ class PreviewExecutor(_BaseExecutor):
             freed += self._drop_final_entries()
         return freed
 
-    def run(self, ops: Sequence[Op], source: np.ndarray | None = None) -> np.ndarray:
-        return self.run_result(ops, source).image
+    def run(
+        self,
+        ops: Sequence[Op],
+        source: np.ndarray | None = None,
+        *,
+        should_abort: AbortCallback | None = None,
+    ) -> np.ndarray:
+        return self.run_result(ops, source, should_abort=should_abort).image
 
-    def run_result(self, ops: Sequence[Op], source: np.ndarray | None = None) -> PipelineResult:
+    def run_result(
+        self,
+        ops: Sequence[Op],
+        source: np.ndarray | None = None,
+        *,
+        should_abort: AbortCallback | None = None,
+    ) -> PipelineResult:
+        """Run ``ops``, resuming from cached prefixes when possible.
+
+        ``should_abort`` (T7.3) is polled at op boundaries; when it returns
+        True the run raises PipelineAborted. Already-snapshotted prefix
+        stages stay cached so the superseding run picks up from them.
+        """
         if source is not None:
             self.set_source(source)
         src = self._resolve_source(None)
@@ -426,6 +455,11 @@ class PreviewExecutor(_BaseExecutor):
         if final_result is not None:
             self.last_applied_ev = final_result.applied_ev
             return final_result
+
+        # Abort before any cache invalidation or GPU work: a request that is
+        # already superseded on entry leaves every cache untouched.
+        if should_abort is not None and should_abort():
+            raise PipelineAborted("preview run superseded before start")
 
         prefix_keys = [hash(tuple(ops[:index])) for index in range(1, len(ops) + 1)]
 
@@ -462,6 +496,14 @@ class PreviewExecutor(_BaseExecutor):
             buf.upload(src)
 
         for index, op in enumerate(ops[start_index:], start=start_index + 1):
+            # Cooperative cancellation (T7.3): checked at every op boundary.
+            # Prefixes snapshotted so far stay cached; only the working
+            # buffer (already snapshotted last stage) is recycled.
+            if should_abort is not None and should_abort():
+                buf.clear()
+                raise PipelineAborted(
+                    f"preview run superseded before op {index}/{len(ops)} ({op.name})"
+                )
             buf = self._apply_op(buf, op)
             # Snapshot the (pre-clip) op output on the GPU. Device copies are
             # cheap; the old per-op to_numpy() readbacks were the main PCIe

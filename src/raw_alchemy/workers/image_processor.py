@@ -28,7 +28,7 @@ from raw_alchemy.math_ops import (
 )
 from raw_alchemy.pipeline.request import ProcessRequest, ProcessorParams
 from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
-from raw_alchemy.pipeline.executor import PreviewExecutor
+from raw_alchemy.pipeline.executor import PipelineAborted, PreviewExecutor
 from raw_alchemy.pipeline.ops import build_op_list
 from raw_alchemy.gpu_buffer import GpuImage, acquire_ndarray, gpu_pool, release_ndarray
 from raw_alchemy.onnx.denoiser import denoise_raw, clear_session as denoise_clear_session
@@ -112,6 +112,9 @@ class ImageProcessor(QThread):
         self._last_executor_source_mode: Optional[str] = None
         self._full_refine_request: Optional[ProcessRequest] = None
         self._full_refine_due = 0.0
+        # Most recent user interaction (load/preview request) timestamp,
+        # used to postpone the idle full refine (T7.3).
+        self._last_interaction = 0.0
         self.last_preview_source = "full"
 
     def stop_and_cleanup(self):
@@ -125,6 +128,7 @@ class ImageProcessor(QThread):
             self.current_request_id += 1
             request_id = self.current_request_id
             self._full_refine_request = None
+            self._last_interaction = time.perf_counter()
             self.pending_request = ProcessRequest(path, {'_load': True}, request_id)
         if not self.isRunning():
             self.start()
@@ -142,6 +146,7 @@ class ImageProcessor(QThread):
             self.current_request_id += 1
             request_id = self.current_request_id
             self._full_refine_request = None
+            self._last_interaction = time.perf_counter()
             self.pending_request = ProcessRequest(path, params, request_id)
         if not self.isRunning():
             self.start()
@@ -179,20 +184,7 @@ class ImageProcessor(QThread):
 
         # Permanent worker loop 鈥?thread stays alive until app closes
         while not self._should_stop:
-            request = None
-            with self.lock:
-                now = time.perf_counter()
-                request = self.pending_request
-                if request:
-                    self.pending_request = None
-                    self._preload_queue.clear()
-                elif self._export_queue:
-                    request = self._export_queue.pop(0)
-                elif self._preload_queue:
-                    request = self._preload_queue.pop(0)
-                elif self._full_refine_request and now >= self._full_refine_due:
-                    request = self._full_refine_request
-                    self._full_refine_request = None
+            request = self._take_next_request()
 
             if not request:
                 time.sleep(0.05)
@@ -202,9 +194,7 @@ class ImageProcessor(QThread):
                 if '_export' in request.params:
                     self._do_export(request)
                 elif '_preload' in request.params:
-                    with self.lock:
-                        has_user_request = self.pending_request is not None
-                    if has_user_request:
+                    if self._interactive_abort_requested():
                         continue
                     self._do_preload(request)
                 elif '_load' in request.params:
@@ -218,6 +208,53 @@ class ImageProcessor(QThread):
 
         # Release GPU buffers on shutdown while CUDA context is still valid
         self._release_gpu_buffers()
+
+    def _take_next_request(self) -> Optional[ProcessRequest]:
+        """Pick the next request: user > export > preload > idle full refine.
+
+        Full-refine trigger tightening (T7.3): a due refine is postponed —
+        never dropped — while queued work exists or a user interaction
+        happened within the idle window, so the expensive full-frame pass
+        only starts once the worker is genuinely idle.
+        """
+        with self.lock:
+            now = time.perf_counter()
+            request = self.pending_request
+            if request:
+                self.pending_request = None
+                self._preload_queue.clear()
+                return request
+            if self._full_refine_request is not None and (
+                self._export_queue or self._preload_queue
+            ):
+                # Queued work runs first; restart the refine idle window so
+                # it fires only after the queue drains and things calm down.
+                self._full_refine_due = max(
+                    self._full_refine_due, now + FULL_REFINE_IDLE_SECONDS
+                )
+            if self._export_queue:
+                return self._export_queue.pop(0)
+            if self._preload_queue:
+                return self._preload_queue.pop(0)
+            if self._full_refine_request is not None and now >= self._full_refine_due:
+                if now - self._last_interaction < FULL_REFINE_IDLE_SECONDS:
+                    self._full_refine_due = (
+                        self._last_interaction + FULL_REFINE_IDLE_SECONDS
+                    )
+                    return None
+                request = self._full_refine_request
+                self._full_refine_request = None
+                return request
+        return None
+
+    def _interactive_abort_requested(self) -> bool:
+        """True when a newer user request is waiting (T7.3 abort predicate).
+
+        Injected into PreviewExecutor.run_result as ``should_abort`` and
+        polled at op boundaries; also checked between _do_preload stages.
+        """
+        with self.lock:
+            return self.pending_request is not None
 
     # =================================================================
     # Loading
@@ -377,14 +414,31 @@ class ImageProcessor(QThread):
         return proxy
 
     def _do_preload(self, request: ProcessRequest):
-        """Preload RAW into CPU cache with lens correction."""
+        """Preload a neighbor RAW into the CPU cache: decode + proxy only.
+
+        Preload slimming (T7.3): neighbor preloads no longer precompute the
+        full-size lens correction — compute_lens_distortion_map plus three
+        full-resolution INTER_CUBIC remaps cost seconds per image and pinned
+        ~515MB of corrected data per entry (T7.6). The interactive path
+        computes `corrected` on demand for the image actually being viewed.
+
+        Stage boundaries (decode -> proxy) check for a pending user request;
+        on hit the remaining stages are abandoned, but everything already
+        computed still goes into the cache.
+        """
         path = request.path
         if self.cache_manager.get(path):
             return
 
         try:
+            # Stage 1: RAW decode + demosaic (the expensive part).
             img, exif_data, _exif_meta = self._rawpy_to_prophoto(path)
-            proxy_img = self._make_proxy(img)
+
+            # Stage 2: interactive proxy generation — skipped when a user
+            # request arrived while decoding (the decode result is kept).
+            proxy_img = None
+            if not self._interactive_abort_requested():
+                proxy_img = self._make_proxy(img)
 
             new_cache_item = CachedImage(
                 path=path,
@@ -394,44 +448,12 @@ class ImageProcessor(QThread):
                 lens_key=None,
                 exif_metadata=_exif_meta,
             )
-
-            # Precompute lens correction on CPU
-            if exif_data:
-                try:
-                    import cv2
-                    from raw_alchemy.lensfun_wrapper import compute_lens_distortion_map
-
-                    dist_result = compute_lens_distortion_map(
-                        img,
-                        camera_maker=exif_data.get('camera_maker'),
-                        camera_model=exif_data.get('camera_model'),
-                        lens_maker=exif_data.get('lens_maker'),
-                        lens_model=exif_data.get('lens_model'),
-                        focal_length=exif_data.get('focal_length', 0),
-                        aperture=exif_data.get('aperture', 0),
-                        crop_factor=exif_data.get('crop_factor'),
-                    )
-                    if dist_result is not None:
-                        coords, oob_mask, vignette_img = dist_result
-                        corrected = np.empty_like(vignette_img)
-                        for ch in range(3):
-                            map_x = coords[:, :, ch, 0]
-                            map_y = coords[:, :, ch, 1]
-                            corrected[:, :, ch] = cv2.remap(
-                                vignette_img[:, :, ch], map_x, map_y,
-                                cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-                        corrected[oob_mask] = 0
-                        new_cache_item.corrected_data = corrected
-                        new_cache_item.proxy_corrected_data = self._make_proxy(corrected)
-                        new_cache_item.lens_key = (True, None, False)
-                        new_cache_item.proxy_lens_key = (True, None, False)
-                        new_cache_item.update_size()
-                except Exception as e:
-                    logger.debug(f"[Worker] Preload lens correction skipped: {e}")
-
             self.cache_manager.put(path, new_cache_item)
-            logger.info(f"[Worker] Preloaded: {os.path.basename(path)} ({img.shape[1]}x{img.shape[0]})"
-                         f"{' +lens' if new_cache_item.corrected_data is not None else ''}")
+            logger.info(
+                f"[Worker] Preloaded: {os.path.basename(path)} "
+                f"({img.shape[1]}x{img.shape[0]})"
+                f"{'' if proxy_img is not None else ' (proxy skipped: superseded)'}"
+            )
 
         except Exception as e:
             logger.warning(f"Preload failed for {path}: {e}")
@@ -945,7 +967,14 @@ class ImageProcessor(QThread):
             ops = build_op_list(params)
             executor_source = self._select_executor_source(use_proxy)
             executor = self._get_preview_executor()
-            result = executor.run_result(ops, source=executor_source)
+            # Cooperative cancellation (T7.3): a newer user request aborts
+            # this run at the next op boundary (completed prefixes stay
+            # cached). Applies to interactive runs and idle full refines.
+            result = executor.run_result(
+                ops,
+                source=executor_source,
+                should_abort=self._interactive_abort_requested,
+            )
             self._sync_executor_export_source(params)
             # Prefix-cache byte budget (T7.6): VRAM budget since T7.2 moved
             # pipeline residency to the GPU. Even if trim() evicts `result`
@@ -956,6 +985,14 @@ class ImageProcessor(QThread):
             applied_ev = float(result.applied_ev)
             self.last_applied_ev = applied_ev
 
+        except PipelineAborted as e:
+            # Superseded in flight: drop the run silently — no result_ready,
+            # no error. The pending request re-renders from the kept prefixes.
+            logger.debug(
+                f"[Worker] Aborted in-flight run for "
+                f"{os.path.basename(request.path)} (id={request.request_id}): {e}"
+            )
+            return
         except Exception as e:
             logger.error(f"[Worker] Error in unified pipeline: {e}")
             import traceback
