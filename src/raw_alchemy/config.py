@@ -66,9 +66,17 @@ CACHE_LIMIT_MB = 6144
 # Relative cap as a fraction of available memory; effective quota is
 # min(relative, absolute).
 CACHE_MEMORY_FRACTION = 0.5
-# Byte budget (MB) for the preview pipeline prefix cache. Host RAM budget
-# until T7.2 moves pipeline residency to the GPU (VRAM budget thereafter).
+# Byte budget (MB) for the preview pipeline prefix cache. Since T7.2 the
+# prefix/final caches hold GPU-resident buffers, so this is a VRAM budget.
 EXECUTOR_CACHE_LIMIT_MB = 4096
+# Byte budget (MB) for *free* (recyclable) GPU buffers retained by the
+# shape-keyed ndarray pool (T7.2). Released buffers above this budget are
+# actually freed instead of pooled.
+GPU_POOL_LIMIT_MB = 2048
+# At most this many free buffers are retained per (dtype, shape) key.
+# Sharpen holds 4 same-shape 2D scratch buffers and RCD demosaic up to 7;
+# the global byte budget above is the primary bound.
+GPU_POOL_MAX_PER_KEY = 8
 
 # ==========================================
 #           GUI 閰嶇疆

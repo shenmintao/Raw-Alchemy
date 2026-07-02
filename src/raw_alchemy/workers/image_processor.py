@@ -20,7 +20,7 @@ from PySide6.QtCore import QThread, Signal
 from loguru import logger
 
 from raw_alchemy import config, metering
-from raw_alchemy.backend import ndarray as backend_ndarray, ti
+from raw_alchemy.backend import ti
 from raw_alchemy.math_ops import (
     apply_matrix_inplace,
     float_to_uint8_gpu,
@@ -30,7 +30,7 @@ from raw_alchemy.pipeline.request import ProcessRequest, ProcessorParams
 from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
 from raw_alchemy.pipeline.executor import PreviewExecutor
 from raw_alchemy.pipeline.ops import build_op_list
-from raw_alchemy.gpu_buffer import GpuImage
+from raw_alchemy.gpu_buffer import GpuImage, acquire_ndarray, gpu_pool, release_ndarray
 from raw_alchemy.onnx.denoiser import denoise_raw, clear_session as denoise_clear_session
 
 
@@ -497,7 +497,7 @@ class ImageProcessor(QThread):
             if cached_item and cached_item.corrected_data is not None:
                 # Cache hit with lens correction: only invalidate downstream
                 self.gpu_graded.clear()
-                self._gpu_uint8 = None
+                self._release_gpu_uint8()
                 if self.preview_executor is not None:
                     self.preview_executor.clear_cache()
                 self.last_metering_key = None
@@ -508,6 +508,12 @@ class ImageProcessor(QThread):
 
         self.load_complete.emit(path, request.request_id)
 
+    def _release_gpu_uint8(self):
+        """Return the uint8 output buffer to the GPU pool (T7.2)."""
+        if self._gpu_uint8 is not None:
+            release_ndarray(self._gpu_uint8, ti.u8, tuple(self._gpu_uint8.shape))
+            self._gpu_uint8 = None
+
     def _invalidate_pipeline_caches(self):
         """Invalidate all pipeline stage caches (but not denoise/sharpen)."""
         self.cached_lens_key = None
@@ -515,25 +521,29 @@ class ImageProcessor(QThread):
         self.cpu_corrected = None
         self.cpu_proxy_corrected = None
         self.gpu_graded.clear()
-        self._gpu_uint8 = None
+        self._release_gpu_uint8()
         self._full_refine_request = None
         if self.preview_executor is not None:
             self.preview_executor.clear_cache()
         self._last_executor_source_mode = None
         self.cached_auto_ev = 0.0
-        # Force immediate GPU memory release
+        # Force immediate GPU memory release: collect dead GpuImages into the
+        # pool first, then drop the pool's free buffers (image switch — T7.2
+        # VRAM lifecycle: pooled sharpen/demosaic scratch is released here).
         gc.collect()
+        gpu_pool().clear()
         self.last_metering_key = None
 
     def _release_gpu_buffers(self):
         """Release all GPU buffers while CUDA context is still valid (on worker thread)."""
         try:
             self.gpu_graded.clear()
-            self._gpu_uint8 = None
+            self._release_gpu_uint8()
             self._full_refine_request = None
             if self.preview_executor is not None:
                 self.preview_executor.clear_cache()
             self._last_executor_source_mode = None
+            gpu_pool().clear()
             logger.debug("[Worker] GPU buffers released.")
         except Exception as e:
             logger.debug(f"[Worker] GPU buffer release error (non-critical): {e}")
@@ -937,15 +947,11 @@ class ImageProcessor(QThread):
             executor = self._get_preview_executor()
             result = executor.run_result(ops, source=executor_source)
             self._sync_executor_export_source(params)
-            # Prefix-cache byte budget (T7.6): host RAM budget until T7.2
-            # moves pipeline residency to the GPU (VRAM budget thereafter).
+            # Prefix-cache byte budget (T7.6): VRAM budget since T7.2 moved
+            # pipeline residency to the GPU. Even if trim() evicts `result`
+            # from the final cache, the local reference keeps its GPU buffer
+            # alive for the output stage below.
             executor.trim(int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024)
-
-            processed = result.image
-            if processed.dtype != np.float32:
-                processed = processed.astype(np.float32)
-            if not processed.flags['C_CONTIGUOUS']:
-                processed = np.ascontiguousarray(processed)
 
             applied_ev = float(result.applied_ev)
             self.last_applied_ev = applied_ev
@@ -959,17 +965,33 @@ class ImageProcessor(QThread):
 
         try:
             t_out = time.perf_counter()
-            self.gpu_graded.upload(processed)
-            source_h, source_w = processed.shape[:2]
+            # T7.2: convert the executor's GPU-resident output straight to
+            # uint8 on-device — only the final (viewport-sized) uint8 image
+            # crosses back to the host, not the full-frame float32.
+            if result.gpu is not None and result.gpu.valid:
+                graded_arr = result.gpu.arr
+                source_h, source_w = result.gpu.height, result.gpu.width
+            else:
+                # Fallback (results without a GPU buffer): legacy host round-trip.
+                processed = result.image
+                if processed.dtype != np.float32:
+                    processed = processed.astype(np.float32)
+                if not processed.flags['C_CONTIGUOUS']:
+                    processed = np.ascontiguousarray(processed)
+                self.gpu_graded.upload(processed)
+                graded_arr = self.gpu_graded.arr
+                source_h, source_w = processed.shape[:2]
+
             target_w, target_h = self._make_preview_target_size(source_w, source_h, params)
 
             if self._gpu_uint8 is None or self._gpu_uint8.shape != (target_h, target_w, 3):
-                self._gpu_uint8 = backend_ndarray(dtype=ti.u8, shape=(target_h, target_w, 3))
+                self._release_gpu_uint8()
+                self._gpu_uint8 = acquire_ndarray(ti.u8, (target_h, target_w, 3))
 
             if target_w == source_w and target_h == source_h:
-                float_to_uint8_gpu(self.gpu_graded.arr, self._gpu_uint8)
+                float_to_uint8_gpu(graded_arr, self._gpu_uint8)
             else:
-                resize_float_to_uint8_gpu(self.gpu_graded.arr, self._gpu_uint8)
+                resize_float_to_uint8_gpu(graded_arr, self._gpu_uint8)
 
             img_uint8 = self._gpu_uint8.to_numpy()
             output_source_size = (source_w, source_h)

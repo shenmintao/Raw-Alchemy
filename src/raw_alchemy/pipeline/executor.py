@@ -1,5 +1,5 @@
+import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 
 import colour
 import numpy as np
@@ -30,10 +30,55 @@ ImageCallback = Callable[[np.ndarray], np.ndarray]
 AutoGainResolver = Callable[[np.ndarray, str], float]
 
 
-@dataclass(frozen=True)
 class PipelineResult:
-    image: np.ndarray
-    applied_ev: float
+    """Result of a pipeline run.
+
+    T7.2: preview runs stay GPU-resident — ``gpu`` holds the post-clip output
+    buffer and ``image`` lazily downloads (then caches) the host copy, so
+    callers that only need the GPU buffer (preview uint8 conversion) never
+    pay the full-frame GPU→CPU readback. The result owns a strong reference
+    to its GpuImage: even after the executor evicts it from the final cache,
+    the buffer stays valid until this object is garbage collected (at which
+    point it is recycled into the buffer pool).
+    """
+
+    __slots__ = ("_image", "applied_ev", "gpu")
+
+    def __init__(
+        self,
+        image: np.ndarray | None = None,
+        applied_ev: float = 0.0,
+        gpu: GpuImage | None = None,
+    ):
+        self._image = image
+        self.applied_ev = applied_ev
+        self.gpu = gpu
+
+    @property
+    def image(self) -> np.ndarray:
+        """Host copy of the result (downloads from the GPU on first access)."""
+        if self._image is None and self.gpu is not None:
+            self._image = self.gpu.to_numpy()
+        return self._image
+
+    @property
+    def nbytes(self) -> int:
+        """Device-side (preferred) or host-side byte size of the result."""
+        if self.gpu is not None and self.gpu.valid:
+            return self.gpu.nbytes
+        if self._image is not None:
+            return int(self._image.nbytes)
+        return 0
+
+
+class _CachedStage:
+    """GPU-resident prefix-cache entry: op output buffer + applied EV."""
+
+    __slots__ = ("gpu", "applied_ev")
+
+    def __init__(self, gpu: GpuImage, applied_ev: float):
+        self.gpu = gpu
+        self.applied_ev = applied_ev
 
 
 class _BaseExecutor:
@@ -90,7 +135,9 @@ class _BaseExecutor:
         for op in ops:
             buf = self._apply_op(buf, op)
         clip_inplace(buf.arr)
-        return PipelineResult(buf.to_numpy(), self.last_applied_ev)
+        image = buf.to_numpy()
+        buf.clear()  # recycle the working buffer (export path materializes to host)
+        return PipelineResult(image, self.last_applied_ev)
 
     def _apply_op(self, buf: GpuImage, op: Op) -> GpuImage:
         if op.name == "denoise":
@@ -271,13 +318,16 @@ class ExportExecutor(_BaseExecutor):
 
 class PreviewExecutor(_BaseExecutor):
     def __init__(self, source: np.ndarray | None = None, **kwargs):
-        self._prefix_cache: dict[int, PipelineResult] = {}
+        # GPU-resident, pre-clip op outputs keyed by hash(tuple(ops[:i]))
+        # (T7.2): ops resume from device buffers with zero host round-trips.
+        self._prefix_cache: dict[int, _CachedStage] = {}
         # Prefix length (op count) per prefix-cache key, used by trim() to
         # drop the cheapest-to-recompute (longest) prefixes first.
         self._prefix_lengths: dict[int, int] = {}
         # Post-clip final result of the most recent run, keyed by
         # hash(tuple(ops)). Kept to a single entry; trim() enforces the
-        # overall byte budget (T7.6).
+        # overall byte budget (T7.6). The stored PipelineResult keeps its
+        # GPU buffer; the worker converts it to uint8 on-device.
         self._final_cache: dict[int, PipelineResult] = {}
         super().__init__(source, **kwargs)
 
@@ -293,19 +343,53 @@ class PreviewExecutor(_BaseExecutor):
         return changed
 
     def clear_cache(self):
-        """Drop all cached intermediate and final pipeline results."""
-        self._prefix_cache.clear()
-        self._prefix_lengths.clear()
-        self._final_cache.clear()
+        """Drop all cached intermediate and final pipeline results.
+
+        Prefix buffers are executor-internal (sole owner) and go straight
+        back to the buffer pool. Final results may still be referenced by
+        callers, so they are recycled only when this cache holds the last
+        reference; otherwise the buffer stays valid for the holder and is
+        freed by taichi when the result is eventually collected.
+        """
+        self._drop_prefix_entries(self._prefix_cache.keys())
+        self._drop_final_entries()
+
+    def _drop_prefix_entries(self, keys) -> int:
+        """Pop prefix entries, recycle their GPU buffers; return bytes freed."""
+        freed = 0
+        for key in list(keys):
+            stage = self._prefix_cache.pop(key, None)
+            self._prefix_lengths.pop(key, None)
+            if stage is not None:
+                freed += stage.gpu.nbytes
+                stage.gpu.clear()
+        return freed
+
+    def _drop_final_entries(self) -> int:
+        """Empty the final-result cache; return bytes dropped from it.
+
+        A final's GPU buffer is returned to the pool only when the cache is
+        the sole owner of the PipelineResult (refcount check). Handed-out
+        results keep their buffer alive — pooling must never steal a buffer
+        a caller could still read (and must not rely on __del__: see
+        GpuImage.clear for why finalizer-time pooling is unsafe).
+        """
+        freed = 0
+        while self._final_cache:
+            _, result = self._final_cache.popitem()
+            freed += result.nbytes
+            # 2 == this local `result` + getrefcount's own argument.
+            if result.gpu is not None and sys.getrefcount(result) == 2:
+                result.gpu.clear()
+                result.gpu = None
+        return freed
 
     def cache_bytes(self) -> int:
-        """Total bytes held by the prefix/final result caches (T7.6).
+        """Total device bytes held by the prefix/final result caches.
 
-        Host RAM today; becomes a VRAM figure once T7.2 moves pipeline
-        residency to the GPU.
-        """
-        total = sum(result.image.nbytes for result in self._prefix_cache.values())
-        total += sum(result.image.nbytes for result in self._final_cache.values())
+        VRAM figure since T7.2 (host RAM under the CPU taichi backend)."""
+        total = sum(stage.gpu.nbytes for stage in self._prefix_cache.values())
+        total += sum(result.nbytes for result in self._final_cache.values())
         return int(total)
 
     def trim(self, budget_bytes: int) -> int:
@@ -322,14 +406,9 @@ class PreviewExecutor(_BaseExecutor):
         freed = 0
         while total - freed > budget and self._prefix_lengths:
             key = max(self._prefix_lengths, key=self._prefix_lengths.get)
-            self._prefix_lengths.pop(key)
-            result = self._prefix_cache.pop(key, None)
-            if result is not None:
-                freed += result.image.nbytes
+            freed += self._drop_prefix_entries([key])
         if total - freed > budget and self._final_cache:
-            for result in self._final_cache.values():
-                freed += result.image.nbytes
-            self._final_cache.clear()
+            freed += self._drop_final_entries()
         return freed
 
     def run(self, ops: Sequence[Op], source: np.ndarray | None = None) -> np.ndarray:
@@ -341,40 +420,62 @@ class PreviewExecutor(_BaseExecutor):
         src = self._resolve_source(None)
 
         # Full hit (same source, identical op list — e.g. only zoom/viewport
-        # changed): return the cached post-clip result directly, skipping the
-        # upload -> clip_inplace -> to_numpy GPU round-trip entirely.
+        # changed): return the cached post-clip result directly, no GPU work.
         ops_key = hash(tuple(ops))
         final_result = self._final_cache.get(ops_key)
         if final_result is not None:
             self.last_applied_ev = final_result.applied_ev
             return final_result
 
+        prefix_keys = [hash(tuple(ops[:index])) for index in range(1, len(ops) + 1)]
+
         start_index = 0
-        cached_result = None
+        cached_stage = None
         for index in range(len(ops), 0, -1):
-            prefix_hash = hash(tuple(ops[:index]))
-            if prefix_hash in self._prefix_cache:
-                cached_result = self._prefix_cache[prefix_hash]
+            stage = self._prefix_cache.get(prefix_keys[index - 1])
+            if stage is not None:
+                cached_stage = stage
                 start_index = index
                 break
 
-        self.last_applied_ev = cached_result.applied_ev if cached_result is not None else 0.0
+        self.last_applied_ev = cached_stage.applied_ev if cached_stage is not None else 0.0
+
+        # The previous final result is stale for this run; drop it up front so
+        # its buffer can be recycled by this very run (unless a caller still
+        # holds the PipelineResult, in which case it keeps its buffer alive).
+        self._drop_final_entries()
+        # Keep only the latest generation of prefixes: entries outside the
+        # current op sequence can never hit again (their tail params changed),
+        # so recycle their VRAM before allocating this run's buffers.
+        current_keys = set(prefix_keys)
+        self._drop_prefix_entries(
+            [key for key in self._prefix_cache if key not in current_keys]
+        )
 
         buf = GpuImage()
-        buf.upload(cached_result.image if cached_result is not None else src)
+        if cached_stage is not None:
+            # Resume from the GPU-resident prefix: device-to-device copy,
+            # zero host traffic (T7.2).
+            buf.copy_from(cached_stage.gpu)
+        else:
+            # Single host->device upload per run (source ingestion only).
+            buf.upload(src)
 
         for index, op in enumerate(ops[start_index:], start=start_index + 1):
             buf = self._apply_op(buf, op)
-            # to_numpy() already returns a fresh host array; no extra copy.
-            prefix_key = hash(tuple(ops[:index]))
-            self._prefix_cache[prefix_key] = PipelineResult(
-                buf.to_numpy(),
-                self.last_applied_ev,
-            )
+            # Snapshot the (pre-clip) op output on the GPU. Device copies are
+            # cheap; the old per-op to_numpy() readbacks were the main PCIe
+            # cost of a preview run.
+            snapshot = GpuImage()
+            snapshot.copy_from(buf)
+            prefix_key = prefix_keys[index - 1]
+            old_stage = self._prefix_cache.get(prefix_key)
+            if old_stage is not None:
+                old_stage.gpu.clear()
+            self._prefix_cache[prefix_key] = _CachedStage(snapshot, self.last_applied_ev)
             self._prefix_lengths[prefix_key] = index
 
         clip_inplace(buf.arr)
-        result = PipelineResult(buf.to_numpy(), self.last_applied_ev)
-        self._final_cache.clear()
+        result = PipelineResult(applied_ev=self.last_applied_ev, gpu=buf)
         self._final_cache[ops_key] = result
         return result

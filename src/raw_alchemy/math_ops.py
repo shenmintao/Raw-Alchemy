@@ -994,18 +994,22 @@ def _blend_channel_kernel(original: ti.types.ndarray(dtype=ti.f32, ndim=3),
         sharpened[y, x] = original[y, x, ch] * (1.0 - alpha) + sharpened[y, x] * alpha
 
 
-# Cache for GPU work buffers to avoid re-allocation
-_sharpen_gpu_bufs = {}
-
-
 def sharpen_gpu(gpu_image, strength: float = 0.5, sigma: float = 1.0):
     """
     GPU-resident RL sharpening. Operates on GpuImage in-place.
     Processes per-channel with 2D buffers to minimize GPU memory usage.
     Only 4 × (H×W×4) bytes extra GPU memory (~640MB for 42MP).
+
+    T7.2: the 2D work buffers come from the shared GPU buffer pool instead of
+    a module-global cache, so they no longer stay resident forever — they are
+    recycled across ops/images and released with the pool (image switch,
+    shutdown, budget pressure).
     """
     if strength <= 0 or not gpu_image.valid:
         return
+
+    # Local import: gpu_buffer imports backend/config only, no cycle back here.
+    from raw_alchemy.gpu_buffer import acquire_ndarray, release_ndarray
 
     iterations = max(1, int(strength * 10))
     h, w = gpu_image.height, gpu_image.width
@@ -1016,44 +1020,40 @@ def sharpen_gpu(gpu_image, strength: float = 0.5, sigma: float = 1.0):
     kernel_1d = ti.ndarray(dtype=ti.f32, shape=(kernel_1d_np.shape[0],))
     kernel_1d.from_numpy(kernel_1d_np)
 
-    # Allocate/reuse 2D GPU work buffers (4 buffers shared across channels)
-    global _sharpen_gpu_bufs
-    if _sharpen_gpu_bufs.get('shape') != shape2d:
-        _sharpen_gpu_bufs = {
-            'shape': shape2d,
-            'estimate': ti.ndarray(dtype=ti.f32, shape=shape2d),
-            'buf_a': ti.ndarray(dtype=ti.f32, shape=shape2d),  # blurred, then correction
-            'buf_b': ti.ndarray(dtype=ti.f32, shape=shape2d),  # ratio
-            'temp': ti.ndarray(dtype=ti.f32, shape=shape2d),
-        }
+    # Acquire 2D GPU work buffers (4 buffers shared across channels)
+    estimate = acquire_ndarray(ti.f32, shape2d)
+    buf_a = acquire_ndarray(ti.f32, shape2d)  # blurred, then correction
+    buf_b = acquire_ndarray(ti.f32, shape2d)  # ratio
+    temp = acquire_ndarray(ti.f32, shape2d)
 
-    estimate = _sharpen_gpu_bufs['estimate']
-    buf_a = _sharpen_gpu_bufs['buf_a']
-    buf_b = _sharpen_gpu_bufs['buf_b']
-    temp = _sharpen_gpu_bufs['temp']
+    try:
+        # Process each channel independently (reuses same 2D buffers)
+        for ch in range(3):
+            # Extract channel from HWC image → estimate (GPU→GPU)
+            _extract_channel_kernel(gpu_image.arr, estimate, ch)
 
-    # Process each channel independently (reuses same 2D buffers)
-    for ch in range(3):
-        # Extract channel from HWC image → estimate (GPU→GPU)
-        _extract_channel_kernel(gpu_image.arr, estimate, ch)
+            # RL iterations using existing 2D kernels
+            for _ in range(iterations):
+                # Forward: blurred = estimate * PSF (separable)
+                _convolve_1d_h_reflect_kernel(estimate, kernel_1d, temp)
+                _convolve_1d_v_reflect_kernel(temp, kernel_1d, buf_a)  # buf_a = blurred
+                # Ratio: observed / blurred (read observed from HWC source)
+                _rl_ratio_from_hwc_kernel(gpu_image.arr, buf_a, buf_b, ch)  # buf_b = ratio
+                # Backward: correction = ratio * PSF_mirror (symmetric Gaussian)
+                _convolve_1d_h_reflect_kernel(buf_b, kernel_1d, temp)
+                _convolve_1d_v_reflect_kernel(temp, kernel_1d, buf_a)  # buf_a = correction
+                # Update estimate
+                _rl_update_estimate_kernel(estimate, buf_a)
 
-        # RL iterations using existing 2D kernels
-        for _ in range(iterations):
-            # Forward: blurred = estimate * PSF (separable)
-            _convolve_1d_h_reflect_kernel(estimate, kernel_1d, temp)
-            _convolve_1d_v_reflect_kernel(temp, kernel_1d, buf_a)  # buf_a = blurred
-            # Ratio: observed / blurred (read observed from HWC source)
-            _rl_ratio_from_hwc_kernel(gpu_image.arr, buf_a, buf_b, ch)  # buf_b = ratio
-            # Backward: correction = ratio * PSF_mirror (symmetric Gaussian)
-            _convolve_1d_h_reflect_kernel(buf_b, kernel_1d, temp)
-            _convolve_1d_v_reflect_kernel(temp, kernel_1d, buf_a)  # buf_a = correction
-            # Update estimate
-            _rl_update_estimate_kernel(estimate, buf_a)
-
-        # Blend with original if strength < 1, then insert back
-        if strength < 1.0:
-            _blend_channel_kernel(gpu_image.arr, estimate, ch, float(strength))
-        _insert_channel_kernel(estimate, gpu_image.arr, ch)
+            # Blend with original if strength < 1, then insert back
+            if strength < 1.0:
+                _blend_channel_kernel(gpu_image.arr, estimate, ch, float(strength))
+            _insert_channel_kernel(estimate, gpu_image.arr, ch)
+    finally:
+        release_ndarray(estimate, ti.f32, shape2d)
+        release_ndarray(buf_a, ti.f32, shape2d)
+        release_ndarray(buf_b, ti.f32, shape2d)
+        release_ndarray(temp, ti.f32, shape2d)
 
     logger.debug(f"GPU RL sharpen: {iterations} iters, sigma={sigma}, strength={strength}")
 

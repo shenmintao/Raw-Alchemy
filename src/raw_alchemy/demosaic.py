@@ -18,7 +18,7 @@ Usage:
 import numpy as np
 from loguru import logger
 
-from raw_alchemy.backend import ndarray as backend_ndarray, ti
+from raw_alchemy.backend import ti
 
 EPS = 1e-5
 EPSSQ = 1e-10
@@ -478,16 +478,34 @@ def rcd_demosaic(
 
     filters_u32 = np.uint32(filters)
 
-    # Allocate GPU buffers — release early to minimize peak VRAM.
+    # Acquire GPU buffers from the shared pool (T7.2) — release early to
+    # minimize peak VRAM; pooled buffers are recycled across calls instead of
+    # churning ~1.7GB of vkAllocate/vkFree per demosaic.
     # Peak: 7 × HW float32 + 1 × HWx3 float32
     # For 42MP: 7×170MB + 510MB ≈ 1.7GB
-    cfa = backend_ndarray(dtype=ti.f32, shape=(h, w))
-    rgb0 = backend_ndarray(dtype=ti.f32, shape=(h, w))
-    rgb1 = backend_ndarray(dtype=ti.f32, shape=(h, w))
-    rgb2 = backend_ndarray(dtype=ti.f32, shape=(h, w))
-    VH_dir = backend_ndarray(dtype=ti.f32, shape=(h, w))
-    lpf = backend_ndarray(dtype=ti.f32, shape=(h, w))
-    out = backend_ndarray(dtype=ti.f32, shape=(h, w, 3))
+    from raw_alchemy.gpu_buffer import acquire_ndarray, release_ndarray
+
+    def _acquire2d(zero: bool = True):
+        # The RCD kernels write only sub-regions (interior / one CFA parity)
+        # and read neighbors from the untouched remainder, relying on the
+        # zero_fill of fresh ti.ndarrays. Pooled buffers are dirty, so scratch
+        # that is read-before-write must be re-zeroed explicitly.
+        arr = acquire_ndarray(ti.f32, (h, w))
+        if zero:
+            arr.fill(0)
+        return arr
+
+    def _release2d(arr):
+        release_ndarray(arr, ti.f32, (h, w))
+
+    cfa = _acquire2d(zero=False)  # fully overwritten by from_numpy
+    rgb0 = _acquire2d()
+    rgb1 = _acquire2d()
+    rgb2 = _acquire2d()
+    VH_dir = _acquire2d()
+    lpf = _acquire2d()
+    # `out` is fully covered by _rcd_write_output (interior) + _border_interpolate.
+    out = acquire_ndarray(ti.f32, (h, w, 3))
 
     cfa.from_numpy(np.ascontiguousarray(bayer, dtype=np.float32))
 
@@ -497,43 +515,51 @@ def rcd_demosaic(
     _rcd_step2(cfa, lpf, w, h, filters_u32)
     _rcd_step3(cfa, lpf, rgb1, VH_dir, w, h, filters_u32)
 
-    # Free lpf, allocate p_diff and q_diff (reuse lpf slot)
+    # Release lpf, acquire p_diff and q_diff (p_diff reuses the lpf buffer)
+    _release2d(lpf)
     del lpf
-    p_diff = backend_ndarray(dtype=ti.f32, shape=(h, w))
-    q_diff = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    p_diff = _acquire2d()
+    q_diff = _acquire2d()
 
     # Step 4.0-4.1: Diagonal discrimination
     _rcd_step4_0(cfa, p_diff, q_diff, w, h)
 
-    # Free cfa (no longer needed), allocate PQ_dir
+    # Release cfa (no longer needed), acquire PQ_dir
+    _release2d(cfa)
     del cfa
-    PQ_dir = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    PQ_dir = _acquire2d()
     _rcd_step4_1(p_diff, q_diff, PQ_dir, w, h, filters_u32)
 
-    # Free p_diff, q_diff
+    # Release p_diff, q_diff
+    _release2d(p_diff)
+    _release2d(q_diff)
     del p_diff, q_diff
 
     # Step 4.2-4.3: R/B interpolation
     _rcd_step4_2(rgb0, rgb1, rgb2, PQ_dir, w, h, filters_u32)
+    _release2d(PQ_dir)
     del PQ_dir
     _rcd_step4_3(rgb0, rgb1, rgb2, VH_dir, w, h, filters_u32)
+    _release2d(VH_dir)
     del VH_dir
 
     # Step 5: Write output (skip 4-pixel border)
     _rcd_write_output(rgb0, rgb1, rgb2, out, 4)
+    _release2d(rgb0)
+    _release2d(rgb1)
+    _release2d(rgb2)
     del rgb0, rgb1, rgb2
 
-    # Border: simple bilinear — reuse rgb0 slot for bayer upload
-    bayer_arr = backend_ndarray(dtype=ti.f32, shape=(h, w))
+    # Border: simple bilinear — reuse a pooled slot for bayer upload
+    bayer_arr = _acquire2d(zero=False)  # fully overwritten by from_numpy
     bayer_arr.from_numpy(np.ascontiguousarray(bayer, dtype=np.float32))
     _border_interpolate(bayer_arr, out, 4, filters_u32)
+    _release2d(bayer_arr)
     del bayer_arr
 
     result = out.to_numpy()
+    release_ndarray(out, ti.f32, (h, w, 3))
     del out
-
-    # Force GPU memory release
-    import gc; gc.collect()
 
     elapsed = time.time() - t0
     logger.info(f"RCD demosaic: {w}x{h} in {elapsed*1000:.0f}ms (GPU)")

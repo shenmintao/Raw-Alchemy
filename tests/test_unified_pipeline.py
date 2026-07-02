@@ -715,3 +715,191 @@ def test_image_processor_applies_executor_cache_budget(monkeypatch):
     processor._do_process(ProcessRequest(path, _case({"exposure": 1.0}), 1))
 
     assert trim_calls == [int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024]
+
+
+# =====================================================================
+# T7.2 — GPU residency: prefix cache holds GPU buffers, zero host
+# round-trips between ops, only the final uint8 is read back.
+# =====================================================================
+
+
+def _install_transfer_spies(monkeypatch):
+    """Count every host<->device transfer made through GpuImage."""
+    from raw_alchemy.gpu_buffer import GpuImage
+
+    uploads = []
+    downloads = []
+    original_upload = GpuImage.upload
+    original_to_numpy = GpuImage.to_numpy
+
+    def spy_upload(self, np_array):
+        uploads.append(np_array.nbytes)
+        return original_upload(self, np_array)
+
+    def spy_to_numpy(self):
+        downloads.append(self.nbytes)
+        return original_to_numpy(self)
+
+    monkeypatch.setattr(GpuImage, "upload", spy_upload)
+    monkeypatch.setattr(GpuImage, "to_numpy", spy_to_numpy)
+    return uploads, downloads
+
+
+def test_preview_executor_run_stays_gpu_resident(monkeypatch):
+    rng = np.random.default_rng(51)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    assert len(ops) >= 3
+
+    uploads, downloads = _install_transfer_spies(monkeypatch)
+
+    result = preview.run_result(ops, source=src)
+    # Exactly one host->device transfer (source ingestion), zero device->host
+    # transfers: prefix snapshots are GPU-to-GPU copies (T7.2).
+    assert len(uploads) == 1
+    assert downloads == []
+    assert result.gpu is not None and result.gpu.valid
+
+    # The host image is downloaded lazily, exactly once, on demand.
+    image = result.image
+    assert len(downloads) == 1
+    assert image.shape == src.shape
+
+    # A tail-only change resumes from the GPU-resident prefix: no upload of
+    # the source and still no readback of intermediate stages.
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    assert changed_ops[:2] == ops[:2]
+    preview.run_result(changed_ops, source=src)
+    assert len(uploads) == 1
+    assert len(downloads) == 1
+
+
+def test_pipeline_result_survives_cache_eviction_and_pool_reuse():
+    rng = np.random.default_rng(53)
+    src_a = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    src_b = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    expected = ExportExecutor().run(ops, src_a.copy())
+
+    preview = PreviewExecutor(src_a)
+    held = preview.run_result(ops, source=src_a)
+
+    # Swapping the source clears the executor caches and recycles buffers
+    # through the pool; the handed-out result must keep its own GPU buffer
+    # alive and untouched (no use-after-release).
+    preview.run_result(ops, source=src_b)
+    preview.run_result(build_op_list(_case({"exposure": 1.5})), source=src_b)
+
+    np.testing.assert_allclose(held.image, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_preview_executor_drops_stale_prefix_generations():
+    rng = np.random.default_rng(59)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+
+    ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.1}))
+    preview.run_result(ops, source=src)
+    assert len(preview._prefix_cache) == len(ops)
+
+    # Only the shared [exposure, white_balance] prefix survives a tail change;
+    # stale generations are recycled instead of accumulating VRAM.
+    changed_ops = build_op_list(_case({"exposure": 0.5, "wb_temp": 5.0, "saturation": 1.3}))
+    preview.run_result(changed_ops, source=src)
+    assert len(preview._prefix_cache) == len(changed_ops)
+    assert set(preview._prefix_lengths.values()) == set(range(1, len(changed_ops) + 1))
+
+    entry_bytes = src.nbytes
+    assert preview.cache_bytes() == (len(changed_ops) + 1) * entry_bytes
+
+
+def test_image_processor_reads_back_only_final_uint8(monkeypatch):
+    from raw_alchemy.pipeline.cache_manager import CachedImage
+    from raw_alchemy.pipeline.request import ProcessRequest
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    params = _case(
+        {
+            "exposure": 1.0,
+            "wb_temp": 5.0,
+            "saturation": 1.1,
+            # Viewport >= source: target size == source size, so the output
+            # is a direct float->uint8 conversion (bit-exact comparison below).
+            "viewport_size": (64, 64),
+            "preview_zoom": 1.0,
+            "device_pixel_ratio": 1.0,
+        }
+    )
+    source = np.random.default_rng(61).uniform(0.05, 0.5, size=(32, 32, 3)).astype(np.float32)
+    path = "synthetic.raw"
+    processor = ImageProcessor()
+    processor.cpu_linear = source
+    processor.current_path = path
+    processor.exif_data = None
+    processor.cache_manager.put(path, CachedImage(path, source, None, None))
+
+    emitted = []
+    processor.result_ready.connect(
+        lambda img, *_args: emitted.append(img.copy())
+    )
+
+    uploads, downloads = _install_transfer_spies(monkeypatch)
+
+    processor._do_process(ProcessRequest(path, dict(params), 1))
+
+    # One upload (pipeline source), zero float32 readbacks: the preview is
+    # converted to uint8 on-device and only the small uint8 image crosses
+    # back to the host (T7.2).
+    assert len(uploads) == 1
+    assert downloads == []
+    assert len(emitted) == 1
+    assert emitted[0].dtype == np.uint8
+
+    # Full-hit rerun (zoom-only style): still zero float32 traffic.
+    processor._do_process(ProcessRequest(path, dict(params), 2))
+    assert len(uploads) == 1
+    assert downloads == []
+
+    # The emitted uint8 matches the executor's post-clip output converted on
+    # the CPU: round(clip(x) * 255).
+    expected_float = ExportExecutor().run(build_op_list(params), source.copy())
+    expected_uint8 = np.floor(
+        np.clip(expected_float, 0.0, 1.0).astype(np.float32) * 255.0 + 0.5
+    ).astype(np.uint8)
+    assert emitted[0].shape == expected_uint8.shape
+    np.testing.assert_array_equal(emitted[0], expected_uint8)
+
+
+def test_repeated_slider_interactions_keep_cache_and_pool_bounded():
+    """T7.2 acceptance guard: continuous tail-op changes must not grow VRAM.
+
+    Both the executor caches (latest prefix generation + single final) and
+    the buffer pool (recycled scratch) stay bounded across many interactions.
+    """
+    from raw_alchemy.gpu_buffer import gpu_pool
+
+    gpu_pool().clear()
+    rng = np.random.default_rng(67)
+    src = rng.uniform(0.02, 0.65, size=(6, 8, 3)).astype(np.float32)
+    preview = PreviewExecutor(src)
+    entry_bytes = src.nbytes
+
+    ops_len = None
+    for i in range(50):
+        ops = build_op_list(
+            _case({"exposure": 0.5, "saturation": 1.05 + (i % 7) * 0.05})
+        )
+        if ops_len is None:
+            ops_len = len(ops)
+        assert len(ops) == ops_len
+        preview.run_result(ops, source=src)
+
+        assert preview.cache_bytes() <= (ops_len + 1) * entry_bytes
+        assert len(preview._prefix_cache) <= ops_len
+
+    # Steady state: exactly one generation of prefixes plus one final, and a
+    # small constant number of recycled buffers in the pool.
+    assert preview.cache_bytes() == (ops_len + 1) * entry_bytes
+    assert gpu_pool().free_bytes() <= 8 * entry_bytes
+    gpu_pool().clear()
