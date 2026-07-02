@@ -83,6 +83,16 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
 
         # Workers
         self.thumb_worker = None
+        self._retired_thumb_workers = []
+
+        # Debounced viewport-priority updates for the thumbnail worker
+        self._thumb_priority_timer = QTimer()
+        self._thumb_priority_timer.setSingleShot(True)
+        self._thumb_priority_timer.setInterval(100)
+        self._thumb_priority_timer.timeout.connect(self._update_thumbnail_priority)
+        self.gallery_list.verticalScrollBar().valueChanged.connect(
+            self._on_gallery_scrolled
+        )
         self.processor = ImageProcessor()
         self.processor.result_ready.connect(self.on_process_result)
         self.processor.load_complete.connect(self.on_load_complete)
@@ -843,10 +853,18 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self._preload_neighbors_timer.stop()
         if hasattr(self, '_zoom_update_timer'):
             self._zoom_update_timer.stop()
-        if self.thumb_worker and self.thumb_worker.isRunning():
-            self.thumb_worker.stop()
-            self.thumb_worker.quit()
-            self.thumb_worker.wait()
+        if hasattr(self, '_thumb_priority_timer'):
+            self._thumb_priority_timer.stop()
+        thumb_workers = list(getattr(self, '_retired_thumb_workers', []))
+        if self.thumb_worker:
+            thumb_workers.append(self.thumb_worker)
+        for worker in thumb_workers:
+            worker.stop()
+        for worker in thumb_workers:
+            if worker.isRunning():
+                worker.quit()
+                # stop() is checked before each decode, so this is bounded
+                worker.wait(2000)
         if hasattr(self, 'right_panel'):
             self.right_panel.shutdown_scope_workers()
         self.processor.stop_and_cleanup()
