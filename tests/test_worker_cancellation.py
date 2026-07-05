@@ -257,9 +257,16 @@ def test_preload_no_longer_precomputes_full_lens_correction(monkeypatch):
         "aperture": 2.8,
         "crop_factor": 1.0,
     }
+    # Approach B: preload decodes GPU-free via rawpy half_size and stores
+    # proxy-only. It must never touch the full-res GPU demosaic.
     monkeypatch.setattr(
-        processor, "_rawpy_to_prophoto", lambda path: (src, exif, {"meta": 1})
+        processor, "_rawpy_proxy_decode", lambda path: (src, exif, {"meta": 1})
     )
+
+    def _no_full_res(path):
+        raise AssertionError("preload must not run the full-res GPU demosaic")
+
+    monkeypatch.setattr(processor, "_rawpy_to_prophoto", _no_full_res)
 
     # If preload ever calls into lens correction again, this stub records it
     # (and no real lensfun/vendored library is touched by the test).
@@ -273,7 +280,8 @@ def test_preload_no_longer_precomputes_full_lens_correction(monkeypatch):
 
     cached = processor.cache_manager.get("neighbor.raw")
     assert cached is not None
-    assert cached.linear_data is src
+    # Full-res linear is deferred to first view (approach B).
+    assert cached.linear_data is None
     assert cached.proxy_linear is not None
     assert cached.proxy_linear.shape == (10, 10, 3)
     # Neighbor preloads never precompute the full-size corrected image.
@@ -283,34 +291,26 @@ def test_preload_no_longer_precomputes_full_lens_correction(monkeypatch):
     assert cached.lens_key is None
 
 
-def test_preload_abandons_remaining_stages_when_user_request_arrives(monkeypatch):
+def test_preload_stores_proxy_only_and_skips_full_res_demosaic(monkeypatch):
     processor = ImageProcessor()
     src = np.full((20, 20, 3), 0.25, dtype=np.float32)
 
-    def decode(path):
-        # A user click lands while the RAW decode stage is running.
-        with processor.lock:
-            processor.pending_request = ProcessRequest("clicked.raw", {"_load": True}, 9)
-        return src, None, None
+    # Approach B: preload decodes GPU-free (rawpy half_size) and stores
+    # proxy-only. It must never invoke the full-res GPU demosaic — a burst of
+    # those during fast scrolling exhausts the Taichi/Vulkan device allocator.
+    monkeypatch.setattr(processor, "_rawpy_proxy_decode", lambda path: (src, None, None))
 
-    monkeypatch.setattr(processor, "_rawpy_to_prophoto", decode)
+    def _no_full_res(path):
+        raise AssertionError("preload must not run the full-res GPU demosaic")
 
-    proxy_calls = []
-    monkeypatch.setattr(
-        ImageProcessor, "_make_proxy", staticmethod(lambda img: proxy_calls.append(1))
-    )
+    monkeypatch.setattr(processor, "_rawpy_to_prophoto", _no_full_res)
 
     processor._do_preload(ProcessRequest("neighbor.raw", {"_preload": True}, -1))
 
-    # The completed decode stage still lands in the cache; the proxy stage
-    # (and everything after it) is abandoned so the click is served sooner.
     cached = processor.cache_manager.get("neighbor.raw")
     assert cached is not None
-    assert cached.linear_data is src
-    assert cached.proxy_linear is None
-    assert proxy_calls == []
-    with processor.lock:
-        assert processor.pending_request is not None  # untouched, served next
+    assert cached.linear_data is None        # full-res deferred to first view
+    assert cached.proxy_linear is not None   # proxy ready for instant fit-view
 
 
 # =====================================================================

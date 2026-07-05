@@ -247,32 +247,31 @@ def test_hit_after_lens_roundtrip_restores_key_consistent_export_state(monkeypat
 # =====================================================================
 
 
-def test_aborted_preload_backfills_proxy_on_next_load(monkeypatch):
+def test_proxy_only_preload_backfills_full_res_on_load(monkeypatch):
     monkeypatch.setattr(processor_module, "PROXY_MIN_SOURCE_PIXELS", 200)
     monkeypatch.setattr(processor_module, "PROXY_TARGET_PIXELS", 100)
-    path = "raced_preload.raw"
-    source = np.linspace(0.05, 0.6, 20 * 20 * 3, dtype=np.float32).reshape(20, 20, 3)
+    path = "preloaded.raw"
+    reduced = np.linspace(0.05, 0.6, 20 * 20 * 3, dtype=np.float32).reshape(20, 20, 3)
+    full = np.linspace(0.0, 1.0, 40 * 40 * 3, dtype=np.float32).reshape(40, 40, 3)
 
     processor = ImageProcessor()
-    monkeypatch.setattr(processor, "_rawpy_to_prophoto", lambda p: (source, None, None))
+    # Approach B: neighbor preload decodes GPU-free (half_size) and stores
+    # proxy-only; the full-res GPU demosaic is deferred to first view.
+    monkeypatch.setattr(processor, "_rawpy_proxy_decode", lambda p: (reduced, None, None))
+    monkeypatch.setattr(processor, "_rawpy_to_prophoto", lambda p: (full, None, None))
 
-    # A user request lands while the neighbor preload is decoding: T7.3
-    # skips proxy generation and caches the entry with proxy_linear=None.
-    with processor.lock:
-        processor.pending_request = ProcessRequest(path, {"_load": True}, 1)
     processor._do_preload(ProcessRequest(path, {"_preload": True}, -1))
     entry = processor.cache_manager.get(path)
-    assert entry is not None and entry.proxy_linear is None
+    assert entry is not None
+    assert entry.linear_data is None
+    assert entry.proxy_linear is not None
 
-    # The user's actual load of that image must backfill the proxy —
-    # otherwise every fit-view interaction on it runs the full-res
-    # pipeline for the rest of the session (M6).
-    with processor.lock:
-        processor.pending_request = None
+    # Opening the image runs the exact full-res render once and publishes it
+    # back, so subsequent views (and zoom/denoise/export) reuse it.
     processor._do_load(ProcessRequest(path, {"_load": True}, 1))
 
+    assert processor.cpu_linear is full
+    assert entry.linear_data is full
     assert processor.cpu_proxy_linear is not None
-    assert entry.proxy_linear is not None
-    np.testing.assert_array_equal(processor.cpu_proxy_linear, entry.proxy_linear)
     fit_params = _case({"viewport_size": (10, 10), "preview_zoom": 1.0})
     assert processor._should_use_proxy_preview(fit_params) is True

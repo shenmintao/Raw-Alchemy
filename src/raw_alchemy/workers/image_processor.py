@@ -418,6 +418,35 @@ class ImageProcessor(QThread):
 
         return rgb, exif_data, exif_metadata
 
+    def _rawpy_proxy_decode(self, path: str):
+        """Reduced-resolution, GPU-FREE decode for neighbor preloads (approach B).
+
+        Uses rawpy's half_size CPU postprocess to ProPhoto so preloading many
+        neighbors during fast scrolling never touches the GPU demosaic. The
+        full-res Markesteijn/RCD GPU path is deferred to when the image is
+        actually opened — a scroll storm of full-res GPU demosaics exhausts the
+        Taichi/Vulkan device allocator ("Failed to allocate ext arr buffer").
+        Colour is approximate (rawpy's own pipeline); the exact app-pipeline
+        render is produced by _rawpy_to_prophoto on first view.
+        """
+        import rawpy
+        from raw_alchemy.exif import extract_lens_exif
+
+        with rawpy.imread(path) as raw:
+            rgb16 = raw.postprocess(
+                gamma=(1, 1), no_auto_bright=True, use_camera_wb=True,
+                use_auto_wb=False, output_bps=16,
+                output_color=rawpy.ColorSpace.ProPhoto,
+                half_size=True, highlight_mode=2,
+            )
+        rgb = rgb16.astype(np.float32) / 65535.0
+        del rgb16
+        if rgb.ndim == 3 and rgb.shape[2] == 1:
+            rgb = np.repeat(rgb, 3, axis=2)
+        np.clip(rgb, 0.0, 1.0, out=rgb)
+        exif_data, exif_metadata = extract_lens_exif(path, None)
+        return rgb, exif_data, exif_metadata
+
     @staticmethod
     def _make_proxy(linear_data: np.ndarray) -> Optional[np.ndarray]:
         """Create a 2-4MP linear proxy for interactive preview work."""
@@ -459,27 +488,34 @@ class ImageProcessor(QThread):
         ~515MB of corrected data per entry (T7.6). The interactive path
         computes `corrected` on demand for the image actually being viewed.
 
-        Stage boundaries (decode -> proxy) check for a pending user request;
-        on hit the remaining stages are abandoned, but everything already
-        computed still goes into the cache.
+        Approach B: the decode is a GPU-free rawpy half_size pass and the entry
+        is cached proxy-only (linear_data=None); the full-res GPU demosaic is
+        deferred to _do_load on first view. This keeps the GPU demosaic off the
+        fast-scroll path entirely (a burst of full-res GPU demosaics exhausts
+        the Taichi/Vulkan device allocator).
         """
         path = request.path
         if self.cache_manager.get(path):
             return
 
         try:
-            # Stage 1: RAW decode + demosaic (the expensive part).
-            img, exif_data, _exif_meta = self._rawpy_to_prophoto(path)
+            # Approach B: neighbor preloads decode at REDUCED resolution on the
+            # CPU (rawpy half_size) and store proxy-only (linear_data=None). The
+            # full-res GPU Markesteijn/RCD demosaic is deferred to first view
+            # (_do_process backfills it). Running the full-res GPU demosaic for
+            # every neighbor during a fast scroll exhausts the Taichi/Vulkan
+            # device allocator ("Failed to allocate ext arr buffer").
+            reduced, exif_data, _exif_meta = self._rawpy_proxy_decode(path)
 
-            # Stage 2: interactive proxy generation — skipped when a user
-            # request arrived while decoding (the decode result is kept).
-            proxy_img = None
-            if not self._interactive_abort_requested():
-                proxy_img = self._make_proxy(img)
+            # A ~half-res frame is already interactive-sized; downscale toward
+            # the proxy target, else serve it directly.
+            proxy_img = self._make_proxy(reduced)
+            if proxy_img is None:
+                proxy_img = reduced
 
             new_cache_item = CachedImage(
                 path=path,
-                linear_data=img,
+                linear_data=None,  # deferred to first view (approach B)
                 proxy_linear=proxy_img,
                 exif_data=exif_data,
                 lens_key=None,
@@ -487,9 +523,8 @@ class ImageProcessor(QThread):
             )
             self.cache_manager.put(path, new_cache_item)
             logger.info(
-                f"[Worker] Preloaded: {os.path.basename(path)} "
-                f"({img.shape[1]}x{img.shape[0]})"
-                f"{'' if proxy_img is not None else ' (proxy skipped: superseded)'}"
+                f"[Worker] Preloaded (proxy-only): {os.path.basename(path)} "
+                f"({proxy_img.shape[1]}x{proxy_img.shape[0]} reduced, full deferred)"
             )
 
         except Exception as e:
@@ -522,6 +557,30 @@ class ImageProcessor(QThread):
                 self.cached_denoise_full = cached_item.denoise_full
                 self.cached_denoise_original = cached_item.denoise_original
                 self.last_denoise_key = cached_item.denoise_key
+
+            # Approach B backfill: a neighbor preload stored proxy-only
+            # (linear_data=None) to keep the full-res GPU demosaic off the fast-
+            # scroll path. Now that this image is actually being viewed, run the
+            # exact app-pipeline full-res render once (GPU demosaic, serialised
+            # to this one image) and publish it back to the entry.
+            if self.cpu_linear is None:
+                try:
+                    img_np, _bf_exif, _bf_meta = self._rawpy_to_prophoto(path)
+                    self.cpu_linear = img_np
+                    proxy_np = self._make_proxy(img_np)
+                    if proxy_np is not None:
+                        self.cpu_proxy_linear = proxy_np
+                    with cached_item.lock:
+                        cached_item.linear_data = img_np
+                        if proxy_np is not None:
+                            cached_item.proxy_linear = proxy_np
+                    self.cache_manager.notify_entry_updated(path)
+                    logger.info(
+                        f"[Worker] Full-res backfill (approach B): "
+                        f"{os.path.basename(path)} ({img_np.shape[1]}x{img_np.shape[0]})"
+                    )
+                except Exception as e:
+                    logger.error(f"[Worker] Full-res backfill failed for {path}: {e}")
 
             # Aborted-preload backfill (T7.3/M6): a neighbor preload that was
             # superseded mid-decode caches the entry with proxy_linear=None.
