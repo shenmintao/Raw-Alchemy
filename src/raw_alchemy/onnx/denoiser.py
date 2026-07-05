@@ -426,6 +426,8 @@ def _highlight_guard_config() -> dict:
         "enabled": on,
         "blend_lo": _env_float("CANS_HL_BLEND_LO", 0.45),
         "blend_hi": _env_float("CANS_HL_BLEND_HI", 0.75),
+        "chroma_lo": _env_float("CANS_HL_CHROMA_LO", 0.08),
+        "chroma_hi": _env_float("CANS_HL_CHROMA_HI", 0.25),
         "despeckle_tau": _env_float("CANS_DESPECKLE_TAU", 0.12),
     }
 
@@ -448,9 +450,12 @@ def _apply_highlight_guard(out_hwc: np.ndarray, in_hwc: np.ndarray, cfg: dict) -
 
     1. Despeckle: replace pixels that deviate from their 3x3 median by more than
        ``despeckle_tau`` with the median (kills isolated colour spikes).
-    2. Highlight-protective blend: trust the input as brightness rises, so the
-       model's chroma shift in near-saturated highlights (-> magenta after the
-       blue WB gain) is suppressed while shadows/mid-tones stay fully denoised.
+    2. Chroma-aware highlight guard: only where a pixel is bright AND the model
+       shifted its channel balance away from the input (the magenta artifact),
+       pull the *chroma* back toward the input while KEEPING the denoised luma.
+       Faithfully-reproduced bright colour (neon, lanterns) has near-zero chroma
+       divergence, so it is left untouched; shadows/mid-tones stay fully
+       denoised. Blending only chroma (not luma) preserves highlight detail.
     """
     if not cfg["enabled"]:
         return out_hwc
@@ -463,10 +468,20 @@ def _apply_highlight_guard(out_hwc: np.ndarray, in_hwc: np.ndarray, cfg: dict) -
             spike = np.abs(guarded - med) > tau
             guarded[spike] = med[spike]
     lo, hi = float(cfg["blend_lo"]), float(cfg["blend_hi"])
+    clo, chi = float(cfg["chroma_lo"]), float(cfg["chroma_hi"])
     if hi > lo:
+        eps = 1e-4
         brightness = inp.max(axis=-1, keepdims=True)
-        a = np.clip((brightness - lo) / (hi - lo), 0.0, 1.0)
-        guarded = (1.0 - a) * guarded + a * inp
+        a_bright = np.clip((brightness - lo) / (hi - lo), 0.0, 1.0)
+        # per-pixel colour signature = channels normalised by their own luma
+        luma_out = guarded.mean(axis=-1, keepdims=True) + eps
+        chroma_out = guarded / luma_out
+        chroma_in = inp / (inp.mean(axis=-1, keepdims=True) + eps)
+        cdiff = np.abs(chroma_out - chroma_in).mean(axis=-1, keepdims=True)
+        a_chroma = np.clip((cdiff - clo) / max(chi - clo, 1e-6), 0.0, 1.0)
+        a = a_bright * a_chroma
+        chroma_fixed = (1.0 - a) * chroma_out + a * chroma_in
+        guarded = luma_out * chroma_fixed
     return np.clip(guarded, 0.0, 1.0)
 
 
