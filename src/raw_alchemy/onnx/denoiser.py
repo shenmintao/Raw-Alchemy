@@ -408,6 +408,68 @@ def _apply_output_guards(out_hwc: np.ndarray, in_hwc: np.ndarray, cfg: dict) -> 
     return guarded
 
 
+# Highlight-protective guard: DEFAULT ON.
+# v14 is out-of-distribution on bright, near-saturated content (illuminated
+# night architecture): it pulls the brightest packed channel down more than the
+# others, which the strong blue WB gain renders as magenta blotches, and it
+# emits isolated colour spikes (green/blue dots). Both live only in bright/
+# high-contrast regions that carry little recoverable noise, so a cheap post-
+# guard removes them without touching the denoised shadows/mid-tones. Disable
+# with CANS_HIGHLIGHT_GUARD=0; tune via CANS_HL_BLEND_LO/HI, CANS_DESPECKLE_TAU.
+# ---------------------------------------------------------------------------
+
+def _highlight_guard_config() -> dict:
+    on = os.environ.get("CANS_HIGHLIGHT_GUARD", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+    return {
+        "enabled": on,
+        "blend_lo": _env_float("CANS_HL_BLEND_LO", 0.45),
+        "blend_hi": _env_float("CANS_HL_BLEND_HI", 0.75),
+        "despeckle_tau": _env_float("CANS_DESPECKLE_TAU", 0.12),
+    }
+
+
+def _median3_hwc(img: np.ndarray) -> Optional[np.ndarray]:
+    """Per-channel 3x3 median via OpenCV (float32). None if cv2 unavailable."""
+    try:
+        import cv2
+    except Exception:
+        return None
+    src = np.ascontiguousarray(img, dtype=np.float32)
+    out = np.empty_like(src)
+    for c in range(src.shape[-1]):
+        out[..., c] = cv2.medianBlur(src[..., c], 3)
+    return out
+
+
+def _apply_highlight_guard(out_hwc: np.ndarray, in_hwc: np.ndarray, cfg: dict) -> np.ndarray:
+    """Default-on guard fixing the model's OOD behaviour in bright regions.
+
+    1. Despeckle: replace pixels that deviate from their 3x3 median by more than
+       ``despeckle_tau`` with the median (kills isolated colour spikes).
+    2. Highlight-protective blend: trust the input as brightness rises, so the
+       model's chroma shift in near-saturated highlights (-> magenta after the
+       blue WB gain) is suppressed while shadows/mid-tones stay fully denoised.
+    """
+    if not cfg["enabled"]:
+        return out_hwc
+    guarded = out_hwc.astype(np.float32, copy=True)
+    inp = in_hwc.astype(np.float32, copy=False)
+    tau = float(cfg["despeckle_tau"])
+    if tau > 0:
+        med = _median3_hwc(guarded)
+        if med is not None:
+            spike = np.abs(guarded - med) > tau
+            guarded[spike] = med[spike]
+    lo, hi = float(cfg["blend_lo"]), float(cfg["blend_hi"])
+    if hi > lo:
+        brightness = inp.max(axis=-1, keepdims=True)
+        a = np.clip((brightness - lo) / (hi - lo), 0.0, 1.0)
+        guarded = (1.0 - a) * guarded + a * inp
+    return np.clip(guarded, 0.0, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
@@ -832,6 +894,7 @@ def denoise_raw_packed(
     session = _get_session(sensor)
     packed_chw = np.ascontiguousarray(packed.transpose(2, 0, 1), dtype=np.float16)
     guard_cfg = _output_guard_config()
+    highlight_cfg = _highlight_guard_config()
 
     step = tile_size - tile_overlap
     ys = list(range(0, max(pack_h - tile_size, 0) + 1, step))
@@ -861,6 +924,7 @@ def denoise_raw_packed(
         logger.info(f"CANS raw-main v14 done in {elapsed:.1f}s (1 tile, {_session_provider})")
         packed_out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32)
         packed_out = _apply_output_guards(packed_out, packed_input, guard_cfg)
+        packed_out = _apply_highlight_guard(packed_out, packed_input, highlight_cfg)
         return {
             "packed": np.clip(packed_out, 0.0, 1.0).astype(np.float32),
             "sensor": sensor,
@@ -936,6 +1000,7 @@ def denoise_raw_packed(
 
     packed_out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32)
     packed_out = _apply_output_guards(packed_out, packed_input, guard_cfg)
+    packed_out = _apply_highlight_guard(packed_out, packed_input, highlight_cfg)
     return {
         "packed": np.clip(packed_out, 0.0, 1.0).astype(np.float32),
         "sensor": sensor,
