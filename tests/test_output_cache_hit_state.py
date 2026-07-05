@@ -247,31 +247,31 @@ def test_hit_after_lens_roundtrip_restores_key_consistent_export_state(monkeypat
 # =====================================================================
 
 
-def test_proxy_only_preload_backfills_full_res_on_load(monkeypatch):
+def test_cpu_preloaded_image_is_used_directly_without_gpu(monkeypatch):
     monkeypatch.setattr(processor_module, "PROXY_MIN_SOURCE_PIXELS", 200)
     monkeypatch.setattr(processor_module, "PROXY_TARGET_PIXELS", 100)
     path = "preloaded.raw"
-    reduced = np.linspace(0.05, 0.6, 20 * 20 * 3, dtype=np.float32).reshape(20, 20, 3)
     full = np.linspace(0.0, 1.0, 40 * 40 * 3, dtype=np.float32).reshape(40, 40, 3)
 
     processor = ImageProcessor()
-    # Approach B: neighbor preload decodes GPU-free (half_size) and stores
-    # proxy-only; the full-res GPU demosaic is deferred to first view.
-    monkeypatch.setattr(processor, "_rawpy_proxy_decode", lambda p: (reduced, None, None))
-    monkeypatch.setattr(processor, "_rawpy_to_prophoto", lambda p: (full, None, None))
+    # Neighbour preload does a GPU-free CPU full decode and caches the frame.
+    monkeypatch.setattr(processor, "_cpu_decode_to_prophoto", lambda p: (full, None, None))
+
+    def _no_gpu(p):
+        raise AssertionError("opening a preloaded image must not run the GPU demosaic")
+
+    monkeypatch.setattr(processor, "_rawpy_to_prophoto", _no_gpu)
 
     processor._do_preload(ProcessRequest(path, {"_preload": True}, -1))
     entry = processor.cache_manager.get(path)
     assert entry is not None
-    assert entry.linear_data is None
+    assert entry.linear_data is full
     assert entry.proxy_linear is not None
 
-    # Opening the image runs the exact full-res render once and publishes it
-    # back, so subsequent views (and zoom/denoise/export) reuse it.
+    # Opening a preloaded image reuses the cached frame directly — no GPU work.
     processor._do_load(ProcessRequest(path, {"_load": True}, 1))
 
     assert processor.cpu_linear is full
-    assert entry.linear_data is full
     assert processor.cpu_proxy_linear is not None
     fit_params = _case({"viewport_size": (10, 10), "preview_zoom": 1.0})
     assert processor._should_use_proxy_preview(fit_params) is True

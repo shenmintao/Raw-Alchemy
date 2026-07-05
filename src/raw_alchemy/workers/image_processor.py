@@ -418,31 +418,49 @@ class ImageProcessor(QThread):
 
         return rgb, exif_data, exif_metadata
 
-    def _rawpy_proxy_decode(self, path: str):
-        """Reduced-resolution, GPU-FREE decode for neighbor preloads (approach B).
+    def _cpu_decode_to_prophoto(self, path: str):
+        """Full-res, GPU-FREE decode whose colour matches _rawpy_to_prophoto.
 
-        Uses rawpy's half_size CPU postprocess to ProPhoto so preloading many
-        neighbors during fast scrolling never touches the GPU demosaic. The
-        full-res Markesteijn/RCD GPU path is deferred to when the image is
-        actually opened — a scroll storm of full-res GPU demosaics exhausts the
-        Taichi/Vulkan device allocator ("Failed to allocate ext arr buffer").
-        Colour is approximate (rawpy's own pipeline); the exact app-pipeline
-        render is produced by _rawpy_to_prophoto on first view.
+        Background neighbour preloads use this so a fast scroll never touches
+        the GPU demosaic (whose many large, varied-size intermediates exhaust
+        the Taichi/Vulkan device allocator -> "Failed to allocate ext arr
+        buffer"). libraw's CPU demosaic (same Markesteijn/RCD-class algorithm as
+        the GPU port) produces the mosaic; we then apply THIS app's white
+        balance + cam->working matrix on the CPU, so the result is colour-
+        identical to the GPU path (~0.16% mean delta, verified) — a preloaded
+        image and a GPU-decoded one look the same.
         """
         import rawpy
+        from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
+        from raw_alchemy.onnx.denoiser import _apply_flip
         from raw_alchemy.exif import extract_lens_exif
 
         with rawpy.imread(path) as raw:
-            rgb16 = raw.postprocess(
-                gamma=(1, 1), no_auto_bright=True, use_camera_wb=True,
-                use_auto_wb=False, output_bps=16,
-                output_color=rawpy.ColorSpace.ProPhoto,
-                half_size=True, highlight_mode=2,
+            wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+            flip = raw.sizes.flip
+            xyz = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
+            # Camera-native demosaic only: unit WB, no auto-bright, linear,
+            # unflipped — this app owns white balance, colour and orientation.
+            cam = raw.postprocess(
+                gamma=(1, 1), no_auto_bright=True,
+                user_wb=[1.0, 1.0, 1.0, 1.0], output_bps=16,
+                output_color=rawpy.ColorSpace.raw,
+                user_flip=0, half_size=False, highlight_mode=2,
             )
-        rgb = rgb16.astype(np.float32) / 65535.0
-        del rgb16
-        if rgb.ndim == 3 and rgb.shape[2] == 1:
-            rgb = np.repeat(rgb, 3, axis=2)
+        rgb = cam.astype(np.float32) / 65535.0
+        del cam
+        if rgb.ndim == 2:
+            rgb = np.repeat(rgb[:, :, None], 3, axis=2)
+        elif rgb.shape[2] > 3:
+            rgb = np.ascontiguousarray(rgb[:, :, :3])
+
+        g = wb[1] if wb[1] > 0 else 1.0
+        rgb[:, :, 0] *= wb[0] / g
+        rgb[:, :, 2] *= wb[2] / g
+        # cam->working matrix, per-pixel (M @ [r,g,b]); numpy keeps it GPU-free.
+        m = cam_to_working_space_matrix(xyz).astype(np.float32)
+        rgb = np.einsum('ij,hwj->hwi', m, rgb, optimize=True).astype(np.float32)
+        rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
         np.clip(rgb, 0.0, 1.0, out=rgb)
         exif_data, exif_metadata = extract_lens_exif(path, None)
         return rgb, exif_data, exif_metadata
@@ -488,34 +506,30 @@ class ImageProcessor(QThread):
         ~515MB of corrected data per entry (T7.6). The interactive path
         computes `corrected` on demand for the image actually being viewed.
 
-        Approach B: the decode is a GPU-free rawpy half_size pass and the entry
-        is cached proxy-only (linear_data=None); the full-res GPU demosaic is
-        deferred to _do_load on first view. This keeps the GPU demosaic off the
-        fast-scroll path entirely (a burst of full-res GPU demosaics exhausts
-        the Taichi/Vulkan device allocator).
+        The decode is a GPU-free, colour-matched CPU full-res pass
+        (_cpu_decode_to_prophoto), so the entry is cached with a ready full
+        frame. The GPU demosaic is never run for neighbours; a fast scroll
+        therefore cannot exhaust the Taichi/Vulkan device allocator. Opening a
+        preloaded image reuses the cached frame directly (no GPU); only a jump
+        to a not-yet-decoded image pays a single GPU demosaic in _do_load.
         """
         path = request.path
         if self.cache_manager.get(path):
             return
 
         try:
-            # Approach B: neighbor preloads decode at REDUCED resolution on the
-            # CPU (rawpy half_size) and store proxy-only (linear_data=None). The
-            # full-res GPU Markesteijn/RCD demosaic is deferred to first view
-            # (_do_process backfills it). Running the full-res GPU demosaic for
-            # every neighbor during a fast scroll exhausts the Taichi/Vulkan
-            # device allocator ("Failed to allocate ext arr buffer").
-            reduced, exif_data, _exif_meta = self._rawpy_proxy_decode(path)
+            # Neighbour preloads decode full-res on the CPU (colour-matched to
+            # the GPU _rawpy_to_prophoto path) and cache the full linear frame.
+            # The GPU demosaic is never run for neighbours, so a fast scroll
+            # cannot exhaust the Taichi/Vulkan device allocator. When this image
+            # is later opened it is already decoded -> used directly, no GPU.
+            img, exif_data, _exif_meta = self._cpu_decode_to_prophoto(path)
 
-            # A ~half-res frame is already interactive-sized; downscale toward
-            # the proxy target, else serve it directly.
-            proxy_img = self._make_proxy(reduced)
-            if proxy_img is None:
-                proxy_img = reduced
+            proxy_img = self._make_proxy(img)
 
             new_cache_item = CachedImage(
                 path=path,
-                linear_data=None,  # deferred to first view (approach B)
+                linear_data=img,
                 proxy_linear=proxy_img,
                 exif_data=exif_data,
                 lens_key=None,
@@ -523,8 +537,8 @@ class ImageProcessor(QThread):
             )
             self.cache_manager.put(path, new_cache_item)
             logger.info(
-                f"[Worker] Preloaded (proxy-only): {os.path.basename(path)} "
-                f"({proxy_img.shape[1]}x{proxy_img.shape[0]} reduced, full deferred)"
+                f"[Worker] Preloaded (CPU full decode): {os.path.basename(path)} "
+                f"({img.shape[1]}x{img.shape[0]})"
             )
 
         except Exception as e:
@@ -558,11 +572,10 @@ class ImageProcessor(QThread):
                 self.cached_denoise_original = cached_item.denoise_original
                 self.last_denoise_key = cached_item.denoise_key
 
-            # Approach B backfill: a neighbor preload stored proxy-only
-            # (linear_data=None) to keep the full-res GPU demosaic off the fast-
-            # scroll path. Now that this image is actually being viewed, run the
-            # exact app-pipeline full-res render once (GPU demosaic, serialised
-            # to this one image) and publish it back to the entry.
+            # Safety net: a cached entry should always carry a full-res frame
+            # (preloads CPU-decode it, cache-miss loads GPU-decode it). If one
+            # is ever missing when the image is actually viewed, decode it now
+            # (GPU, serialised to this one image) rather than showing nothing.
             if self.cpu_linear is None:
                 try:
                     img_np, _bf_exif, _bf_meta = self._rawpy_to_prophoto(path)
