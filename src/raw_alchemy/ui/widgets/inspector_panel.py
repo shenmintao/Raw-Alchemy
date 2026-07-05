@@ -19,7 +19,7 @@ from raw_alchemy.i18n import tr
 from raw_alchemy.ui.widgets.histogram import HistogramWidget
 from raw_alchemy.ui.widgets.waveform import WaveformWidget
 
-DENOISE_UI_ENABLED = False
+DENOISE_UI_ENABLED = True
 
 
 class InspectorPanel(ScrollArea):
@@ -301,7 +301,7 @@ class InspectorPanel(ScrollArea):
         
         self.add_section(tr('adjustments'), self.adj_card)
         
-        # --- AI Denoise (disabled — new RAW-to-RAW model in progress) ---
+        # --- AI Denoise (v14 raw-main RAW-to-RAW model, cfa-v11 ep10) ---
         self.denoise_card = SimpleCardWidget()
         denoise_layout = QVBoxLayout(self.denoise_card)
 

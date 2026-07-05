@@ -32,7 +32,7 @@ from loguru import logger
 
 # Bump when the on-disk format or the thumbnail geometry changes; old
 # entries then simply miss and are garbage-collected by prune().
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 
 DEFAULT_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 DEFAULT_MAX_FILES = 20000

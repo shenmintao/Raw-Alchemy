@@ -418,18 +418,22 @@ def test_gui_crop_and_perspective_modes_reset_preview_then_persist_params():
     assert window.triggered == 2
 
 
-def test_inspector_panel_keeps_cans_denoise_ui_disabled(monkeypatch):
+def test_inspector_panel_enables_cans_denoise_ui(monkeypatch):
     _ensure_qapp(monkeypatch)
 
     from raw_alchemy.ui.widgets import inspector_panel
 
-    assert inspector_panel.DENOISE_UI_ENABLED is False
+    # v14 raw-main is integrated: the AI-denoise UI ships enabled. The switch
+    # itself follows model availability (onnxruntime + bundled ONNX present).
+    assert inspector_panel.DENOISE_UI_ENABLED is True
     panel = inspector_panel.InspectorPanel()
     try:
-        assert panel.denoise_switch.isEnabled() is False
+        available = panel._denoise_available()
+        assert panel.denoise_switch.isEnabled() is available
         panel.set_params({"denoise_enabled": True})
-        assert panel.denoise_switch.isChecked() is False
-        assert panel.get_params()["denoise_enabled"] is False
+        # Checked/effective state only when the model is actually available.
+        assert panel.denoise_switch.isChecked() is available
+        assert panel.get_params()["denoise_enabled"] is available
     finally:
         panel.shutdown_scope_workers()
         panel.deleteLater()

@@ -1,5 +1,5 @@
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Signal, QThread
-from PySide6.QtGui import QImage, QImageReader, QColor
+from PySide6.QtGui import QImage, QImageReader, QImageIOHandler, QColor
 import os
 import threading
 import numpy as np
@@ -54,35 +54,45 @@ def _apply_flip_rotation(image: QImage, flip: int) -> QImage:
     return image
 
 
-def _decode_jpeg_scaled(data, flip: int, target_height: int):
-    """Decode JPEG bytes directly at thumbnail size via QImageReader.
+def _decode_jpeg_scaled(data, target_height: int):
+    """Decode embedded JPEG bytes at ~thumbnail size via QImageReader.
 
-    setScaledSize lets libjpeg do DCT-domain scaled decoding: ~8x faster
-    and a tiny fraction of the peak memory of a full-resolution decode.
-    The scaled size is chosen so that the image is target_height tall
-    *after* the camera-orientation rotation (flip 5/6 swap dimensions).
-    Returns a QImage or None.
+    Returns ``(QImage | None, exif_oriented)``. ``exif_oriented`` is True when
+    the embedded JPEG carried its own EXIF orientation tag — setAutoTransform
+    has then already rotated the image to its correct display orientation, so
+    the caller must NOT re-apply the rawpy flip on top (doing both rotates the
+    image twice, the Fuji RAF portrait bug: flip=6 + EXIF Rotate90 = +180°).
+
+    setScaledSize lets libjpeg do DCT-domain scaled decoding: ~8x faster and a
+    tiny fraction of the peak memory of a full-resolution decode. We decode to
+    ~2x target height by the longest *stored* edge and leave exact sizing to
+    the caller, sidestepping any pre/post-transform ambiguity in size().
     """
     byte_array = QByteArray(data)
     buffer = QBuffer(byte_array)
     if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
-        return None
+        return None, False
     reader = QImageReader(buffer, QByteArray(b"jpg"))
     # QImage.loadFromData applies EXIF orientation by default; keep parity.
     reader.setAutoTransform(True)
+    exif_oriented = (
+        reader.transformation()
+        != QImageIOHandler.Transformation.TransformationNone
+    )
     size = reader.size()  # header-only, no pixel decode
     if size.isValid() and size.width() > 0 and size.height() > 0:
-        ref = size.width() if flip in (5, 6) else size.height()
-        if ref > target_height:
-            scale = target_height / ref
+        longest = max(size.width(), size.height())
+        cap = max(1, target_height * 2)
+        if longest > cap:
+            scale = cap / longest
             reader.setScaledSize(QSize(
                 max(1, round(size.width() * scale)),
                 max(1, round(size.height() * scale)),
             ))
     image = reader.read()
     if image.isNull():
-        return None
-    return image
+        return None, False
+    return image, exif_oriented
 
 
 class ThumbnailWorker(QThread):
@@ -161,6 +171,7 @@ class ThumbnailWorker(QThread):
             target_height = ThumbnailWorker.THUMB_HEIGHT
             image = None
             flip = 0
+            exif_oriented = False
 
             # Method 1: Extract embedded JPEG thumbnail (fastest, ~50ms)
             try:
@@ -169,7 +180,9 @@ class ThumbnailWorker(QThread):
                     flip = raw.sizes.flip
                     thumb = raw.extract_thumb()
                 if thumb.format == rawpy.ThumbFormat.JPEG:
-                    image = _decode_jpeg_scaled(thumb.data, flip, target_height)
+                    image, exif_oriented = _decode_jpeg_scaled(
+                        thumb.data, target_height
+                    )
                 elif thumb.format == rawpy.ThumbFormat.BITMAP:
                     h, w = thumb.data.shape[:2]
                     thumb_data = np.ascontiguousarray(thumb.data)
@@ -179,18 +192,27 @@ class ThumbnailWorker(QThread):
                     ).copy()
             except Exception:
                 image = None
+                exif_oriented = False
 
-            # Embedded thumbnails are typically unrotated; apply camera
-            # orientation. Scale *before* rotating so the transform runs on a
-            # ~300px image instead of allocating a rotated full-size copy.
+            # Orient the embedded thumbnail. When the JPEG carried its own EXIF
+            # orientation, setAutoTransform already applied it — re-applying the
+            # rawpy flip double-rotates (Fuji RAF portrait: flip=6 + Rotate90 =
+            # +180°). Only apply the rawpy flip when the JPEG had no orientation
+            # of its own (e.g. Canon CR2 embedded thumbnails are unrotated).
+            # Scale *before* rotating so the transform runs on a ~300px image
+            # instead of allocating a rotated full-size copy.
             if image is not None and not image.isNull():
-                ref = image.width() if flip in (5, 6) else image.height()
-                if ref != target_height and ref > 0:
-                    if flip in (5, 6):
-                        image = image.scaledToWidth(target_height)
-                    else:
+                if exif_oriented:
+                    if image.height() != target_height and image.height() > 0:
                         image = image.scaledToHeight(target_height)
-                image = _apply_flip_rotation(image, flip)
+                else:
+                    ref = image.width() if flip in (5, 6) else image.height()
+                    if ref != target_height and ref > 0:
+                        if flip in (5, 6):
+                            image = image.scaledToWidth(target_height)
+                        else:
+                            image = image.scaledToHeight(target_height)
+                    image = _apply_flip_rotation(image, flip)
                 if not image.isNull():
                     if cache is not None:
                         try:
