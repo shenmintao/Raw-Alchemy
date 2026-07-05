@@ -465,6 +465,33 @@ class ImageProcessor(QThread):
         exif_data, exif_metadata = extract_lens_exif(path, None)
         return rgb, exif_data, exif_metadata
 
+    def _decode_for_view(self, path: str):
+        """On-demand full decode with a CPU fallback (crash safety net).
+
+        Uses the fast GPU demosaic (_rawpy_to_prophoto) normally. If the
+        GPU/Vulkan device allocator is exhausted ("Failed to allocate ext arr
+        buffer") or the GPU path fails for any reason, reclaim the GPU pool and
+        decode on the CPU instead (_cpu_decode_to_prophoto — GPU-free and
+        colour-matched). A wedged allocator then degrades to a slower load for
+        that one image rather than cascading into repeated hard failures.
+        """
+        try:
+            return self._rawpy_to_prophoto(path)
+        except Exception as e:
+            logger.warning(
+                f"[Worker] GPU decode failed ({str(e)[:80]}); reclaiming GPU "
+                f"memory and falling back to CPU decode for "
+                f"{os.path.basename(path)}"
+            )
+            try:
+                from raw_alchemy.gpu_buffer import gpu_pool
+                gpu_pool().clear()
+            except Exception:
+                pass
+            import gc
+            gc.collect()
+            return self._cpu_decode_to_prophoto(path)
+
     @staticmethod
     def _make_proxy(linear_data: np.ndarray) -> Optional[np.ndarray]:
         """Create a 2-4MP linear proxy for interactive preview work."""
@@ -578,7 +605,7 @@ class ImageProcessor(QThread):
             # (GPU, serialised to this one image) rather than showing nothing.
             if self.cpu_linear is None:
                 try:
-                    img_np, _bf_exif, _bf_meta = self._rawpy_to_prophoto(path)
+                    img_np, _bf_exif, _bf_meta = self._decode_for_view(path)
                     self.cpu_linear = img_np
                     proxy_np = self._make_proxy(img_np)
                     if proxy_np is not None:
@@ -616,7 +643,7 @@ class ImageProcessor(QThread):
             logger.info(f"[Worker] Cache Miss - Loading: {os.path.basename(path)}")
 
             try:
-                img_np, self.exif_data, self.exif_metadata = self._rawpy_to_prophoto(path)
+                img_np, self.exif_data, self.exif_metadata = self._decode_for_view(path)
                 proxy_np = self._make_proxy(img_np)
 
                 # Keep on CPU (GPU upload only when needed for processing)
