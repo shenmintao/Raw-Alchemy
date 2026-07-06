@@ -429,6 +429,10 @@ def _highlight_guard_config() -> dict:
         "chroma_lo": _env_float("CANS_HL_CHROMA_LO", 0.08),
         "chroma_hi": _env_float("CANS_HL_CHROMA_HI", 0.25),
         "despeckle_tau": _env_float("CANS_DESPECKLE_TAU", 0.12),
+        "sat_thr": _env_float("CANS_HL_SAT_THR", 0.7),
+        "sat_dilate": int(_env_float("CANS_HL_SAT_DILATE", 28)),
+        "halo_br_lo": _env_float("CANS_HL_HALO_BR_LO", 0.02),
+        "halo_br_hi": _env_float("CANS_HL_HALO_BR_HI", 0.08),
     }
 
 
@@ -473,15 +477,53 @@ def _apply_highlight_guard(out_hwc: np.ndarray, in_hwc: np.ndarray, cfg: dict) -
         eps = 1e-4
         brightness = inp.max(axis=-1, keepdims=True)
         a_bright = np.clip((brightness - lo) / (hi - lo), 0.0, 1.0)
+        # Saturated-spot halo: the magenta/purple ring the model paints around
+        # small clipped light sources (street lamps) sits at *mid* brightness —
+        # below blend_lo — so the ramp alone misses it. Dilate the near-clip
+        # mask so the halo inherits full brightness weight; the chroma gate
+        # below still decides whether anything is actually pulled back, so
+        # ordinary mid-tones inside the dilated ring stay fully denoised.
+        sat_thr, sat_dilate = float(cfg["sat_thr"]), int(cfg["sat_dilate"])
+        halo = None
+        if sat_dilate > 0:
+            sat = (brightness[..., 0] > sat_thr).astype(np.uint8)
+            if sat.any():
+                try:
+                    import cv2
+                    k = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (2 * sat_dilate + 1, 2 * sat_dilate + 1)
+                    )
+                    halo = cv2.dilate(sat, k).astype(np.float32)[..., np.newaxis]
+                    # Local-brightness gate: within the dilated disc, only
+                    # actual structure (lamp head/pole/glow) may be restored.
+                    # Without it the disc also reverts the noisy night sky
+                    # around every lamp — visible as a dark noise bubble.
+                    # Blurred brightness so per-pixel noise cannot open the gate.
+                    blo = float(cfg["halo_br_lo"])
+                    bhi = max(float(cfg["halo_br_hi"]), blo + 1e-6)
+                    local_br = cv2.blur(brightness[..., 0], (11, 11))
+                    br_gate = np.clip((local_br - blo) / (bhi - blo), 0.0, 1.0)
+                    halo = halo * br_gate[..., np.newaxis]
+                    a_bright = np.maximum(a_bright, halo)
+                except Exception:
+                    halo = None
         # per-pixel colour signature = channels normalised by their own luma
         luma_out = guarded.mean(axis=-1, keepdims=True) + eps
+        luma_in = inp.mean(axis=-1, keepdims=True) + eps
         chroma_out = guarded / luma_out
-        chroma_in = inp / (inp.mean(axis=-1, keepdims=True) + eps)
+        chroma_in = inp / luma_in
         cdiff = np.abs(chroma_out - chroma_in).mean(axis=-1, keepdims=True)
         a_chroma = np.clip((cdiff - clo) / max(chi - clo, 1e-6), 0.0, 1.0)
         a = a_bright * a_chroma
         chroma_fixed = (1.0 - a) * chroma_out + a * chroma_in
-        guarded = luma_out * chroma_fixed
+        # Inside the dilated halo the model crushes *luma* too (a chroma-only
+        # fix turns bright pink lamp cores into dim violet), so restore the
+        # full pixel toward the input there. Elsewhere keep the denoised luma.
+        luma_fixed = luma_out
+        if halo is not None:
+            a_luma = halo * a_chroma
+            luma_fixed = (1.0 - a_luma) * luma_out + a_luma * luma_in
+        guarded = luma_fixed * chroma_fixed
     return np.clip(guarded, 0.0, 1.0)
 
 
