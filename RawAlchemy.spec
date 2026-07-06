@@ -86,10 +86,6 @@ pyexiv2_binaries = pyexiv2_ret[1]
 pyexiv2_hiddenimports = pyexiv2_ret[2]
 binaries_list.extend(pyexiv2_binaries)
 
-taichi_ret = collect_all('taichi')
-taichi_datas = taichi_ret[0]
-taichi_binaries = taichi_ret[1]
-taichi_hiddenimports = taichi_ret[2]
 
 rawspeedpy_datas = collect_data_files('rawspeedpy')
 
@@ -112,8 +108,8 @@ a = Analysis(
         ('src/raw_alchemy/demosaic.py', 'raw_alchemy'),
         ('src/raw_alchemy/xtrans_demosaic.py', 'raw_alchemy'),
         ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
-    ] + taichi_datas + rawspeedpy_datas,
-    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'] + taichi_hiddenimports,
+    ] + rawspeedpy_datas,
+    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'onnx', 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -9,7 +9,7 @@ from raw_alchemy.logger import create_logger
 from raw_alchemy.file_io import save_image
 from raw_alchemy import config, metering
 from raw_alchemy.onnx.rgb_denoiser import denoise_rgb_linear
-from raw_alchemy.math_ops import apply_matrix_inplace, init_taichi
+from raw_alchemy.math_ops import apply_matrix_inplace, compute_hl_refavg, init_taichi
 from raw_alchemy.pipeline.executor import ExportExecutor
 from raw_alchemy.pipeline.ops import build_op_list
 
@@ -51,40 +51,6 @@ def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
 #     楂樺厜閲嶅缓 (Segmentation Based, GPU)
 # ==========================================
 
-def _compute_hl_refavg_np(raw_data, color_map, wb_gains, raw_clips):
-    """Opposing-channel cube-root reference average (numpy/cv2).
-
-    Pixel-exact port of the retired Taichi kernel: 3x3 clamped-neighbourhood
-    per-color means == replicate-border box sums of (value*mask, mask).
-    """
-    import cv2
-
-    raw_pos = np.maximum(raw_data, 0.0).astype(np.float32, copy=False)
-    cbrt = np.zeros((3,) + raw_data.shape, dtype=np.float32)
-    for c in range(3):
-        mask = (color_map == c).astype(np.float32)
-        sums = cv2.boxFilter(raw_pos * mask, -1, (3, 3), normalize=False,
-                             borderType=cv2.BORDER_REPLICATE)
-        cnts = cv2.boxFilter(mask, -1, (3, 3), normalize=False,
-                             borderType=cv2.BORDER_REPLICATE)
-        mean = np.divide(sums, cnts, out=np.zeros_like(sums), where=cnts > 0)
-        cbrt[c] = np.cbrt(float(wb_gains[c]) * mean)
-
-    opp = np.stack([
-        0.5 * (cbrt[1] + cbrt[2]),
-        0.5 * (cbrt[0] + cbrt[2]),
-        0.5 * (cbrt[0] + cbrt[1]),
-    ])
-    opp_at = np.take_along_axis(opp, color_map[None], axis=0)[0]
-    wb_at = np.asarray(wb_gains, np.float32)[color_map]
-    refavg = opp_at ** 3
-    refavg = np.where(wb_at > 1e-6, refavg / np.maximum(wb_at, 1e-6), refavg)
-
-    clips_at = np.asarray(raw_clips, np.float32)[color_map]
-    clipped = raw_data >= clips_at
-    return refavg.astype(np.float32), clipped
-
-
 def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     """Segmentation-based highlight reconstruction.
 
@@ -92,12 +58,11 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     per-pixel opposing-channel reference average + per-segment chroma
     correction.
 
-    Implementation: numpy/cv2 throughout — ``_compute_hl_refavg_np`` for the
-    per-pixel opposing-channel reference (SIMD box filters), morphology /
+    Implementation: numpy/cv2 throughout — ``math_ops.compute_hl_refavg`` for
+    the per-pixel opposing-channel reference (SIMD box filters), morphology /
     CCL / max-filter via OpenCV.
     """
     import cv2
-    compute_hl_refavg = _compute_hl_refavg_np
 
     H, W = raw_data.shape
     pat_size = cfa_pattern.shape[0]
@@ -187,35 +152,37 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     from raw_alchemy.onnx.denoiser import _apply_flip
     from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
 
-    # ---- Bayer fast path: rawspeed decode + ONNX RCD ----
-    bayer_data = None
+    # ---- CFA fast path: rawspeed/rawpy decode + ONNX demosaic (GPU) ----
+    cfa_data = None
     rs = None
     try:
-        from rawspeedpy import try_decode
+        from rawspeedpy import try_decode, XTRANS_PATTERN
         rs = try_decode(raw_path)
     except ImportError:
         pass
-    if rs and rs.is_bayer and rs.color_matrix is not None:
-        from raw_alchemy.demosaic import get_cfa_pattern_from_filters
+    if rs and (rs.is_bayer or rs.is_xtrans) and rs.color_matrix is not None:
+        from raw_alchemy.demosaic_helpers import get_cfa_pattern_from_filters
         try:
             with rawpy.imread(raw_path) as _r:
                 flip = _r.sizes.flip
         except Exception:
             flip = 0
-        bayer_data = (
+        pattern = (get_cfa_pattern_from_filters(rs.filters) if rs.is_bayer
+                   else np.asarray(XTRANS_PATTERN))
+        cfa_data = (
             rs.bayer.astype(np.float32),
             np.array(rs.black_levels, dtype=np.float32),
             float(rs.white_level),
             np.array(rs.wb_coeffs, dtype=np.float32),
             rs.color_matrix.astype(np.float64),
-            get_cfa_pattern_from_filters(rs.filters),
+            pattern,
             flip,
         )
     else:
         with rawpy.imread(raw_path) as raw:
             cfa = raw.raw_pattern
-            if cfa is not None and cfa.shape == (2, 2):
-                bayer_data = (
+            if cfa is not None and cfa.shape in ((2, 2), (6, 6)):
+                cfa_data = (
                     raw.raw_image_visible.astype(np.float32),
                     np.array(raw.black_level_per_channel, dtype=np.float32),
                     float(raw.white_level),
@@ -225,13 +192,17 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
                     raw.sizes.flip,
                 )
 
-    if bayer_data is not None:
-        from raw_alchemy.onnx.rcd_demosaic import rcd_demosaic as onnx_rcd
-        sensor_raw, bl, wl, wb, xyz_to_cam, cfa_pattern, flip = bayer_data
+    if cfa_data is not None:
+        sensor_raw, bl, wl, wb, xyz_to_cam, cfa_pattern, flip = cfa_data
         raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
         fix_hot_pixels(raw_norm, cfa_pattern)
         highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
-        rgb = onnx_rcd(raw_norm, cfa_pattern)
+        if cfa_pattern.shape == (2, 2):
+            from raw_alchemy.onnx.rcd_demosaic import rcd_demosaic as onnx_rcd
+            rgb = onnx_rcd(raw_norm, cfa_pattern)
+        else:
+            from raw_alchemy.onnx.xtrans_demosaic import xtrans_markesteijn_demosaic
+            rgb = xtrans_markesteijn_demosaic(raw_norm, cfa_pattern)
         rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
         g = wb[1] if wb[1] > 0 else 1.0
         rgb[:, :, 0] *= wb[0] / g
@@ -241,7 +212,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
         np.clip(rgb, 0.0, 1.0, out=rgb)
         return rgb
 
-    # ---- X-Trans & everything else: libraw demosaic ----
+    # ---- 罕见传感器(Foveon 等):libraw 兜底 ----
     with rawpy.imread(raw_path) as raw:
         cfa = raw.raw_pattern
         has_cfa = cfa is not None and cfa.shape in ((2, 2), (6, 6))

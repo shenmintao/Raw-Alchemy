@@ -1,13 +1,11 @@
 ﻿"""
-GPU-resident image processing pipeline using Taichi.
+Image processing pipeline worker (numpy/cv2 compute, pooled buffers).
 
-All image data lives on GPU as ti.ndarray. Data crosses CPU-GPU boundary only:
-  1. RAW decode (rawpy + RCD demosaic -> numpy -> GPU upload)  [CPU -> GPU, once per image]
-  2. Lens correction (GPU -> CPU -> GPU)          [cv2, once per image]
-  3. Display output (GPU -> numpy)                [GPU -> CPU, each frame]
+Pipeline buffers are pooled numpy arrays (see gpu_buffer — the historical
+GPU names are kept for interface compatibility). The compute ops in
+math_ops are numpy/cv2; the Taichi runtime is no longer used here.
 
-Taichi has a single global instance per process - all kernel calls are
-serialized. This QThread processes requests sequentially, which is safe.
+This QThread processes requests sequentially, which is safe.
 """
 import math
 import threading
@@ -21,7 +19,6 @@ from PySide6.QtCore import QThread, Signal
 from loguru import logger
 
 from raw_alchemy import config, metering
-from raw_alchemy.backend import ti
 from raw_alchemy.math_ops import (
     apply_matrix_inplace,
     float_to_uint8_gpu,
@@ -134,7 +131,7 @@ class ImageProcessor(QThread):
         self.last_denoise_key = None
 
         self._should_stop = False
-        self._gpu_uint8 = None      # Pre-allocated GPU uint8 buffer (ti.ndarray)
+        self._gpu_uint8 = None      # Pre-allocated pooled uint8 output buffer
         # Proxy and full previews each keep their own executor (T7.4), so a
         # zoom across 1.0 or an idle full refine never evicts the other
         # side's prefix/final caches. Keyed by source mode: 'proxy' / 'full'.
@@ -208,7 +205,7 @@ class ImageProcessor(QThread):
         return request_id
 
     def run(self):
-        # Initialize Taichi on this thread so CUDA context is valid here (once only)
+        # Compatibility stubs (no-ops since the numpy/cv2 port of math_ops).
         from raw_alchemy.math_ops import init_taichi, warmup
         init_taichi()
         if not self._warmed_up:
@@ -570,9 +567,9 @@ class ImageProcessor(QThread):
         self.load_complete.emit(path, request.request_id)
 
     def _release_gpu_uint8(self):
-        """Return the uint8 output buffer to the GPU pool (T7.2)."""
+        """Return the uint8 output buffer to the buffer pool (T7.2)."""
         if self._gpu_uint8 is not None:
-            release_ndarray(self._gpu_uint8, ti.u8, tuple(self._gpu_uint8.shape))
+            release_ndarray(self._gpu_uint8, np.uint8, tuple(self._gpu_uint8.shape))
             self._gpu_uint8 = None
 
     def _invalidate_pipeline_caches(self):
@@ -1441,7 +1438,7 @@ class ImageProcessor(QThread):
 
             if self._gpu_uint8 is None or self._gpu_uint8.shape != (target_h, target_w, 3):
                 self._release_gpu_uint8()
-                self._gpu_uint8 = acquire_ndarray(ti.u8, (target_h, target_w, 3))
+                self._gpu_uint8 = acquire_ndarray(np.uint8, (target_h, target_w, 3))
 
             if target_w == source_w and target_h == source_h:
                 float_to_uint8_gpu(graded_arr, self._gpu_uint8)

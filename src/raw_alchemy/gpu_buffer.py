@@ -1,14 +1,19 @@
 """
-GPU Buffer Manager using Taichi ndarray.
+Buffer manager for the pipeline — numpy-backed since the Taichi runtime was
+removed from the interactive pipeline.
 
-ti.ndarray is GPU-resident: when passed to @ti.kernel via ti.types.ndarray(),
-NO CPU copy is made. Data stays on GPU between kernel calls.
+GpuImage / NdarrayPool / GpuBufferPool keep their historical names and exact
+interfaces (upload / to_numpy / copy_from / acquire / release / trim / byte
+accounting), but the buffers are now plain host (RAM) numpy arrays. The
+shape-keyed pool still recycles same-(dtype, shape) buffers so full-frame
+allocations are reused instead of churning the allocator, and the byte
+budget/trim semantics (T7.2/T7.6) are unchanged — the accounted bytes are
+now RAM instead of VRAM.
 
-Only from_numpy() / to_numpy() cross the CPU-GPU boundary.
-
-T7.2: all GpuImage allocations are backed by a process-wide, shape-keyed
-ndarray pool so repeated full-frame allocations (700MB-class per request)
-recycle device memory instead of churning vkAllocate/vkFree.
+Buffers returned by the pool are ``HostNdarray`` (a numpy subclass) carrying
+the minimal ti.ndarray-compatible surface (``from_numpy`` / ``to_numpy`` /
+``copy_from`` / ``fill``) so the legacy Taichi demosaic modules keep working
+against pool buffers unchanged.
 """
 import threading
 from collections import OrderedDict
@@ -18,34 +23,61 @@ import numpy as np
 from loguru import logger
 
 from raw_alchemy import config
-from raw_alchemy.backend import ndarray, ti
 
 
-def _dtype_itemsize(dtype) -> int:
-    """Best-effort byte size of a taichi primitive dtype."""
-    name = str(dtype)
-    if name.endswith(("64",)):
-        return 8
-    if name.endswith(("16",)):
-        return 2
-    if name.endswith(("8",)):
-        return 1
-    return 4  # f32 / i32 / u32 and unknowns
+# Taichi primitive dtype names (str(ti.f32) == "f32", etc.) — accepted for
+# compatibility with legacy callers; normalized to numpy dtypes.
+_TI_DTYPE_NAMES = {
+    "f16": np.float16, "f32": np.float32, "f64": np.float64,
+    "i8": np.int8, "i16": np.int16, "i32": np.int32, "i64": np.int64,
+    "u8": np.uint8, "u16": np.uint16, "u32": np.uint32, "u64": np.uint64,
+}
+
+
+def _as_numpy_dtype(dtype) -> np.dtype:
+    """Normalize numpy dtypes and taichi primitive dtypes to np.dtype."""
+    mapped = _TI_DTYPE_NAMES.get(str(dtype))
+    if mapped is not None:
+        return np.dtype(mapped)
+    try:
+        return np.dtype(dtype)
+    except TypeError:
+        raise TypeError(f"Unsupported buffer dtype: {dtype!r}")
 
 
 def _nbytes(dtype, shape) -> int:
-    total = _dtype_itemsize(dtype)
+    total = _as_numpy_dtype(dtype).itemsize
     for dim in shape:
         total *= int(dim)
     return total
 
 
+class HostNdarray(np.ndarray):
+    """numpy array with the small ti.ndarray-compatible method surface."""
+
+    def from_numpy(self, src: np.ndarray):
+        np.copyto(self, src)
+
+    def to_numpy(self) -> np.ndarray:
+        """Return an independent plain-ndarray copy of the buffer contents."""
+        return np.array(self, copy=True)
+
+    def copy_from(self, other: np.ndarray):
+        np.copyto(self, other)
+
+
+def ndarray(*, dtype, shape) -> HostNdarray:
+    """Allocate a pool-compatible host buffer of (dtype, shape)."""
+    np_dtype = _as_numpy_dtype(dtype)
+    return np.empty(tuple(int(dim) for dim in shape), dtype=np_dtype).view(HostNdarray)
+
+
 class NdarrayPool:
-    """Shape-keyed pool of free backend ndarrays (T7.2).
+    """Shape-keyed pool of free host ndarrays (T7.2).
 
     acquire() pops a recycled buffer of the exact (dtype, shape) or allocates
     a fresh one; release() returns a buffer for reuse. Retained *free* bytes
-    are capped (LRU eviction across keys) so the pool never hoards VRAM.
+    are capped (LRU eviction across keys) so the pool never hoards RAM.
     Thread-safe: the worker, export and preload threads share one instance.
     """
 
@@ -63,10 +95,10 @@ class NdarrayPool:
 
     @staticmethod
     def _key(dtype, shape) -> tuple:
-        return (str(dtype), tuple(int(dim) for dim in shape))
+        return (_as_numpy_dtype(dtype).name, tuple(int(dim) for dim in shape))
 
     def acquire(self, dtype, shape):
-        """Return a device ndarray of exactly (dtype, shape); pooled if possible."""
+        """Return an ndarray of exactly (dtype, shape); pooled if possible."""
         key = self._key(dtype, shape)
         with self._lock:
             bucket = self._free.get(key)
@@ -138,7 +170,7 @@ _pool = NdarrayPool()
 
 
 def gpu_pool() -> NdarrayPool:
-    """The process-wide GPU buffer pool."""
+    """The process-wide buffer pool."""
     return _pool
 
 
@@ -152,19 +184,19 @@ def release_ndarray(arr, dtype, shape) -> bool:
 
 class GpuImage:
     """
-    GPU-resident image buffer backed by ti.ndarray.
+    Image buffer backed by a pooled numpy array (float32, HxWxC).
 
-    Lifecycle:
-        1. upload(np_array)  — CPU → GPU (once, on RAW load)
-        2. Taichi kernels    — GPU → GPU (zero-copy, many times)
-        3. to_numpy()        — GPU → CPU (only for display/export)
+    The historical GPU lifecycle names are preserved:
+        1. upload(np_array)  — copies the source into the pooled buffer
+        2. pixel ops         — mutate ``arr`` in place (numpy/cv2)
+        3. to_numpy()        — independent host copy (display/export)
 
     Buffers come from the shape-keyed pool; clear() (and garbage collection
-    of the GpuImage) returns them for reuse instead of freeing device memory.
+    of the GpuImage) returns them for reuse instead of freeing memory.
     """
 
     def __init__(self, height: int = 0, width: int = 0, channels: int = 3):
-        self._arr: Optional[ti.ndarray] = None
+        self._arr: Optional[HostNdarray] = None
         self._height = height
         self._width = width
         self._channels = channels
@@ -173,7 +205,7 @@ class GpuImage:
             self._allocate(height, width, channels)
 
     def _allocate(self, height: int, width: int, channels: int = 3):
-        """Acquire device memory from the pool. Re-acquires only if size changes."""
+        """Acquire memory from the pool. Re-acquires only if size changes."""
         if (self._arr is not None
                 and self._height == height
                 and self._width == width
@@ -181,7 +213,7 @@ class GpuImage:
             return
 
         self._release_to_pool()
-        self._arr = acquire_ndarray(ti.f32, (height, width, channels))
+        self._arr = acquire_ndarray(np.float32, (height, width, channels))
         self._height = height
         self._width = width
         self._channels = channels
@@ -189,14 +221,14 @@ class GpuImage:
     def _release_to_pool(self):
         if self._arr is not None:
             try:
-                release_ndarray(self._arr, ti.f32, (self._height, self._width, self._channels))
+                release_ndarray(self._arr, np.float32, (self._height, self._width, self._channels))
             except Exception:
                 pass
             self._arr = None
 
     @property
-    def arr(self) -> ti.ndarray:
-        """The underlying ti.ndarray. Pass this to @ti.kernel params."""
+    def arr(self) -> np.ndarray:
+        """The underlying array. Mutated in place by the pixel ops."""
         return self._arr
 
     @property
@@ -217,54 +249,47 @@ class GpuImage:
 
     @property
     def nbytes(self) -> int:
-        """Device bytes held by this buffer (float32)."""
+        """Bytes held by this buffer (float32)."""
         if self._arr is None:
             return 0
         return self._height * self._width * self._channels * 4
 
     def upload(self, np_array: np.ndarray):
-        """
-        Upload numpy array to GPU. Re-acquires if shape changed.
-        This is the ONLY place data crosses CPU → GPU.
-        """
+        """Copy a numpy array into the pooled buffer. Re-acquires if shape changed."""
         if np_array.dtype != np.float32:
             np_array = np_array.astype(np.float32)
-        if not np_array.flags['C_CONTIGUOUS']:
-            np_array = np.ascontiguousarray(np_array)
 
         h, w = np_array.shape[:2]
         c = np_array.shape[2] if np_array.ndim == 3 else 1
         self._allocate(h, w, c)
-        self._arr.from_numpy(np_array)
+        np.copyto(self._arr.reshape(np_array.shape), np_array)
 
     def to_numpy(self) -> np.ndarray:
-        """
-        Download GPU data to numpy. This crosses GPU → CPU.
-        Use sparingly (only for display/export).
+        """Independent copy of the buffer contents.
+
+        A copy (not a view) so callers keep a stable result even after this
+        buffer is cleared back to the pool and reused — same semantics as the
+        old device download.
         """
         if self._arr is None:
             return np.empty((0, 0, 3), dtype=np.float32)
         return self._arr.to_numpy()
 
     def copy_from(self, other: 'GpuImage'):
-        """GPU-to-GPU copy from another GpuImage."""
+        """Buffer-to-buffer copy from another GpuImage."""
         if not other.valid:
             return
         self._allocate(other._height, other._width, other._channels)
-        self._arr.copy_from(other._arr)
+        np.copyto(self._arr, other._arr)
 
     def clear(self):
-        """Return the device buffer to the pool immediately.
+        """Return the buffer to the pool immediately.
 
         Only call from *live* code paths when this GpuImage is the sole owner
-        of its buffer (no kernels or other objects still referencing ``arr``).
-
-        Note there is deliberately no ``__del__``-based pooling: resurrecting
-        the ndarray from inside a garbage cycle is unsafe — PEP 442 runs all
-        finalizers of cyclic garbage first, so taichi's ``ScalarNdarray.__del__``
-        would free the native buffer while the resurrected Python object sits
-        in the pool with a dangling handle. Unreferenced buffers that never
-        get an explicit clear() are simply freed by taichi on collection.
+        of its buffer (no other objects still referencing ``arr``). There is
+        deliberately no ``__del__``-based pooling: unreferenced buffers that
+        never get an explicit clear() are simply freed by the garbage
+        collector.
         """
         self._release_to_pool()
         self._height = 0
@@ -272,7 +297,7 @@ class GpuImage:
         self._channels = 0
 
     def size_mb(self) -> float:
-        """Approximate GPU memory usage in MB."""
+        """Approximate memory usage in MB."""
         if not self.valid:
             return 0.0
         return self.nbytes / (1024 * 1024)
@@ -280,7 +305,7 @@ class GpuImage:
 
 class GpuBufferPool:
     """
-    Pool of pre-allocated GPU buffers for the processing pipeline.
+    Pool of pre-allocated buffers for the processing pipeline.
     Avoids repeated allocation/deallocation.
     """
 
@@ -299,7 +324,7 @@ class GpuBufferPool:
         self.viewport = GpuImage()
 
     def total_gpu_mb(self) -> float:
-        """Total GPU memory used by all buffers."""
+        """Total memory used by all buffers."""
         total = 0.0
         for attr_name in vars(self):
             attr = getattr(self, attr_name)
@@ -308,9 +333,9 @@ class GpuBufferPool:
         return total
 
     def clear_all(self):
-        """Release all GPU buffers."""
+        """Release all buffers."""
         for attr_name in vars(self):
             attr = getattr(self, attr_name)
             if isinstance(attr, GpuImage):
                 attr.clear()
-        logger.debug("[GpuBufferPool] All GPU buffers released.")
+        logger.debug("[GpuBufferPool] All buffers released.")

@@ -83,16 +83,7 @@ pyexiv2_binaries = pyexiv2_ret[1]
 pyexiv2_hiddenimports = pyexiv2_ret[2]
 binaries_list.extend(pyexiv2_binaries)
 
-taichi_ret = collect_all('taichi')
-taichi_datas = taichi_ret[0]
-taichi_binaries = taichi_ret[1]
-taichi_hiddenimports = taichi_ret[2]
 
-_taichi_exclude = {'c_api', 'examples'}
-taichi_datas = [(src, dst) for src, dst in taichi_datas
-                if not any(ex in src for ex in _taichi_exclude)]
-taichi_binaries = [(src, dst) for src, dst in taichi_binaries
-                   if not any(ex in src for ex in _taichi_exclude)]
 
 # Determine ONNX Runtime package based on platform
 # The import name is 'onnxruntime' for every distribution variant
@@ -115,8 +106,8 @@ a = Analysis(
         ('src/raw_alchemy/demosaic.py', 'raw_alchemy'),
         ('src/raw_alchemy/xtrans_demosaic.py', 'raw_alchemy'),
         ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
-    ] + taichi_datas,
-    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'] + taichi_hiddenimports,
+    ],
+    hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'onnx', 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

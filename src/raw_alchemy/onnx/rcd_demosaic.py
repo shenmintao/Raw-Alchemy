@@ -22,21 +22,41 @@ from .denoiser import _find_model, _get_providers
 
 MODEL_FILE = "rcd_demosaic_dyn.onnx"
 
-_session = None
+# DirectML compiles/partitions dynamic-shape graphs poorly for some sizes
+# (24MP ran 20x slower than 42.6MP on the same graph), so the runtime
+# freezes the dynamic model's H/W to the actual sensor size before creating
+# a session — one session per distinct size, cached (cameras have one size).
+_sessions: dict = {}
 _session_lock = threading.Lock()
 _session_provider = None
 
 
-def _get_session():
-    global _session, _session_provider
-    if _session is not None:
-        return _session
+def _get_session(h: int, w: int):
+    global _session_provider
+    key = (h, w)
+    sess = _sessions.get(key)
+    if sess is not None:
+        return sess
     with _session_lock:
-        if _session is not None:
-            return _session
+        sess = _sessions.get(key)
+        if sess is not None:
+            return sess
         import onnxruntime as ort
 
         model_path = _find_model(MODEL_FILE)
+        model_bytes = None
+        try:
+            import onnx
+
+            m = onnx.load(model_path)
+            for d, v in zip(m.graph.input[0].type.tensor_type.shape.dim, (h, w)):
+                d.ClearField("dim_param")
+                d.dim_value = int(v)
+            m = onnx.shape_inference.infer_shapes(m)
+            model_bytes = m.SerializeToString()
+        except Exception as e:
+            logger.warning(f"RCD: dim freeze unavailable ({e}); using dynamic graph")
+
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         providers = _get_providers()
@@ -44,18 +64,20 @@ def _get_session():
             ({"device_id": 0} if p in ("CUDAExecutionProvider", "DmlExecutionProvider") else {})
             for p in providers
         ]
-        _session = ort.InferenceSession(
-            model_path, so, providers=providers, provider_options=provider_options,
+        sess = ort.InferenceSession(
+            model_bytes if model_bytes is not None else model_path,
+            so, providers=providers, provider_options=provider_options,
         )
-        _session_provider = _session.get_providers()[0]
-        logger.info(f"RCD demosaic session: {_session_provider}")
-    return _session
+        _sessions[key] = sess
+        _session_provider = sess.get_providers()[0]
+        logger.info(f"RCD demosaic session ({w}x{h}): {_session_provider}")
+    return sess
 
 
 def clear_session() -> None:
-    global _session, _session_provider
+    global _session_provider
     with _session_lock:
-        _session = None
+        _sessions.clear()
         _session_provider = None
     import gc
     gc.collect()
@@ -90,7 +112,7 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray) -> np.ndarray:
         raise ValueError(f"unsupported mosaic size {w}x{h}")
 
     t0 = time.time()
-    session = _get_session()
+    session = _get_session(h, w)
     m2 = _phase_masks(np.asarray(cfa_pattern))
     feeds = {
         "bayer": np.ascontiguousarray(bayer, dtype=np.float32),

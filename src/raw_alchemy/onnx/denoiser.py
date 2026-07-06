@@ -879,7 +879,7 @@ def _unpack_xtrans_sid(packed: np.ndarray, *, top: int = 0, left: int = 0) -> np
 
 def _render_packed_raw_to_prophoto(result: dict) -> np.ndarray:
     from raw_alchemy.colorspace_matrices import cam_to_prophoto_matrix
-    from raw_alchemy.demosaic import FILTERS_RGGB, rcd_demosaic
+    from raw_alchemy.onnx.rcd_demosaic import rcd_demosaic
     from raw_alchemy.math_ops import apply_matrix_inplace
 
     packed = np.clip(result["packed"], 0.0, 1.0).astype(np.float32, copy=False)
@@ -887,9 +887,9 @@ def _render_packed_raw_to_prophoto(result: dict) -> np.ndarray:
 
     if sensor == "bayer":
         mosaic = _unpack_bayer_rggb(packed)
-        rgb = rcd_demosaic(mosaic, FILTERS_RGGB)
+        rgb = rcd_demosaic(mosaic, np.array([[0, 1], [1, 2]]))  # RGGB
     elif sensor == "xtrans":
-        from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
+        from raw_alchemy.onnx.xtrans_demosaic import xtrans_markesteijn_demosaic
 
         # The packed RAW was phase-aligned to the canonical X-Trans layout, so
         # the reconstructed mosaic is in canonical phase -> demosaic with the
