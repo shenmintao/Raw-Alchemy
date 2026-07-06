@@ -144,8 +144,15 @@ class _BaseExecutor:
         self.last_applied_ev = 0.0
         buf = GpuImage()
         buf.upload(src)
-        for op in ops:
-            buf = self._apply_op(buf, op)
+        i = 0
+        while i < len(ops):
+            j = self._grade_fuse_end(ops, i)
+            if j is not None:
+                buf = self._apply_op(buf, Op("grade_fused", tuple(ops[i:j + 1])))
+                i = j + 1
+            else:
+                buf = self._apply_op(buf, ops[i])
+                i += 1
         clip_inplace(buf.arr)
         image = buf.to_numpy()
         buf.clear()  # recycle the working buffer (export path materializes to host)
@@ -198,6 +205,12 @@ class _BaseExecutor:
             apply_crop_pixels_gpu(buf, dst, int(x), int(y), int(w), int(h))
             buf.clear()
             return dst
+
+        if op.name == "grade_fused":
+            # Synthetic execution-time op: params is the fused sub-sequence
+            # [exposure, (wb|hs|sc)*, srgb_out]. Never part of op-list cache
+            # keys — the loops build it on the fly via _grade_fuse_end.
+            return self._apply_grade_fused(buf, op.params)
 
         if op.name == "exposure":
             exposure_mode, exposure, metering_mode, *rest = op.params
@@ -330,6 +343,120 @@ class _BaseExecutor:
             return buf
 
         raise ValueError(f"Unknown pipeline op: {op.name}")
+
+    def _resolve_exposure_gain(self, buf: GpuImage, exposure_params) -> float:
+        """Shared Manual/Auto gain resolution (exposure op + fused grade)."""
+        exposure_mode, exposure, metering_mode, *rest = exposure_params
+        working_space = rest[0] if rest else None
+        if exposure_mode == "Manual":
+            gain = 2.0 ** float(exposure)
+            self.last_applied_ev = float(exposure)
+        else:
+            metering_img = buf.to_numpy()
+            if self.auto_gain_resolver is not None:
+                gain = self.auto_gain_resolver(metering_img, metering_mode)
+            else:
+                source_cs = (
+                    colour.RGB_COLOURSPACES[working_space]
+                    if working_space
+                    else utils.get_working_colourspace()
+                )
+                gain = metering.get_metering_strategy(metering_mode).calculate_gain(
+                    metering_img,
+                    source_cs,
+                )
+            self.last_applied_ev = float(np.log2(gain))
+        return round(float(gain), 4) if self.round_exposure_gain else float(gain)
+
+    _GRADE_MID_OPS = ("white_balance", "highlight_shadow", "sat_contrast")
+
+    def _grade_fuse_end(self, ops: Sequence[Op], i: int):
+        """Index of the srgb_out op ending a fusable colour tail at ops[i].
+
+        Execution-time fusion only: the op list (and every cache key derived
+        from it) is untouched — the executor just runs the whole
+        [exposure, (wb|hs|sc)*, srgb_out] window as one GPU call when the
+        grade graph is available. Returns None when not fusable.
+        """
+        if ops[i].name != "exposure":
+            return None
+        from raw_alchemy.onnx import grade
+
+        if not grade.is_enabled():
+            return None
+        j = i + 1
+        while j < len(ops) and ops[j].name in self._GRADE_MID_OPS:
+            j += 1
+        if j < len(ops) and ops[j].name == "srgb_out":
+            return j
+        return None
+
+    def _apply_grade_fused(self, buf: GpuImage, seq: Sequence[Op]) -> GpuImage:
+        """The colour tail as one call: gain -> WB -> HL/SH -> sat/con ->
+        output matrix -> sRGB. GPU (onnx/grade.py) with a per-op numpy
+        fallback of identical math."""
+        exposure_params = seq[0].params
+        srgb_params = seq[-1].params
+        mid = {op.name: op.params for op in seq[1:-1]}
+        wb_params = mid.get("white_balance")
+        hs_params = mid.get("highlight_shadow")
+        sc_params = mid.get("sat_contrast")
+        gain = self._resolve_exposure_gain(buf, exposure_params)
+
+        working_space = srgb_params[0] if srgb_params else None
+        source_cs = (
+            colour.RGB_COLOURSPACES[working_space]
+            if working_space
+            else utils.get_working_colourspace()
+        )
+        luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
+
+        if wb_params is not None:
+            wb_temp, wb_tint, *wb_rest = wb_params
+            mat_a = white_balance_matrix(
+                wb_temp, wb_tint, wb_rest[0] if wb_rest else None
+            ).astype(np.float32)
+        else:
+            mat_a = np.eye(3, dtype=np.float32)
+
+        highlight = float(hs_params[0]) / 100.0 if hs_params is not None else 0.0
+        shadow = float(hs_params[1]) / 100.0 if hs_params is not None else 0.0
+        saturation = float(sc_params[0]) if sc_params is not None else 1.0
+        contrast = float(sc_params[1]) if sc_params is not None else 1.0
+
+        mat_b = colour.matrix_RGB_to_RGB(
+            source_cs, colour.RGB_COLOURSPACES["sRGB"]
+        ).astype(np.float32)
+
+        from raw_alchemy.onnx import grade
+
+        if grade.is_enabled():
+            try:
+                out = grade.apply_grade(
+                    buf.to_numpy(),
+                    gain=gain, mat_a=mat_a,
+                    highlight=highlight, shadow=shadow,
+                    saturation=saturation, contrast=contrast,
+                    pivot=0.18, luma=luma, mat_b=mat_b, srgb_encode=True,
+                )
+                dst = GpuImage()
+                dst.upload(out)
+                buf.clear()
+                return dst
+            except Exception as e:
+                logger.warning(f"grade GPU path failed ({e}); numpy fallback")
+
+        # numpy fallback — the exact per-op sequence the fused graph replaces
+        apply_gain_inplace(buf.arr, gain)
+        if wb_params is not None:
+            apply_matrix_inplace(buf.arr, mat_a)
+        if hs_params is not None:
+            apply_highlight_shadow_inplace(buf.arr, highlight, shadow, luma)
+        if sc_params is not None:
+            apply_saturation_contrast_inplace(buf.arr, saturation, contrast, 0.18, luma)
+        apply_matrix_inplace(buf.arr, mat_b)
+        linear_to_srgb_inplace(buf.arr)
+        return buf
 
 
 class ExportExecutor(_BaseExecutor):
@@ -541,16 +668,29 @@ class PreviewExecutor(_BaseExecutor):
                     )
                     self._prefix_lengths[_SOURCE_PREFIX_KEY] = 0
 
-        for index, op in enumerate(ops[start_index:], start=start_index + 1):
+        pos = start_index
+        while pos < len(ops):
+            op = ops[pos]
             # Cooperative cancellation (T7.3): checked at every op boundary.
             # Prefixes snapshotted so far stay cached; only the working
             # buffer (already snapshotted last stage) is recycled.
             if should_abort is not None and should_abort():
                 buf.clear()
                 raise PipelineAborted(
-                    f"preview run superseded before op {index}/{len(ops)} ({op.name})"
+                    f"preview run superseded before op {pos + 1}/{len(ops)} ({op.name})"
                 )
-            buf = self._apply_op(buf, op)
+            # Colour-tail fusion: run [exposure..srgb_out] as one GPU call.
+            # Cache keys stay per-op-list; only the post-window stage is
+            # snapshotted (mid-window prefixes never materialize, which just
+            # means a colour-param change recomputes the fused tail — the
+            # tail costs 16-99ms fused vs 0.5-1.2s on the per-op numpy path).
+            fuse_end = self._grade_fuse_end(ops, pos)
+            if fuse_end is not None:
+                buf = self._apply_op(buf, Op("grade_fused", tuple(ops[pos:fuse_end + 1])))
+                index = fuse_end + 1
+            else:
+                buf = self._apply_op(buf, op)
+                index = pos + 1
             # Snapshot the (pre-clip) op output on the GPU. Device copies are
             # cheap; the old per-op to_numpy() readbacks were the main PCIe
             # cost of a preview run.
@@ -562,6 +702,7 @@ class PreviewExecutor(_BaseExecutor):
                 old_stage.gpu.clear()
             self._prefix_cache[prefix_key] = _CachedStage(snapshot, self.last_applied_ev)
             self._prefix_lengths[prefix_key] = index
+            pos = index
 
         clip_inplace(buf.arr)
         result = PipelineResult(applied_ev=self.last_applied_ev, gpu=buf)
