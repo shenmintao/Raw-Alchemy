@@ -266,7 +266,7 @@ def test_preload_no_longer_precomputes_full_lens_correction(monkeypatch):
     def _no_gpu(path):
         raise AssertionError("preload must not run the full-res GPU demosaic")
 
-    monkeypatch.setattr(processor, "_rawpy_to_prophoto", _no_gpu)
+    monkeypatch.setattr(processor, "_decode_for_view", _no_gpu)
 
     # If preload ever calls into lens correction again, this stub records it
     # (and no real lensfun/vendored library is touched by the test).
@@ -305,7 +305,7 @@ def test_preload_cpu_decodes_full_res_without_gpu(monkeypatch):
     def _no_gpu(path):
         raise AssertionError("preload must not run the full-res GPU demosaic")
 
-    monkeypatch.setattr(processor, "_rawpy_to_prophoto", _no_gpu)
+    monkeypatch.setattr(processor, "_decode_for_view", _no_gpu)
 
     processor._do_preload(ProcessRequest("neighbor.raw", {"_preload": True}, -1))
 

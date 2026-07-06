@@ -51,6 +51,40 @@ def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
 #     楂樺厜閲嶅缓 (Segmentation Based, GPU)
 # ==========================================
 
+def _compute_hl_refavg_np(raw_data, color_map, wb_gains, raw_clips):
+    """Opposing-channel cube-root reference average (numpy/cv2).
+
+    Pixel-exact port of the retired Taichi kernel: 3x3 clamped-neighbourhood
+    per-color means == replicate-border box sums of (value*mask, mask).
+    """
+    import cv2
+
+    raw_pos = np.maximum(raw_data, 0.0).astype(np.float32, copy=False)
+    cbrt = np.zeros((3,) + raw_data.shape, dtype=np.float32)
+    for c in range(3):
+        mask = (color_map == c).astype(np.float32)
+        sums = cv2.boxFilter(raw_pos * mask, -1, (3, 3), normalize=False,
+                             borderType=cv2.BORDER_REPLICATE)
+        cnts = cv2.boxFilter(mask, -1, (3, 3), normalize=False,
+                             borderType=cv2.BORDER_REPLICATE)
+        mean = np.divide(sums, cnts, out=np.zeros_like(sums), where=cnts > 0)
+        cbrt[c] = np.cbrt(float(wb_gains[c]) * mean)
+
+    opp = np.stack([
+        0.5 * (cbrt[1] + cbrt[2]),
+        0.5 * (cbrt[0] + cbrt[2]),
+        0.5 * (cbrt[0] + cbrt[1]),
+    ])
+    opp_at = np.take_along_axis(opp, color_map[None], axis=0)[0]
+    wb_at = np.asarray(wb_gains, np.float32)[color_map]
+    refavg = opp_at ** 3
+    refavg = np.where(wb_at > 1e-6, refavg / np.maximum(wb_at, 1e-6), refavg)
+
+    clips_at = np.asarray(raw_clips, np.float32)[color_map]
+    clipped = raw_data >= clips_at
+    return refavg.astype(np.float32), clipped
+
+
 def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     """Segmentation-based highlight reconstruction.
 
@@ -58,13 +92,12 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     per-pixel opposing-channel reference average + per-segment chroma
     correction.
 
-    Implementation:
-      * ``compute_hl_refavg`` runs on GPU (Taichi).
-      * Morphology / CCL / max-filter run on CPU via OpenCV (SIMD,
-        operating on packed uint8 with SSE2/AVX2).
+    Implementation: numpy/cv2 throughout — ``_compute_hl_refavg_np`` for the
+    per-pixel opposing-channel reference (SIMD box filters), morphology /
+    CCL / max-filter via OpenCV.
     """
     import cv2
-    from raw_alchemy.math_ops import compute_hl_refavg
+    compute_hl_refavg = _compute_hl_refavg_np
 
     H, W = raw_data.shape
     pat_size = cfa_pattern.shape[0]
@@ -142,83 +175,117 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
 # ==========================================
 
 def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
-    """Decode RAW via RawSpeed (or rawpy fallback) + GPU demosaic to ProPhoto Linear float32 (H, W, 3)."""
+    """Decode RAW to working-space linear float32 (H, W, 3).
+
+    Bayer: RawSpeed (or rawpy) raw decode + RCD demosaic on the ONNX runtime
+    (GPU via DirectML/CUDA) — the Taichi port is retired; the ONNX graph is
+    pixel-exact against it.
+    X-Trans / other sensors: libraw demosaic (unit WB, linear), then this
+    app's white balance + cam->working matrix (colour-matched, ~0.16% delta).
+    """
     import rawpy
-    from raw_alchemy.demosaic import rcd_demosaic, get_dcraw_filters, get_cfa_pattern_from_filters
     from raw_alchemy.onnx.denoiser import _apply_flip
     from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
-    from rawspeedpy import try_decode, XTRANS_PATTERN
 
-    rs = try_decode(raw_path)
-
-    if rs and (rs.is_bayer or rs.is_xtrans) and rs.color_matrix is not None:
-        sensor_raw = rs.bayer.astype(np.float32)
-        bl = np.array(rs.black_levels, dtype=np.float32)
-        wl = float(rs.white_level)
-        wb = np.array(rs.wb_coeffs, dtype=np.float32)
-        xyz_to_cam = rs.color_matrix.astype(np.float64) if rs.color_matrix is not None else None
-        is_bayer = rs.is_bayer
-        is_xtrans = rs.is_xtrans
-        filters = rs.filters
-        cfa_pattern = get_cfa_pattern_from_filters(filters) if is_bayer else XTRANS_PATTERN
+    # ---- Bayer fast path: rawspeed decode + ONNX RCD ----
+    bayer_data = None
+    rs = None
+    try:
+        from rawspeedpy import try_decode
+        rs = try_decode(raw_path)
+    except ImportError:
+        pass
+    if rs and rs.is_bayer and rs.color_matrix is not None:
+        from raw_alchemy.demosaic import get_cfa_pattern_from_filters
         try:
-            import rawpy as _rp
-            with _rp.imread(raw_path) as _r:
+            with rawpy.imread(raw_path) as _r:
                 flip = _r.sizes.flip
         except Exception:
             flip = 0
+        bayer_data = (
+            rs.bayer.astype(np.float32),
+            np.array(rs.black_levels, dtype=np.float32),
+            float(rs.white_level),
+            np.array(rs.wb_coeffs, dtype=np.float32),
+            rs.color_matrix.astype(np.float64),
+            get_cfa_pattern_from_filters(rs.filters),
+            flip,
+        )
     else:
         with rawpy.imread(raw_path) as raw:
-            sensor_raw = raw.raw_image_visible.astype(np.float32)
-            bl = np.array(raw.black_level_per_channel, dtype=np.float32)
-            wl = float(raw.white_level)
-            wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-            flip = raw.sizes.flip
-            cfa_pattern = raw.raw_pattern.copy() if raw.raw_pattern is not None else None
-            xyz_to_cam = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
+            cfa = raw.raw_pattern
+            if cfa is not None and cfa.shape == (2, 2):
+                bayer_data = (
+                    raw.raw_image_visible.astype(np.float32),
+                    np.array(raw.black_level_per_channel, dtype=np.float32),
+                    float(raw.white_level),
+                    np.array(raw.camera_whitebalance, dtype=np.float32),
+                    np.array(raw.rgb_xyz_matrix, dtype=np.float64),
+                    cfa.copy(),
+                    raw.sizes.flip,
+                )
 
-        is_bayer = cfa_pattern is not None and cfa_pattern.shape == (2, 2)
-        is_xtrans = cfa_pattern is not None and cfa_pattern.shape == (6, 6)
-        filters = None
-
-    if is_bayer:
+    if bayer_data is not None:
+        from raw_alchemy.onnx.rcd_demosaic import rcd_demosaic as onnx_rcd
+        sensor_raw, bl, wl, wb, xyz_to_cam, cfa_pattern, flip = bayer_data
         raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
         fix_hot_pixels(raw_norm, cfa_pattern)
         highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
-        dcraw_filters = filters if filters else get_dcraw_filters(cfa_pattern)
-        rgb = rcd_demosaic(raw_norm, dcraw_filters)
-    elif is_xtrans:
-        xtrans_pat = cfa_pattern
-        raw_norm = subtract_black_level(sensor_raw, bl, wl, xtrans_pat)
-        fix_hot_pixels(raw_norm, xtrans_pat)
-        highlight_inpaint_opposed(raw_norm, xtrans_pat, wb)
-        from raw_alchemy.xtrans_demosaic import xtrans_markesteijn_demosaic
-        rgb = xtrans_markesteijn_demosaic(raw_norm, xtrans_pat)
-    else:
-        import rawpy as _rawpy
-        with _rawpy.imread(raw_path) as _raw:
-            rgb16 = _raw.postprocess(
-                gamma=(1, 1), no_auto_bright=True, use_camera_wb=True,
-                use_auto_wb=False, output_bps=16,
-                output_color=_rawpy.ColorSpace.ProPhoto,
-                bright=1.0, highlight_mode=2,
-            )
-        rgb = (rgb16 / 65535.0).astype(np.float32)
-        del rgb16
-        if rgb.ndim == 3 and rgb.shape[2] == 1:
-            rgb = np.repeat(rgb, 3, axis=2)
-        np.maximum(rgb, 0.0, out=rgb)
+        rgb = onnx_rcd(raw_norm, cfa_pattern)
+        rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
+        g = wb[1] if wb[1] > 0 else 1.0
+        rgb[:, :, 0] *= wb[0] / g
+        rgb[:, :, 2] *= wb[2] / g
+        m = cam_to_working_space_matrix(xyz_to_cam).astype(np.float32)
+        rgb = np.einsum('ij,hwj->hwi', m, rgb, optimize=True).astype(np.float32)
+        np.clip(rgb, 0.0, 1.0, out=rgb)
         return rgb
 
-    rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
+    # ---- X-Trans & everything else: libraw demosaic ----
+    with rawpy.imread(raw_path) as raw:
+        cfa = raw.raw_pattern
+        has_cfa = cfa is not None and cfa.shape in ((2, 2), (6, 6))
+        if not has_cfa:
+            # Foveon & friends: let libraw handle colour end-to-end.
+            rgb16 = raw.postprocess(
+                gamma=(1, 1), no_auto_bright=True, use_camera_wb=True,
+                use_auto_wb=False, output_bps=16,
+                output_color=rawpy.ColorSpace.ProPhoto,
+                bright=1.0, highlight_mode=2,
+            )
+            rgb = (rgb16 / 65535.0).astype(np.float32)
+            del rgb16
+            if rgb.ndim == 3 and rgb.shape[2] == 1:
+                rgb = np.repeat(rgb, 3, axis=2)
+            np.maximum(rgb, 0.0, out=rgb)
+            return rgb
+
+        wb = np.array(raw.camera_whitebalance, dtype=np.float32)
+        flip = raw.sizes.flip
+        xyz_to_cam = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
+        # Camera-native demosaic only: unit WB, no auto-bright, linear,
+        # unflipped — this app owns white balance, colour and orientation.
+        cam = raw.postprocess(
+            gamma=(1, 1), no_auto_bright=True,
+            user_wb=[1.0, 1.0, 1.0, 1.0], output_bps=16,
+            output_color=rawpy.ColorSpace.raw,
+            user_flip=0, half_size=False, highlight_mode=2,
+        )
+
+    rgb = cam.astype(np.float32) / 65535.0
+    del cam
+    if rgb.ndim == 2:
+        rgb = np.repeat(rgb[:, :, None], 3, axis=2)
+    elif rgb.shape[2] > 3:
+        rgb = np.ascontiguousarray(rgb[:, :, :3])
 
     g = wb[1] if wb[1] > 0 else 1.0
     rgb[:, :, 0] *= wb[0] / g
     rgb[:, :, 2] *= wb[2] / g
 
-    cam_to_working = cam_to_working_space_matrix(xyz_to_cam)
-    apply_matrix_inplace(rgb, cam_to_working)
-
+    cam_to_working = cam_to_working_space_matrix(xyz_to_cam).astype(np.float32)
+    rgb = np.einsum('ij,hwj->hwi', cam_to_working, rgb, optimize=True).astype(np.float32)
+    rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
     np.clip(rgb, 0.0, 1.0, out=rgb)
     return rgb
 

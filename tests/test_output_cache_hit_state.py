@@ -260,7 +260,7 @@ def test_cpu_preloaded_image_is_used_directly_without_gpu(monkeypatch):
     def _no_gpu(p):
         raise AssertionError("opening a preloaded image must not run the GPU demosaic")
 
-    monkeypatch.setattr(processor, "_rawpy_to_prophoto", _no_gpu)
+    monkeypatch.setattr(processor, "_decode_for_view", _no_gpu)
 
     processor._do_preload(ProcessRequest(path, {"_preload": True}, -1))
     entry = processor.cache_manager.get(path)
