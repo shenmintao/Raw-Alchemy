@@ -103,8 +103,6 @@ a = Analysis(
         ('src/raw_alchemy/locales', 'locales'),
         ('icon.ico', '.'), ('icon.png', '.'),
         ('src/raw_alchemy/math_ops.py', 'raw_alchemy'),
-        ('src/raw_alchemy/demosaic.py', 'raw_alchemy'),
-        ('src/raw_alchemy/xtrans_demosaic.py', 'raw_alchemy'),
         ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
     ],
     hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'onnx', 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'],
