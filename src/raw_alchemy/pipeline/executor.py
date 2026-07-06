@@ -370,13 +370,26 @@ class _BaseExecutor:
 
     _GRADE_MID_OPS = ("white_balance", "highlight_shadow", "sat_contrast")
 
+    @staticmethod
+    def _lut3d_cached(path):
+        """The loaded LUT when it is a 3D LUT (fusable), else None."""
+        try:
+            lut = utils.load_lut_cached(path)
+        except Exception:
+            return None
+        return lut if isinstance(lut, colour.LUT3D) else None
+
     def _grade_fuse_end(self, ops: Sequence[Op], i: int):
-        """Index of the srgb_out op ending a fusable colour tail at ops[i].
+        """End index of a fusable colour tail starting at ops[i] (exposure).
 
         Execution-time fusion only: the op list (and every cache key derived
-        from it) is untouched — the executor just runs the whole
-        [exposure, (wb|hs|sc)*, srgb_out] window as one GPU call when the
-        grade graph is available. Returns None when not fusable.
+        from it) is untouched — the executor just runs the window as one GPU
+        call when a grade graph covers it. Fusable windows:
+          A: exposure, (wb|hs|sc)*, srgb_out
+          B: exposure, (wb|hs|sc)*, log_transform[, lut(3D)]
+          C: exposure, (wb|hs|sc)*, lut(3D), srgb_out
+        Returns None when not fusable (HDR/1D-file-LUT/unknown chains run the
+        classic per-op path).
         """
         if ops[i].name != "exposure":
             return None
@@ -387,30 +400,46 @@ class _BaseExecutor:
         j = i + 1
         while j < len(ops) and ops[j].name in self._GRADE_MID_OPS:
             j += 1
-        if j < len(ops) and ops[j].name == "srgb_out":
+        if j >= len(ops):
+            return None
+        if ops[j].name == "srgb_out":
+            return j
+        if ops[j].name == "lut":
+            if self._lut3d_cached(ops[j].params[0]) is None:
+                return None
+            if j + 1 < len(ops) and ops[j + 1].name == "srgb_out":
+                return j + 1
+            return None
+        if ops[j].name == "log_transform":
+            from raw_alchemy.pipeline.log_encoding import get_log_lut
+
+            log_curve = ops[j].params[-1]
+            if get_log_lut(log_curve).size == 0:
+                return None
+            if j + 1 < len(ops) and ops[j + 1].name == "lut":
+                if self._lut3d_cached(ops[j + 1].params[0]) is None:
+                    return None
+                return j + 1
             return j
         return None
 
     def _apply_grade_fused(self, buf: GpuImage, seq: Sequence[Op]) -> GpuImage:
-        """The colour tail as one call: gain -> WB -> HL/SH -> sat/con ->
-        output matrix -> sRGB. GPU (onnx/grade.py) with a per-op numpy
-        fallback of identical math."""
+        """The colour tail as one GPU call. Window shapes (see
+        _grade_fuse_end): A ends in srgb_out, B ends in log_transform[,lut],
+        C is lut+srgb_out. On any GPU failure the window is replayed through
+        the classic per-op handlers (identical math)."""
         exposure_params = seq[0].params
-        srgb_params = seq[-1].params
-        mid = {op.name: op.params for op in seq[1:-1]}
+        mid = {op.name: op.params for op in seq[1:] if op.name in self._GRADE_MID_OPS}
+        tail = [op for op in seq[1:] if op.name not in self._GRADE_MID_OPS]
+        tail_names = [op.name for op in tail]
+
+        gain = self._resolve_exposure_gain(buf, exposure_params)
+        source_cs = utils.get_working_colourspace()
+        luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
+
         wb_params = mid.get("white_balance")
         hs_params = mid.get("highlight_shadow")
         sc_params = mid.get("sat_contrast")
-        gain = self._resolve_exposure_gain(buf, exposure_params)
-
-        working_space = srgb_params[0] if srgb_params else None
-        source_cs = (
-            colour.RGB_COLOURSPACES[working_space]
-            if working_space
-            else utils.get_working_colourspace()
-        )
-        luma = utils.get_luminance_coeffs(source_cs).astype(np.float32)
-
         if wb_params is not None:
             wb_temp, wb_tint, *wb_rest = wb_params
             mat_a = white_balance_matrix(
@@ -418,44 +447,78 @@ class _BaseExecutor:
             ).astype(np.float32)
         else:
             mat_a = np.eye(3, dtype=np.float32)
-
         highlight = float(hs_params[0]) / 100.0 if hs_params is not None else 0.0
         shadow = float(hs_params[1]) / 100.0 if hs_params is not None else 0.0
         saturation = float(sc_params[0]) if sc_params is not None else 1.0
         contrast = float(sc_params[1]) if sc_params is not None else 1.0
 
-        mat_b = colour.matrix_RGB_to_RGB(
-            source_cs, colour.RGB_COLOURSPACES["sRGB"]
-        ).astype(np.float32)
+        core = dict(
+            gain=gain, mat_a=mat_a, highlight=highlight, shadow=shadow,
+            saturation=saturation, contrast=contrast, pivot=0.18, luma=luma,
+        )
 
         from raw_alchemy.onnx import grade
 
-        if grade.is_enabled():
-            try:
+        try:
+            if tail_names == ["srgb_out"]:
+                mat_b = colour.matrix_RGB_to_RGB(
+                    source_cs, colour.RGB_COLOURSPACES["sRGB"]
+                ).astype(np.float32)
                 out = grade.apply_grade(
-                    buf.to_numpy(),
-                    gain=gain, mat_a=mat_a,
-                    highlight=highlight, shadow=shadow,
-                    saturation=saturation, contrast=contrast,
-                    pivot=0.18, luma=luma, mat_b=mat_b, srgb_encode=True,
+                    buf.to_numpy(), mat_b=mat_b, srgb_encode=True, **core
                 )
-                dst = GpuImage()
-                dst.upload(out)
-                buf.clear()
-                return dst
-            except Exception as e:
-                logger.warning(f"grade GPU path failed ({e}); numpy fallback")
+            elif tail_names == ["lut", "srgb_out"]:
+                lut = self._lut3d_cached(tail[0].params[0])
+                mat_b = colour.matrix_RGB_to_RGB(
+                    source_cs, colour.RGB_COLOURSPACES["sRGB"]
+                ).astype(np.float32)
+                out = grade.apply_grade_lut(
+                    buf.to_numpy(),
+                    lut3d_flat=lut.table.reshape(-1, 3),
+                    lut3d_size=lut.table.shape[0],
+                    d3_min=lut.domain[0], d3_max=lut.domain[1],
+                    mat_b=mat_b, **core,
+                )
+            elif tail_names[0] == "log_transform":
+                from raw_alchemy.pipeline.log_encoding import (
+                    LOG_LUT_DOMAIN_MAX, LOG_LUT_DOMAIN_MIN, get_log_lut,
+                )
 
-        # numpy fallback — the exact per-op sequence the fused graph replaces
+                lp = tail[0].params
+                log_cs_name = lp[2] if len(lp) == 4 else lp[1]
+                log_curve = lp[-1]
+                mat_log = colour.matrix_RGB_to_RGB(
+                    source_cs, colour.RGB_COLOURSPACES[log_cs_name]
+                ).astype(np.float32)
+                lut3 = (
+                    self._lut3d_cached(tail[1].params[0])
+                    if len(tail) > 1 else None
+                )
+                out = grade.apply_grade_log(
+                    buf.to_numpy(),
+                    mat_log=mat_log, lut1d=get_log_lut(log_curve),
+                    d1_min=LOG_LUT_DOMAIN_MIN, d1_max=LOG_LUT_DOMAIN_MAX,
+                    lut3d_flat=(lut3.table.reshape(-1, 3) if lut3 is not None else None),
+                    lut3d_size=(lut3.table.shape[0] if lut3 is not None else 0),
+                    d3_min=(lut3.domain[0] if lut3 is not None else None),
+                    d3_max=(lut3.domain[1] if lut3 is not None else None),
+                    **core,
+                )
+            else:
+                raise ValueError(f"unfusable window {tail_names}")
+            dst = GpuImage()
+            dst.upload(out)
+            buf.clear()
+            return dst
+        except Exception as e:
+            logger.warning(f"grade GPU path failed ({e}); per-op replay")
+
+        # Fallback: replay the window through the classic per-op handlers.
+        # _resolve_exposure_gain already ran (Auto metering must not run
+        # twice), so apply the resolved gain directly, then the rest.
         apply_gain_inplace(buf.arr, gain)
-        if wb_params is not None:
-            apply_matrix_inplace(buf.arr, mat_a)
-        if hs_params is not None:
-            apply_highlight_shadow_inplace(buf.arr, highlight, shadow, luma)
-        if sc_params is not None:
-            apply_saturation_contrast_inplace(buf.arr, saturation, contrast, 0.18, luma)
-        apply_matrix_inplace(buf.arr, mat_b)
-        linear_to_srgb_inplace(buf.arr)
+        for sub in seq[1:]:
+            buf = self._apply_op(buf, sub)
         return buf
 
 

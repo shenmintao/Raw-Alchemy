@@ -92,18 +92,6 @@ def test_full_hit_runs_nothing(fusion_on, monkeypatch):
     assert calls == []
 
 
-def test_log_and_lut_chains_stay_unfused(fusion_on, monkeypatch):
-    calls = _spy_ops(monkeypatch)
-    ops = build_op_list(_params(log_space="S-Log3"))
-    names = [op.name for op in ops]
-    assert "log_transform" in names and "srgb_out" not in names
-    try:
-        PreviewExecutor(_src()).run(ops)
-    except Exception:
-        pass  # log LUT data may be unavailable in CI; fusion gating is the point
-    assert "grade_fused" not in calls
-
-
 def test_export_path_fuses_and_matches(fusion_on, monkeypatch):
     src = _src(3)
     ops = build_op_list(_params())
@@ -124,3 +112,63 @@ def test_minimal_tail_exposure_plus_srgb_only(fusion_on, monkeypatch):
     monkeypatch.setenv("RAWALCHEMY_GRADE_GPU", "0")
     classic = PreviewExecutor(src.copy()).run(ops)
     np.testing.assert_allclose(fused, classic, atol=2e-5)
+
+
+def _write_cube(path, size=8):
+    g = np.linspace(0, 1, size, dtype=np.float32)
+    lines = [f"LUT_3D_SIZE {size}"]
+    # .cube 顺序:R 最快;colour 读入 table[r,g,b]
+    for b in g:
+        for gg in g:
+            for r in g:
+                lines.append(f"{r**1.1:.6f} {gg:.6f} {b**0.9:.6f}")
+    path.write_text("\n".join(lines))
+    return str(path)
+
+
+def test_lut3d_chain_fused_matches_classic(fusion_on, monkeypatch, tmp_path):
+    cube = _write_cube(tmp_path / "t.cube")
+    src = _src(5)
+    ops = build_op_list(_params(lut_path=cube))
+    assert [op.name for op in ops][-2:] == ["lut", "srgb_out"]
+    calls = _spy_ops(monkeypatch)
+    fused = PreviewExecutor(src.copy()).run(ops)
+    assert calls == ["grade_fused"]
+    monkeypatch.setenv("RAWALCHEMY_GRADE_GPU", "0")
+    classic = PreviewExecutor(src.copy()).run(ops)
+    np.testing.assert_allclose(fused, classic, atol=5e-5)
+
+
+def test_log_chain_fused_matches_classic(fusion_on, monkeypatch):
+    from raw_alchemy import config as cfg
+    log_space = next(iter(cfg.LOG_ENCODING_MAP)) if cfg.LOG_ENCODING_MAP else None
+    if not log_space:
+        pytest.skip("no log spaces configured")
+    src = _src(6)
+    ops = build_op_list(_params(log_space=log_space))
+    if ops[-1].name != "log_transform":
+        pytest.skip(f"log chain shape unexpected: {[o.name for o in ops]}")
+    calls = _spy_ops(monkeypatch)
+    fused = PreviewExecutor(src.copy()).run(ops)
+    if "grade_fused" not in calls:
+        pytest.skip("log curve LUT unavailable; window not fused")
+    monkeypatch.setenv("RAWALCHEMY_GRADE_GPU", "0")
+    classic = PreviewExecutor(src.copy()).run(ops)
+    np.testing.assert_allclose(fused, classic, atol=5e-5)
+
+
+def test_log_plus_lut_chain_fused_matches_classic(fusion_on, monkeypatch, tmp_path):
+    from raw_alchemy import config as cfg
+    log_space = next(iter(cfg.LOG_ENCODING_MAP)) if cfg.LOG_ENCODING_MAP else None
+    if not log_space:
+        pytest.skip("no log spaces configured")
+    cube = _write_cube(tmp_path / "t2.cube")
+    src = _src(7)
+    ops = build_op_list(_params(log_space=log_space, lut_path=cube))
+    calls = _spy_ops(monkeypatch)
+    fused = PreviewExecutor(src.copy()).run(ops)
+    if "grade_fused" not in calls:
+        pytest.skip("log curve LUT unavailable; window not fused")
+    monkeypatch.setenv("RAWALCHEMY_GRADE_GPU", "0")
+    classic = PreviewExecutor(src.copy()).run(ops)
+    np.testing.assert_allclose(fused, classic, atol=5e-5)
