@@ -807,6 +807,72 @@ def _render_packed_raw_to_prophoto(result: dict) -> np.ndarray:
     return _apply_flip(rgb, int(result["flip_code"]))
 
 
+def _read_iso_tiff_fallback(raw_path: str) -> float:
+    """Minimal TIFF/EXIF walker: read tag 0x8827 (ISOSpeedRatings) directly.
+
+    pyexiv2 hard-fails on some files instead of degrading (e.g. Sony-converted
+    DNGs raise "Directory Sony2 ... considered invalid" over a makernote it
+    cannot parse), which used to silently default the FiLM ISO condition to
+    100 and wreck the denoise output on high-ISO shots. The standard ISO tag
+    in IFD0/ExifIFD/SubIFDs is intact in those files, so walk it ourselves.
+    Returns 0.0 when the file is not TIFF-based or the tag is absent.
+    """
+    import struct
+
+    try:
+        with open(raw_path, "rb") as f:
+            data = f.read(4 * 1024 * 1024)
+        if len(data) < 8 or data[:2] not in (b"II", b"MM"):
+            return 0.0
+        bo = "<" if data[:2] == b"II" else ">"
+
+        def u16(off: int) -> int:
+            return struct.unpack_from(bo + "H", data, off)[0]
+
+        def u32(off: int) -> int:
+            return struct.unpack_from(bo + "I", data, off)[0]
+
+        visited: set[int] = set()
+
+        def walk_ifd(off: int, depth: int) -> float:
+            if off <= 0 or off + 2 > len(data) or off in visited or depth > 4:
+                return 0.0
+            visited.add(off)
+            n = u16(off)
+            if n > 4096 or off + 2 + n * 12 > len(data):
+                return 0.0
+            sub_offsets = []
+            for i in range(n):
+                e = off + 2 + i * 12
+                tag, typ, cnt = u16(e), u16(e + 2), u32(e + 4)
+                if tag == 0x8827 and typ in (3, 4) and cnt >= 1:
+                    # count>1 (multi-ISO) stores values behind an offset
+                    voff = u32(e + 8) if (cnt * (2 if typ == 3 else 4)) > 4 else e + 8
+                    if voff + 4 <= len(data):
+                        return float(u16(voff) if typ == 3 else u32(voff))
+                if tag == 0x8769:  # ExifIFD pointer
+                    sub_offsets.append(u32(e + 8))
+                if tag == 0x014A and typ == 4:  # SubIFDs
+                    base = u32(e + 8)
+                    if cnt == 1:
+                        sub_offsets.append(base)
+                    elif base + cnt * 4 <= len(data):
+                        sub_offsets.extend(u32(base + j * 4) for j in range(min(cnt, 8)))
+            for sub in sub_offsets:
+                iso = walk_ifd(sub, depth + 1)
+                if iso > 0:
+                    return iso
+            # chained next-IFD pointer (IFD1...)
+            next_off = off + 2 + n * 12
+            if next_off + 4 <= len(data):
+                return walk_ifd(u32(next_off), depth + 1)
+            return 0.0
+
+        return walk_ifd(u32(4), 0)
+    except Exception:
+        return 0.0
+
+
 def _read_iso(raw_path: str) -> float:
     """Best-effort ISO read from EXIF (rawpy on this build has no iso_speed)."""
     try:
@@ -819,6 +885,11 @@ def _read_iso(raw_path: str) -> float:
                 return float(str(iso_str).split()[0])
     except Exception:
         pass
+    iso = _read_iso_tiff_fallback(raw_path)
+    if iso > 0:
+        logger.info(f"CANS: ISO {iso:.0f} recovered via TIFF fallback (pyexiv2 failed) for {os.path.basename(raw_path)}")
+        return iso
+    logger.warning(f"CANS: ISO unreadable for {os.path.basename(raw_path)}, defaulting to 100 — denoise strength may be wrong")
     return 100.0
 
 
