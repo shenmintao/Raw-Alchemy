@@ -527,6 +527,63 @@ def _apply_highlight_guard(out_hwc: np.ndarray, in_hwc: np.ndarray, cfg: dict) -
     return np.clip(guarded, 0.0, 1.0)
 
 
+# Dark low-frequency guard: DEFAULT ON.
+# In near-black flat regions (high-ISO night sky) v14's *low-frequency* output
+# is unreliable: it lifts G ~9x while crushing B to a floor (an olive veil over
+# the sky), leaves low-frequency chroma noise blobs the tile receptive field
+# cannot resolve, and each tile settles on a slightly different DC level (a
+# visible grid once the user pushes exposure). All three are low-frequency
+# errors, so one correction fixes them: below a brightness ramp, replace the
+# output's low-frequency component with the input's. Blurring the input over
+# sigma~25 packed pixels averages thousands of samples, so it carries the true
+# local mean with negligible noise, and the per-pixel denoised detail
+# (out - blur(out)) is preserved untouched.
+# Disable with CANS_DARK_LF_GUARD=0; tune via CANS_DARK_LF_BR_LO/HI/SIGMA.
+# ---------------------------------------------------------------------------
+
+def _dark_lf_guard_config() -> dict:
+    on = os.environ.get("CANS_DARK_LF_GUARD", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+    return {
+        "enabled": on,
+        "br_lo": _env_float("CANS_DARK_LF_BR_LO", 0.004),
+        "br_hi": _env_float("CANS_DARK_LF_BR_HI", 0.02),
+        "sigma": _env_float("CANS_DARK_LF_SIGMA", 25.0),
+    }
+
+
+def _apply_dark_lf_guard(out_hwc: np.ndarray, in_hwc: np.ndarray, cfg: dict) -> np.ndarray:
+    if not cfg["enabled"]:
+        return out_hwc
+    try:
+        import cv2
+    except Exception:
+        return out_hwc
+    sigma = float(cfg["sigma"])
+    lo = float(cfg["br_lo"])
+    hi = max(float(cfg["br_hi"]), lo + 1e-6)
+    k = max(3, int(sigma * 3) | 1)
+    inp = in_hwc.astype(np.float32, copy=False)
+    out = out_hwc.astype(np.float32, copy=False)
+
+    def _blur(x: np.ndarray) -> np.ndarray:
+        if x.shape[-1] <= 4:
+            return cv2.GaussianBlur(x, (k, k), sigma)
+        return np.stack(
+            [cv2.GaussianBlur(x[..., c], (k, k), sigma) for c in range(x.shape[-1])],
+            axis=-1,
+        )
+
+    lf_in = _blur(inp)
+    lf_out = _blur(out)
+    # Gate on the *input's* low-frequency brightness: stable under noise, and
+    # rising near bright objects so their surroundings are left alone.
+    br = lf_in.mean(axis=-1, keepdims=True)
+    gate = np.clip((hi - br) / (hi - lo), 0.0, 1.0)
+    return np.clip(out + gate * (lf_in - lf_out), 0.0, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
@@ -715,12 +772,19 @@ def _tile_weight(
     at_left: bool,
     at_right: bool,
 ) -> np.ndarray:
-    """Linear feathering window that keeps outer image borders at weight 1."""
+    """Feathering window that keeps outer image borders at weight 1.
+
+    Raised-cosine ramp starting at ~0: a tile must enter with (near-)zero
+    weight, otherwise its first covered column jumps straight to a finite
+    weight and any DC disagreement between neighbouring tiles prints a sharp
+    seam line across flat sky (visible once exposure is pushed).
+    """
     feather = max(0, min(overlap, h // 2, w // 2))
     wy = np.ones(h, dtype=np.float32)
     wx = np.ones(w, dtype=np.float32)
     if feather > 0:
-        ramp = np.linspace(1.0 / (feather + 1), 1.0, feather, dtype=np.float32)
+        i = np.arange(1, feather + 1, dtype=np.float32)
+        ramp = (0.5 - 0.5 * np.cos(np.pi * i / (feather + 1))).astype(np.float32)
         if not at_top:
             wy[:feather] = ramp
         if not at_bottom:
@@ -1023,6 +1087,7 @@ def denoise_raw_packed(
     packed_chw = np.ascontiguousarray(packed.transpose(2, 0, 1), dtype=np.float16)
     guard_cfg = _output_guard_config()
     highlight_cfg = _highlight_guard_config()
+    dark_lf_cfg = _dark_lf_guard_config()
 
     step = tile_size - tile_overlap
     ys = list(range(0, max(pack_h - tile_size, 0) + 1, step))
@@ -1053,6 +1118,7 @@ def denoise_raw_packed(
         packed_out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32)
         packed_out = _apply_output_guards(packed_out, packed_input, guard_cfg)
         packed_out = _apply_highlight_guard(packed_out, packed_input, highlight_cfg)
+        packed_out = _apply_dark_lf_guard(packed_out, packed_input, dark_lf_cfg)
         return {
             "packed": np.clip(packed_out, 0.0, 1.0).astype(np.float32),
             "sensor": sensor,
@@ -1129,6 +1195,7 @@ def denoise_raw_packed(
     packed_out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32)
     packed_out = _apply_output_guards(packed_out, packed_input, guard_cfg)
     packed_out = _apply_highlight_guard(packed_out, packed_input, highlight_cfg)
+    packed_out = _apply_dark_lf_guard(packed_out, packed_input, dark_lf_cfg)
     return {
         "packed": np.clip(packed_out, 0.0, 1.0).astype(np.float32),
         "sensor": sensor,
