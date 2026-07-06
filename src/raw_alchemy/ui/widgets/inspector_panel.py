@@ -776,7 +776,7 @@ class InspectorPanel(ScrollArea):
         if not DENOISE_UI_ENABLED:
             return False
         try:
-            from raw_alchemy.onnx.denoiser import is_available
+            from raw_alchemy.onnx.rgb_denoiser import is_available
 
             return is_available()
         except Exception:

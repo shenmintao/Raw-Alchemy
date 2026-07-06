@@ -362,7 +362,7 @@ def test_image_processor_denoise_toggle_has_no_residual_state(monkeypatch):
     denoised = np.full((8, 8, 3), 0.36, dtype=np.float32)
     path = "synthetic.raw"
 
-    monkeypatch.setattr(processor_module, "denoise_raw", lambda *args, **kwargs: denoised.copy())
+    monkeypatch.setattr(processor_module, "denoise_rgb_linear", lambda *args, **kwargs: denoised.copy())
     monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: None)
 
     processor = ImageProcessor()

@@ -165,7 +165,7 @@
     "denoise_strength": "降噪强度",
     "denoise_on": "AI 降噪: 开启",
     "denoise_off": "AI 降噪: 关闭",
-    "denoise_info": "CANS RAW V2 降噪器 — 开启时替代传统去马赛克。",
+    "denoise_info": "SCUNet 深度降噪 — 在去马赛克后的线性图像上运行,GPU 加速。",
     "denoising": "正在降噪...",
     "denoise_progress": "降噪进度: {current}/{total}",
     "denoise_done_processing": "降噪完成，正在处理管线...",

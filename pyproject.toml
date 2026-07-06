@@ -35,7 +35,10 @@ dependencies = [
     "pyexiv2",
     "psutil",
     "rawspeedpy @ git+https://github.com/shenmintao/rawspeedpy.git@b3eff714300da7092864a3c35179d31baf97f799",
-    "onnxruntime-gpu; sys_platform != 'darwin'",
+    # Windows: DirectML build so AMD/Intel GPUs accelerate ONNX (CUDA-only
+    # onnxruntime-gpu left AMD cards on CPU). Linux keeps the CUDA build.
+    "onnxruntime-directml; sys_platform == 'win32'",
+    "onnxruntime-gpu; sys_platform == 'linux'",
     "onnxruntime; sys_platform == 'darwin'",
 ]
 

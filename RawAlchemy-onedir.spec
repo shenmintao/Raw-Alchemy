@@ -95,13 +95,10 @@ taichi_binaries = [(src, dst) for src, dst in taichi_binaries
                    if not any(ex in src for ex in _taichi_exclude)]
 
 # Determine ONNX Runtime package based on platform
-ort_package = 'onnxruntime' # Default fallback
-if sys.platform == 'win32' or sys.platform.startswith('linux'):
-    ort_package = 'onnxruntime-gpu'
-elif sys.platform == 'darwin':
-    ort_package = 'onnxruntime'
-
-print(f"Using ONNX Runtime package: {ort_package}")
+# The import name is 'onnxruntime' for every distribution variant
+# (onnxruntime-directml on Windows, onnxruntime-gpu on Linux, onnxruntime on
+# macOS) -- pip decides which package is installed via pyproject markers.
+ort_package = 'onnxruntime'
 
 
 

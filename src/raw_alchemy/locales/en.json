@@ -165,7 +165,7 @@
     "denoise_strength": "Denoise Strength",
     "denoise_on": "AI Denoise: ON",
     "denoise_off": "AI Denoise: OFF",
-    "denoise_info": "CANS RAW V2 denoiser — replaces demosaicing when enabled.",
+    "denoise_info": "SCUNet deep denoiser — runs on the demosaiced linear image, GPU accelerated.",
     "denoising": "Denoising...",
     "denoise_progress": "Denoise progress: {current}/{total}",
     "denoise_done_processing": "Denoise complete, applying pipeline...",

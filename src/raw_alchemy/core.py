@@ -8,7 +8,7 @@ from raw_alchemy import utils
 from raw_alchemy.logger import create_logger
 from raw_alchemy.file_io import save_image
 from raw_alchemy import config, metering
-from raw_alchemy.onnx.denoiser import denoise_raw
+from raw_alchemy.onnx.rgb_denoiser import denoise_rgb_linear
 from raw_alchemy.math_ops import apply_matrix_inplace, init_taichi
 from raw_alchemy.pipeline.executor import ExportExecutor
 from raw_alchemy.pipeline.ops import build_op_list
@@ -351,16 +351,14 @@ def process_image(
 
     exif_data, exif_metadata = extract_lens_exif(raw_path, None)
 
+    logger.info("  [Step 1] Decoding RAW (rawpy + RCD)...")
+    img = _rawpy_decode_to_prophoto(raw_path)
     if denoise_enabled:
-        logger.info("  [Step 1] CANS RAW V2 denoise + demosaic...")
+        logger.info("  [Step 1b] SCUNet RGB denoise...")
         try:
-            img = denoise_raw(raw_path, exposure_ratio=1.0)
+            img = denoise_rgb_linear(img)
         except Exception as e:
-            logger.error(f"  CANS denoise failed, falling back to rawpy+RCD: {e}")
-            img = _rawpy_decode_to_prophoto(raw_path)
-    else:
-        logger.info("  [Step 1] Decoding RAW (rawpy + RCD)...")
-        img = _rawpy_decode_to_prophoto(raw_path)
+            logger.error(f"  SCUNet denoise failed, continuing without denoise: {e}")
 
     lens_state = {"corrected": img}
 

@@ -32,7 +32,7 @@ from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
 from raw_alchemy.pipeline.executor import PipelineAborted, PreviewExecutor
 from raw_alchemy.pipeline.ops import Op, _as_hashable, build_op_list
 from raw_alchemy.gpu_buffer import GpuImage, acquire_ndarray, gpu_pool, release_ndarray
-from raw_alchemy.onnx.denoiser import denoise_raw, clear_session as denoise_clear_session
+from raw_alchemy.onnx.rgb_denoiser import denoise_rgb_linear, clear_session as denoise_clear_session
 
 
 PROXY_TARGET_PIXELS = 3_000_000
@@ -1098,14 +1098,13 @@ class ImageProcessor(QThread):
         if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
             try:
                 self.denoise_started.emit()
-                logger.info("[Worker] CANS RAW V2 denoise (replaces demosaicing)...")
+                logger.info("[Worker] SCUNet RGB denoise (post-demosaic)...")
 
                 def progress_cb(cur, total):
                     self.denoise_progress.emit(cur, total)
 
-                denoised = denoise_raw(
-                    path,
-                    exposure_ratio=1.0,
+                denoised = denoise_rgb_linear(
+                    src,
                     progress_callback=progress_cb,
                 )
 

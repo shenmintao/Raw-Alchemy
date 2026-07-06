@@ -154,11 +154,11 @@ def test_hit_after_denoise_roundtrip_never_serves_undenoised_export(monkeypatch)
 
     denoise_calls = []
 
-    def fake_denoise_raw(p, exposure_ratio=1.0, progress_callback=None):
-        denoise_calls.append(p)
+    def fake_denoise_rgb(src, progress_callback=None):
+        denoise_calls.append(src.shape)
         return denoised.copy()
 
-    monkeypatch.setattr(processor_module, "denoise_raw", fake_denoise_raw)
+    monkeypatch.setattr(processor_module, "denoise_rgb_linear", fake_denoise_rgb)
     monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: None)
 
     processor = _make_processor(path, source)
