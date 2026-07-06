@@ -130,6 +130,7 @@ class ImageProcessor(QThread):
         # Denoising Cache
         self.cached_denoise_original = None
         self.cached_denoise_full = None
+        self.cached_denoise_proxy = None
         self.last_denoise_key = None
 
         self._should_stop = False
@@ -1021,7 +1022,13 @@ class ImageProcessor(QThread):
         if self.cpu_proxy_linear is None:
             return False
         if params.get('denoise_enabled', False):
-            return False
+            # Proxy is only usable once the full denoised image is cached for
+            # THIS file — _executor_denoise then serves a downscale of it.
+            # Before that, the full pass must run (and it must run on the
+            # full-res source, not the proxy).
+            key = (self.current_path, 'denoise')
+            if key != self.last_denoise_key or self.cached_denoise_full is None:
+                return False
         if not params.get('viewport_size'):
             return False
         zoom = float(params.get('preview_zoom', 1.0) or 1.0)
@@ -1095,6 +1102,21 @@ class ImageProcessor(QThread):
             return src
 
         denoise_cache_key = (path, 'denoise')
+
+        # Proxy-mode preview: never denoise the proxy itself (different pixels
+        # than the full pass) — serve a downscale of the cached full result.
+        # _should_use_proxy_preview only allows proxy when that cache exists.
+        if self._executor_using_proxy:
+            if (
+                denoise_cache_key == self.last_denoise_key
+                and self.cached_denoise_full is not None
+            ):
+                if self.cached_denoise_proxy is None:
+                    self.cached_denoise_proxy = self._make_proxy(self.cached_denoise_full)
+                if self.cached_denoise_proxy is not None:
+                    return np.ascontiguousarray(self.cached_denoise_proxy)
+            return src
+
         if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
             try:
                 self.denoise_started.emit()
@@ -1110,16 +1132,21 @@ class ImageProcessor(QThread):
 
                 self.cached_denoise_original = self.cpu_linear
                 self.cached_denoise_full = denoised
+                self.cached_denoise_proxy = None
                 self.last_denoise_key = denoise_cache_key
-                denoise_clear_session()
                 self.denoise_finished.emit()
             except Exception as e:
                 logger.error(f"[Worker] Denoising failed: {e}")
                 self.denoise_finished.emit()
                 self.cached_denoise_original = None
                 self.cached_denoise_full = None
+                self.cached_denoise_proxy = None
                 self.last_denoise_key = None
                 return src
+            finally:
+                # Always drop the ONNX session: on DirectML it pins hundreds
+                # of MB of VRAM that the interactive preview renderer needs.
+                denoise_clear_session()
 
         denoised = np.ascontiguousarray(self.cached_denoise_full)
         if not self._executor_params.get('lens_correct', False):
@@ -1251,11 +1278,24 @@ class ImageProcessor(QThread):
         if not denoise_enabled and self.last_denoise_key is not None:
             self.cached_denoise_original = None
             self.cached_denoise_full = None
+            self.cached_denoise_proxy = None
             self.last_denoise_key = None
 
         if not params.get('lens_correct', False):
             if denoise_enabled and self.cached_denoise_full is not None:
-                corrected_source = np.ascontiguousarray(self.cached_denoise_full)
+                if self._executor_using_proxy:
+                    # Proxy pipeline must stay at proxy resolution: feeding it
+                    # the full-res denoised image silently turns every
+                    # interactive render into a 40MP pass (laggy zoom).
+                    if self.cached_denoise_proxy is None:
+                        self.cached_denoise_proxy = self._make_proxy(self.cached_denoise_full)
+                    corrected_source = (
+                        np.ascontiguousarray(self.cached_denoise_proxy)
+                        if self.cached_denoise_proxy is not None
+                        else np.ascontiguousarray(self.cached_denoise_full)
+                    )
+                else:
+                    corrected_source = np.ascontiguousarray(self.cached_denoise_full)
             else:
                 corrected_source = self._select_executor_source(self._executor_using_proxy)
             next_lens_key = (

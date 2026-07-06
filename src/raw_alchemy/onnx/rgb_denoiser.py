@@ -161,7 +161,14 @@ def warmup() -> None:
 
 
 def clear_session() -> None:
-    """Release the ONNX session (frees GPU memory between edits)."""
+    """Release the ONNX session (frees GPU memory between edits).
+
+    The DirectML provider holds its D3D12 allocations until the session
+    object is actually destroyed, so collect immediately — pybind objects
+    routinely sit in reference cycles that plain refcounting won't clear.
+    """
     global _session, _session_provider
     _session = None
     _session_provider = None
+    import gc
+    gc.collect()
