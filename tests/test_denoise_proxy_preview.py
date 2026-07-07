@@ -29,6 +29,8 @@ def _processor(path="img.raw"):
     p.cached_denoise_full = None
     p.cached_denoise_proxy = None
     p.last_denoise_key = None
+    p.last_denoise_proxy_key = None
+    p._executor_params = {}
     p._executor_using_proxy = False
     p._executor_path = path
     p._executor_corrected_source = None
@@ -51,19 +53,45 @@ def _preview_params(**over):
     return params
 
 
-def test_proxy_preview_blocked_until_denoise_cached():
+def test_proxy_preview_always_allowed_with_denoise():
+    """分层降噪:代理路径不再等待全图降噪(代理级 ~3s 自己出图)。"""
     p = _processor()
-    assert p._should_use_proxy_preview(_preview_params()) is False
-
-
-def test_proxy_preview_allowed_once_denoise_cached():
-    p = _processor()
+    assert p._should_use_proxy_preview(_preview_params()) is True
     p.cached_denoise_full = np.full(FULL, 0.1, np.float32)
     p.last_denoise_key = (p.current_path, "denoise")
     assert p._should_use_proxy_preview(_preview_params()) is True
-    # ...but not for a different file's cache
-    p.last_denoise_key = ("other.raw", "denoise")
-    assert p._should_use_proxy_preview(_preview_params()) is False
+
+
+def test_proxy_tier_denoises_proxy_and_caches(monkeypatch):
+    """无全图缓存时,代理模式直接对代理降噪并缓存复用。"""
+    p = _processor()
+    p._executor_using_proxy = True
+    calls = []
+
+    def fake_denoise(src, progress_callback=None):
+        calls.append(src.shape)
+        return (src * 0.5).astype(np.float32)
+
+    monkeypatch.setattr(processor_module, "denoise_rgb_linear", fake_denoise)
+    monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: None)
+
+    class _Sig:
+        def emit(self, *a):
+            pass
+
+    p.denoise_started = p.denoise_progress = p.denoise_finished = _Sig()
+    out1 = p._executor_denoise(p.cpu_proxy_linear)
+    assert calls == [p.cpu_proxy_linear.shape]  # 在代理分辨率上跑
+    np.testing.assert_allclose(out1, p.cpu_proxy_linear * 0.5, atol=1e-6)
+    out2 = p._executor_denoise(p.cpu_proxy_linear)
+    assert calls == [p.cpu_proxy_linear.shape]  # 第二次命中缓存,不重跑
+    np.testing.assert_array_equal(out2, out1)
+    # 全图缓存落地后,代理改用其降采样(精确结果替换近似)
+    p.cached_denoise_full = np.full(FULL, 0.25, np.float32)
+    p.last_denoise_key = (p.current_path, "denoise")
+    p.cached_denoise_proxy = None
+    out3 = p._executor_denoise(p.cpu_proxy_linear)
+    assert abs(float(out3.mean()) - 0.25) < 1e-3
 
 
 def test_executor_denoise_serves_proxy_scale_in_proxy_mode():

@@ -129,6 +129,9 @@ class ImageProcessor(QThread):
         self.cached_denoise_full = None
         self.cached_denoise_proxy = None
         self.last_denoise_key = None
+        # Fast tier: proxy-resolution denoise (~3s) shown while the full-res
+        # pass (~40s, abortable, idle-scheduled) hasn't landed yet.
+        self.last_denoise_proxy_key = None
 
         self._should_stop = False
         self._gpu_uint8 = None      # Pre-allocated pooled uint8 output buffer
@@ -904,14 +907,10 @@ class ImageProcessor(QThread):
             return False
         if self.cpu_proxy_linear is None:
             return False
-        if params.get('denoise_enabled', False):
-            # Proxy is only usable once the full denoised image is cached for
-            # THIS file — _executor_denoise then serves a downscale of it.
-            # Before that, the full pass must run (and it must run on the
-            # full-res source, not the proxy).
-            key = (self.current_path, 'denoise')
-            if key != self.last_denoise_key or self.cached_denoise_full is None:
-                return False
+        # denoise on: proxy stays usable — _executor_denoise serves the
+        # downscaled full result when cached, else the fast proxy-tier
+        # denoise (~3s) so opening a saved denoise=ON photo never blocks
+        # on the ~40s full pass.
         if not params.get('viewport_size'):
             return False
         zoom = float(params.get('preview_zoom', 1.0) or 1.0)
@@ -986,9 +985,10 @@ class ImageProcessor(QThread):
 
         denoise_cache_key = (path, 'denoise')
 
-        # Proxy-mode preview: never denoise the proxy itself (different pixels
-        # than the full pass) — serve a downscale of the cached full result.
-        # _should_use_proxy_preview only allows proxy when that cache exists.
+        # Proxy-mode preview. With the full result cached, serve its
+        # downscale; otherwise denoise the proxy itself (~3s) as the fast
+        # tier — the full pass runs later (idle refine / export) and its
+        # arrival flips the op tier, re-rendering from the exact result.
         if self._executor_using_proxy:
             if (
                 denoise_cache_key == self.last_denoise_key
@@ -998,15 +998,47 @@ class ImageProcessor(QThread):
                     self.cached_denoise_proxy = self._make_proxy(self.cached_denoise_full)
                 if self.cached_denoise_proxy is not None:
                     return np.ascontiguousarray(self.cached_denoise_proxy)
-            return src
+            proxy_key = (path, 'denoise-proxy')
+            if (
+                proxy_key == self.last_denoise_proxy_key
+                and self.cached_denoise_proxy is not None
+            ):
+                return np.ascontiguousarray(self.cached_denoise_proxy)
+            try:
+                self.denoise_started.emit()
+                logger.info("[Worker] SCUNet proxy-tier denoise (fast preview)...")
+
+                def progress_cb(cur, total):
+                    self.denoise_progress.emit(cur, total)
+
+                denoised = denoise_rgb_linear(src, progress_callback=progress_cb)
+                self.cached_denoise_proxy = denoised
+                self.last_denoise_proxy_key = proxy_key
+                self.denoise_finished.emit()
+                return np.ascontiguousarray(denoised)
+            except Exception as e:
+                logger.error(f"[Worker] Proxy denoise failed: {e}")
+                self.denoise_finished.emit()
+                return src
+            finally:
+                denoise_clear_session()
 
         if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
             try:
                 self.denoise_started.emit()
                 logger.info("[Worker] SCUNet RGB denoise (post-demosaic)...")
 
+                abortable = bool(self._executor_params.get('_denoise_abortable'))
+
                 def progress_cb(cur, total):
                     self.denoise_progress.emit(cur, total)
+                    if abortable:
+                        with self.lock:
+                            superseded = self.pending_request is not None
+                        if superseded:
+                            raise PipelineAborted(
+                                f"full denoise superseded at tile {cur}/{total}"
+                            )
 
                 denoised = denoise_rgb_linear(
                     src,
@@ -1018,6 +1050,9 @@ class ImageProcessor(QThread):
                 self.cached_denoise_proxy = None
                 self.last_denoise_key = denoise_cache_key
                 self.denoise_finished.emit()
+            except PipelineAborted:
+                self.denoise_finished.emit()
+                raise
             except Exception as e:
                 logger.error(f"[Worker] Denoising failed: {e}")
                 self.denoise_finished.emit()
@@ -1158,11 +1193,15 @@ class ImageProcessor(QThread):
     def _prepare_executor_source_state(self, params: ProcessorParams):
         self._executor_corrected_source = None
         denoise_enabled = params.get('denoise_enabled', False)
-        if not denoise_enabled and self.last_denoise_key is not None:
+        if not denoise_enabled and (
+            self.last_denoise_key is not None
+            or self.last_denoise_proxy_key is not None
+        ):
             self.cached_denoise_original = None
             self.cached_denoise_full = None
             self.cached_denoise_proxy = None
             self.last_denoise_key = None
+            self.last_denoise_proxy_key = None
 
         if not params.get('lens_correct', False):
             if denoise_enabled and self.cached_denoise_full is not None:
@@ -1318,6 +1357,16 @@ class ImageProcessor(QThread):
                     return
 
             params = request.params.copy()
+            if params.get('denoise_enabled', False):
+                full_ready = (
+                    (request.path, 'denoise') == self.last_denoise_key
+                    and self.cached_denoise_full is not None
+                )
+                # tier 进入 op 参数与输出键:full 结果落地后键位翻转,
+                # 代理级降噪的旧输出自然作废并重渲染
+                params['_denoise_tier'] = 'full' if full_ready else 'proxy'
+                # 预览请求中的全图降噪按 tile 让路给新交互(空闲精化重试)
+                params['_denoise_abortable'] = True
             use_proxy = self._should_use_proxy_preview(params)
             preview_source = 'proxy' if use_proxy else 'full'
             params['_preview_source'] = preview_source
