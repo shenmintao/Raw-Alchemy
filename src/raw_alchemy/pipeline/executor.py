@@ -3,6 +3,7 @@ from collections.abc import Callable, Sequence
 
 import colour
 import numpy as np
+from loguru import logger
 
 from raw_alchemy import metering, utils
 from raw_alchemy.gpu_buffer import GpuImage
@@ -527,7 +528,7 @@ class _BaseExecutor:
             buf.clear()
             return dst
         except Exception as e:
-            logger.warning(f"grade GPU path failed ({e}); per-op replay")
+            logger.warning(f"grade GPU path failed ({type(e).__name__}: {e}); per-op replay")
 
         # Fallback: replay the window through the classic per-op handlers.
         # _resolve_exposure_gain already ran (Auto metering must not run

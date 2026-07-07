@@ -99,7 +99,10 @@ def _get_session():
         model_path = _find_model(MODEL_FILE)
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        providers = _get_providers()
+        if _cpu_fallback:
+            providers = ["CPUExecutionProvider"]
+        else:
+            providers = _get_providers()
         provider_options = [
             ({"device_id": 0} if p in ("CUDAExecutionProvider", "DmlExecutionProvider") else {})
             for p in providers
@@ -120,6 +123,22 @@ def clear_session() -> None:
         _session_provider = None
     import gc
     gc.collect()
+
+
+_cpu_fallback = False
+
+
+def _run_graph(session, feeds):
+    global _cpu_fallback
+    try:
+        return session.run(None, feeds)[0]
+    except Exception as e:
+        logger.warning(
+            f"X-Trans tile failed on {_session_provider} "
+            f"({type(e).__name__}: {str(e)[:80]}); rebuilding on CPU EP")
+        _cpu_fallback = True
+        clear_session()
+        return _get_session().run(None, feeds)[0]
 
 
 def _canonical_roll(pattern: np.ndarray):
@@ -184,7 +203,7 @@ def _demosaic_tiled(session, raw: np.ndarray) -> np.ndarray:
     if H <= TILE and W <= TILE:
         ph, pw = TILE - H, TILE - W
         patch = np.pad(raw, ((0, ph), (0, pw)), mode="reflect") if (ph or pw) else raw
-        rgb = session.run(None, {"raw": patch, "masks": _masks})[0]
+        rgb = _run_graph(session, {"raw": patch, "masks": _masks})
         return rgb[:H, :W]
 
     out = np.zeros((H, W, 3), np.float32)
@@ -201,7 +220,7 @@ def _demosaic_tiled(session, raw: np.ndarray) -> np.ndarray:
             th, tw = patch.shape
             if th < TILE or tw < TILE:
                 patch = np.pad(patch, ((0, TILE - th), (0, TILE - tw)), mode="reflect")
-            rgb = session.run(None, {"raw": np.ascontiguousarray(patch), "masks": _masks})[0]
+            rgb = _run_graph(session, {"raw": np.ascontiguousarray(patch), "masks": _masks})
             iy0, ix0 = y, x
             iy1, ix1 = min(H, y + step), min(W, x + step)
             out[iy0:iy1, ix0:ix1] = rgb[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0]

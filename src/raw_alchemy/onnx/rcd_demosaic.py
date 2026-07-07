@@ -62,7 +62,10 @@ def _get_session():
             logger.warning(f"RCD: tile-dim freeze unavailable ({e}); dynamic graph")
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        providers = _get_providers()
+        if _cpu_fallback:
+            providers = ["CPUExecutionProvider"]
+        else:
+            providers = _get_providers()
         provider_options = [
             ({"device_id": 0} if p in ("CUDAExecutionProvider", "DmlExecutionProvider") else {})
             for p in providers
@@ -98,12 +101,27 @@ def _phase_masks(cfa_pattern: np.ndarray) -> np.ndarray:
     return m2
 
 
+_cpu_fallback = False
+
+
 def _run_tile(session, patch: np.ndarray, m2: np.ndarray) -> np.ndarray:
+    global _cpu_fallback
     feeds = {
         "bayer": np.ascontiguousarray(patch, dtype=np.float32),
         "mr2": m2[0], "mg2": m2[1], "mb2": m2[2],
     }
-    return session.run(None, feeds)[0]
+    try:
+        return session.run(None, feeds)[0]
+    except Exception as e:
+        # DML 运行时故障(常见:显存耗尽;Windows 本地化错误文本还会被
+        # pybind 以 utf-8 解码炸成 UnicodeDecodeError,掩盖真实原因)。
+        # 重建 CPU-EP 会话兜底:慢,但绝不让解码整体失败。
+        logger.warning(
+            f"RCD tile failed on {_session_provider} "
+            f"({type(e).__name__}: {str(e)[:80]}); rebuilding on CPU EP")
+        _cpu_fallback = True
+        clear_session()
+        return _get_session().run(None, feeds)[0]
 
 
 def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray) -> np.ndarray:
