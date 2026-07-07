@@ -165,7 +165,7 @@
     "denoise_strength": "Denoise Strength",
     "denoise_on": "AI Denoise: ON",
     "denoise_off": "AI Denoise: OFF",
-    "denoise_info": "SCUNet deep denoiser — runs on the demosaiced linear image, GPU accelerated.",
+    "denoise_info": "FastDenoise v4 — runs once on the demosaiced linear image and is cached; adjustable strength (default 0.25).",
     "denoising": "Denoising...",
     "denoise_progress": "Denoise progress: {current}/{total}",
     "denoise_done_processing": "Denoise complete, applying pipeline...",

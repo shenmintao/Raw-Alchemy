@@ -60,7 +60,7 @@ def test_proxy_preview_always_allowed_with_denoise():
     p = _processor()
     assert p._should_use_proxy_preview(_preview_params()) is True
     p.cached_denoise_full = np.full(FULL, 0.1, np.float32)
-    p.last_denoise_key = (p.current_path, "denoise")
+    p.last_denoise_key = (p.current_path, "denoise", 0.25)
     assert p._should_use_proxy_preview(_preview_params()) is True
 
 
@@ -71,7 +71,7 @@ def test_denoise_runs_once_at_native_then_all_views_derive(monkeypatch, tmp_path
     p = _processor()
     calls = []
 
-    def fake_denoise(src, progress_callback=None):
+    def fake_denoise(src, strength=0.25, progress_callback=None):
         calls.append(src.shape)
         return (src * 0.5).astype(np.float32)
 
@@ -107,7 +107,7 @@ def test_denoise_survives_restart_via_disk_cache(monkeypatch, tmp_path):
     raw.write_bytes(b"raw bytes")
     calls = []
 
-    def fake_denoise(src, progress_callback=None):
+    def fake_denoise(src, strength=0.25, progress_callback=None):
         calls.append(1)
         return (src * 0.5).astype(np.float32)
 
@@ -135,7 +135,7 @@ def test_denoise_survives_restart_via_disk_cache(monkeypatch, tmp_path):
 def test_executor_denoise_serves_proxy_scale_in_proxy_mode():
     p = _processor()
     p.cached_denoise_full = np.full(FULL, 0.1, np.float32)
-    p.last_denoise_key = (p.current_path, "denoise")
+    p.last_denoise_key = (p.current_path, "denoise", 0.25)
     p._executor_using_proxy = True
     out = p._executor_denoise(p.cpu_proxy_linear)
     # a downscale of the denoised full image — proxy-sized, denoised values
@@ -148,7 +148,7 @@ def test_executor_denoise_serves_proxy_scale_in_proxy_mode():
 def test_prepare_source_state_keeps_proxy_resolution():
     p = _processor()
     p.cached_denoise_full = np.full(FULL, 0.1, np.float32)
-    p.last_denoise_key = (p.current_path, "denoise")
+    p.last_denoise_key = (p.current_path, "denoise", 0.25)
     p._executor_using_proxy = True
     p._prepare_executor_source_state(_preview_params())
     assert p.cpu_proxy_corrected is not None
@@ -156,7 +156,7 @@ def test_prepare_source_state_keeps_proxy_resolution():
     # full mode still seeds the full-res corrected cache
     p2 = _processor()
     p2.cached_denoise_full = np.full(FULL, 0.1, np.float32)
-    p2.last_denoise_key = (p2.current_path, "denoise")
+    p2.last_denoise_key = (p2.current_path, "denoise", 0.25)
     p2._executor_using_proxy = False
     p2._prepare_executor_source_state(_preview_params())
     assert p2.cpu_corrected.shape == FULL

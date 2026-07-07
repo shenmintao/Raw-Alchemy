@@ -428,6 +428,7 @@ def process_image(
     crop: Optional[tuple] = None,
     # Denoising
     denoise_enabled: bool = False,
+    denoise_strength: float = 0.25,
     # Sharpening (Richardson-Lucy)
     sharpen_strength: float = 0.0,
     # HDR output
@@ -448,11 +449,11 @@ def process_image(
     logger.info("  [Step 1] Decoding RAW (rawpy + RCD)...")
     img = _rawpy_decode_to_prophoto(raw_path)
     if denoise_enabled:
-        logger.info("  [Step 1b] SCUNet RGB denoise...")
+        logger.info(f"  [Step 1b] FastDenoise v4 (s={denoise_strength:.2f})...")
         try:
-            img = denoise_rgb_linear(img)
+            img = denoise_rgb_linear(img, strength=denoise_strength)
         except Exception as e:
-            logger.error(f"  SCUNet denoise failed, continuing without denoise: {e}")
+            logger.error(f"  FastDenoise failed, continuing without denoise: {e}")
 
     lens_state = {"corrected": img}
 

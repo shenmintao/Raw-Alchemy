@@ -154,7 +154,7 @@ def test_hit_after_denoise_roundtrip_never_serves_undenoised_export(monkeypatch)
 
     denoise_calls = []
 
-    def fake_denoise_rgb(src, progress_callback=None):
+    def fake_denoise_rgb(src, strength=0.25, progress_callback=None):
         denoise_calls.append(src.shape)
         return denoised.copy()
 

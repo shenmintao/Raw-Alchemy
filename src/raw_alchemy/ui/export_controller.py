@@ -273,6 +273,7 @@ class ExportControllerMixin:
             "perspective_corners": _perspective_corners,
             "crop": p.get("crop", (0.0, 0.0, 1.0, 1.0)),
             "denoise_enabled": p.get("denoise_enabled", False),
+            "denoise_strength": p.get("denoise_strength", 0.25),
             "sharpen_strength": p.get("sharpen_strength", 0.0),
         }
         self.processor.export_path(input_path, export_payload)

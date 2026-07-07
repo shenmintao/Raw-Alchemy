@@ -312,6 +312,35 @@ class InspectorPanel(ScrollArea):
         self._update_denoise_switch_text()
         denoise_layout.addWidget(self.denoise_switch)
 
+        # Denoise strength (FastDenoise sigma conditioning)
+        dn_header_layout = QHBoxLayout()
+        self.denoise_strength_label = BodyLabel(f"{tr('denoise_strength')}: 0.25")
+
+        self.denoise_strength_revert_btn = ToolButton(FIF.HISTORY)
+        self.denoise_strength_revert_btn.setFixedSize(24, 24)
+        self.denoise_strength_revert_btn.setToolTip(tr('revert_to_baseline_or_default'))
+        self.denoise_strength_revert_btn.clicked.connect(self._revert_denoise_strength)
+
+        dn_header_layout.addWidget(self.denoise_strength_label)
+        dn_header_layout.addStretch()
+        dn_header_layout.addWidget(self.denoise_strength_revert_btn)
+
+        self.denoise_strength_slider = NoWheelSlider(Qt.Orientation.Horizontal)
+        self.denoise_strength_slider.setRange(5, 60)
+        self.denoise_strength_slider.setValue(25)
+        self.denoise_strength_slider.sliderPressed.connect(self._on_param_interaction_started)
+        self.denoise_strength_slider.sliderReleased.connect(self._on_param_interaction_finished)
+
+        def update_denoise_strength_label(val):
+            self.denoise_strength_label.setText(f"{tr('denoise_strength')}: {val / 100.0:.2f}")
+            self._on_param_change()
+
+        self.denoise_strength_slider.valueChanged.connect(update_denoise_strength_label)
+        dn_strength_row = QVBoxLayout()
+        dn_strength_row.addLayout(dn_header_layout)
+        dn_strength_row.addWidget(self.denoise_strength_slider)
+        denoise_layout.addLayout(dn_strength_row)
+
         self.denoise_info_label = BodyLabel(tr('denoise_info'))
         self.denoise_info_label.setWordWrap(True)
         self.denoise_info_label.setStyleSheet("color: gray; font-size: 11px;")
@@ -450,6 +479,9 @@ class InspectorPanel(ScrollArea):
                 bool(params['denoise_enabled']) and self._denoise_available()
             )
             self._update_denoise_switch_text()
+        if 'denoise_strength' in params:
+            self.denoise_strength_slider.setValue(
+                int(round(float(params['denoise_strength']) * 100)))
         
         # Sharpen
         if 'sharpen_strength' in params:
@@ -713,6 +745,7 @@ class InspectorPanel(ScrollArea):
         
         # Add denoise toggle
         params['denoise_enabled'] = self.denoise_switch.isEnabled() and self.denoise_switch.isChecked()
+        params['denoise_strength'] = self.denoise_strength_slider.value() / 100.0
         
         # Add sharpen strength
         params['sharpen_strength'] = self.sharpen_slider.value() / 100.0
@@ -808,6 +841,14 @@ class InspectorPanel(ScrollArea):
             self.denoise_switch.setText(tr('denoise_on'))
         else:
             self.denoise_switch.setText(tr('denoise_off'))
+
+    def _revert_denoise_strength(self):
+        """Revert denoise strength to baseline or default (0.25)"""
+        if self.saved_baseline_params and 'denoise_strength' in self.saved_baseline_params:
+            val = float(self.saved_baseline_params['denoise_strength'])
+        else:
+            val = 0.25
+        self.denoise_strength_slider.setValue(int(round(val * 100)))
 
     def _revert_sharpen(self):
         """Revert sharpen slider to baseline or default"""

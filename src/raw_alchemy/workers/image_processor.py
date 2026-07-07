@@ -716,6 +716,11 @@ class ImageProcessor(QThread):
             expected = self._expected_lens_state_key(params)
             if self._normalize_lens_state_key(self.cached_lens_key) != expected:
                 return None
+            if expected[2]:
+                want = round(float(params.get('denoise_strength', 0.25) or 0.25), 3)
+                dk = self.last_denoise_key
+                if not dk or len(dk) < 3 or dk[2] != want:
+                    return None
             if expected[2] and self.cached_denoise_full is None:
                 # The key claims a denoised source but the denoise artifact
                 # is gone (failed/aborted run, dropped cache) — cpu_corrected
@@ -762,6 +767,8 @@ class ImageProcessor(QThread):
         return _as_hashable((
             params.get('_preview_source', 'full'),
             params.get('denoise_enabled', False),
+            (round(float(params.get('denoise_strength', 0.25) or 0.25), 3)
+             if params.get('denoise_enabled', False) else None),
             params.get('lens_correct'), params.get('custom_db_path'),
             params.get('rotation', 0),
             params.get('flip_horizontal', False),
@@ -1046,13 +1053,15 @@ class ImageProcessor(QThread):
         if path is None:
             return src
 
-        denoise_cache_key = (path, 'denoise')
+        strength = round(float(self._executor_params.get('denoise_strength', 0.25) or 0.25), 3)
+        denoise_cache_key = (path, 'denoise', strength)
         missing = (denoise_cache_key != self.last_denoise_key
                    or self.cached_denoise_full is None)
         if missing:
             from raw_alchemy.pipeline import denoise_disk_cache
             from raw_alchemy.onnx.rgb_denoiser import MODEL_FILE as _DN_TAG
-            cached = denoise_disk_cache.load(path, _DN_TAG)
+            _dn_tag = f"{_DN_TAG}|s{strength:.3f}"
+            cached = denoise_disk_cache.load(path, _dn_tag)
             if cached is not None:
                 self.cached_denoise_original = self.cpu_linear
                 self.cached_denoise_full = cached
@@ -1065,7 +1074,7 @@ class ImageProcessor(QThread):
             source = self.cpu_linear if self.cpu_linear is not None else src
             try:
                 self.denoise_started.emit()
-                logger.info("[Worker] SCUNet RGB denoise (native, once)...")
+                logger.info(f"[Worker] FastDenoise v4 (native, once, s={strength:.2f})...")
 
                 def progress_cb(cur, total):
                     self.denoise_progress.emit(cur, total)
@@ -1075,12 +1084,13 @@ class ImageProcessor(QThread):
                         raise PipelineAborted(
                             f"denoise superseded by another photo at {cur}/{total}")
 
-                denoised = denoise_rgb_linear(source, progress_callback=progress_cb)
+                denoised = denoise_rgb_linear(source, strength=strength,
+                                              progress_callback=progress_cb)
                 self.cached_denoise_original = self.cpu_linear
                 self.cached_denoise_full = denoised
                 self.cached_denoise_proxy = None
                 self.last_denoise_key = denoise_cache_key
-                denoise_disk_cache.save(path, _DN_TAG, denoised)
+                denoise_disk_cache.save(path, _dn_tag, denoised)
                 self.denoise_finished.emit()
             except PipelineAborted:
                 self.denoise_finished.emit()

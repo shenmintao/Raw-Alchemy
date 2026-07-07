@@ -17,11 +17,11 @@ class _StubSession:
 
     def get_inputs(self):
         class _I:  # minimal shim
-            name = "x"
+            name = "rgb"
         return [_I()]
 
     def run(self, _outs, feeds):
-        x = feeds["x"]
+        x = feeds["rgb"]
         return [self._fn(x)]
 
 

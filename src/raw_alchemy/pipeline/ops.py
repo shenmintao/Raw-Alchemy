@@ -47,7 +47,7 @@ def build_op_list(params: ProcessorParams) -> list[Op]:
     working_space = config.WORKING_SPACE
 
     if params.get("denoise_enabled", False):
-        ops.append(Op("denoise", ()))
+        ops.append(Op("denoise", (round(_float_param(params, "denoise_strength", 0.25), 3),)))
 
     if params.get("lens_correct", False):
         ops.append(Op("lens_correct", (_as_hashable(params.get("custom_db_path")),)))

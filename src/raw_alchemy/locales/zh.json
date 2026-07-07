@@ -165,7 +165,7 @@
     "denoise_strength": "降噪强度",
     "denoise_on": "AI 降噪: 开启",
     "denoise_off": "AI 降噪: 关闭",
-    "denoise_info": "SCUNet 深度降噪 — 在去马赛克后的线性图像上运行,GPU 加速。",
+    "denoise_info": "FastDenoise v4 自研降噪 — 去马赛克后线性域一次计算、全局缓存,缩放拖动不重算;强度可调(默认 0.25)。",
     "denoising": "正在降噪...",
     "denoise_progress": "降噪进度: {current}/{total}",
     "denoise_done_processing": "降噪完成，正在处理管线...",

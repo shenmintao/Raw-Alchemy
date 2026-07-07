@@ -1,4 +1,10 @@
-"""SCUNet RGB denoiser (ONNX) — the app's denoise engine.
+"""FastDenoise v4 RGB denoiser (ONNX) — the app's denoise engine.
+
+自研 DML 亲和架构(纯密集卷积,主干 1/4 分辨率,6.1M/12MB fp16),
+训练数据与本管线逐比特对齐(合成标定噪声 + SID/RawNIND 真实配对 +
+SCUNet 蒸馏)。RX 9070 XT 实测 2.2ms/tile,42.6MP ≈ 0.5s(SCUNet 42s)。
+噪声强度 σ 为条件输入 → UI 降噪强度滑块(默认 0.25)。
+蒸馏容器原则:将来任何更强 teacher 都可经蒸馏管线注入本模型升级画质。
 
 Runs on the demosaiced linear ProPhoto RGB image (HWC float32 [0,1]), so the
 pipeline contract is unchanged for everything downstream: WB/matrix/edits all
@@ -25,7 +31,7 @@ from loguru import logger
 
 from .denoiser import _find_model, _get_providers, _tile_weight
 
-MODEL_FILE = "scunet_real_512_fp16.onnx"
+MODEL_FILE = "fastdenoise_v4_512_fp16.onnx"
 MODEL_TILE = 512
 DEFAULT_OVERLAP = 64
 
@@ -52,7 +58,7 @@ def _get_session():
     import onnxruntime as ort
 
     model_path = _find_model(MODEL_FILE)
-    logger.info(f"Loading SCUNet RGB denoiser from: {model_path}")
+    logger.info(f"Loading FastDenoise v4 from: {model_path}")
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     providers = _get_providers()
@@ -65,7 +71,7 @@ def _get_session():
         providers=providers, provider_options=provider_options,
     )
     _session_provider = _session.get_providers()[0]
-    logger.info(f"SCUNet session: {_session_provider}")
+    logger.info(f"FastDenoise session: {_session_provider}")
     return _session
 
 
@@ -88,6 +94,7 @@ def compute_gain(linear_rgb: np.ndarray) -> float:
 
 def denoise_rgb_linear(
     linear_rgb: np.ndarray,
+    strength: float = 0.25,
     tile_overlap: int = DEFAULT_OVERLAP,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> np.ndarray:
@@ -96,8 +103,8 @@ def denoise_rgb_linear(
         raise ValueError(f"expected HWC RGB, got {linear_rgb.shape}")
     t0 = time.time()
     session = _get_session()
-    inp_name = session.get_inputs()[0].name
 
+    strength = float(np.clip(strength, 0.01, 0.6))
     lin = np.clip(linear_rgb.astype(np.float32, copy=False), 0.0, 1.0)
     gain = compute_gain(lin)
     gained = lin * gain
@@ -130,7 +137,8 @@ def denoise_rgb_linear(
         for x in xs:
             patch = enc[y:y + tile, x:x + tile]
             chw = np.ascontiguousarray(patch.transpose(2, 0, 1))[np.newaxis]
-            pred = session.run(None, {inp_name: chw})[0][0].transpose(1, 2, 0)
+            sig = np.full((1, 1, tile, tile), strength, np.float32)
+            pred = session.run(None, {"rgb": chw, "sigma": sig})[0][0].transpose(1, 2, 0)
             wt = _tile_weight(
                 tile, tile, overlap,
                 at_top=(y == 0), at_bottom=(y + tile >= PH),
@@ -146,7 +154,7 @@ def denoise_rgb_linear(
     out_lin = np.clip(out_enc, 0.0, 1.0) ** GAMMA / gain
     out_lin = np.where(clipped, lin, out_lin)
     logger.info(
-        f"SCUNet RGB denoise done in {time.time() - t0:.1f}s "
+        f"FastDenoise v4 (s={strength:.2f}) done in {time.time() - t0:.1f}s "
         f"({total} tiles, gain {gain:.1f}x, {_session_provider})"
     )
     return np.clip(out_lin, 0.0, 1.0).astype(np.float32)
@@ -157,7 +165,7 @@ def warmup() -> None:
     try:
         _get_session()
     except Exception as e:
-        logger.warning(f"SCUNet warmup failed: {e}")
+        logger.warning(f"FastDenoise warmup failed: {e}")
 
 
 def clear_session() -> None:
