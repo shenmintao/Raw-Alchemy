@@ -100,6 +100,9 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self._on_gallery_scrolled
         )
         self.processor = ImageProcessor()
+        # 启动即拉起 worker 线程:空闲循环里完成 ONNX 会话预热(DirectML
+        # JIT 编译藏进启动期,首次出图不再现场付费)
+        self.processor.start()
         self.processor.result_ready.connect(self.on_process_result)
         self.processor.load_complete.connect(self.on_load_complete)
         self.processor.error_occurred.connect(self.on_error)

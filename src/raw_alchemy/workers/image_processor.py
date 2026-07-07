@@ -217,6 +217,7 @@ class ImageProcessor(QThread):
         init_taichi()
         if not self._warmed_up:
             warmup()
+            self._warm_onnx_sessions()
             self._warmed_up = True
 
         # Permanent worker loop 鈥?thread stays alive until app closes
@@ -610,6 +611,39 @@ class ImageProcessor(QThread):
         gc.collect()
         gpu_pool().clear()
         self.last_metering_key = None
+
+    def _warm_onnx_sessions(self):
+        """启动预热:预建 ONNX 会话并各跑一次假数据,把 DirectML 的
+        JIT 编译成本(RCD ~1s、grade 首跑、SCUNet ~4s 加载)藏进应用
+        启动期,首次出图不再现场付费。任何一步失败都不阻塞启动。"""
+        import numpy as np
+        t0 = time.time()
+        try:
+            from raw_alchemy.onnx import rcd_demosaic
+            dummy = np.full((64, 64), 0.25, np.float32)
+            rcd_demosaic.rcd_demosaic(dummy, np.array([[0, 1], [3, 2]]))
+        except Exception as e:
+            logger.debug(f"[Warmup] RCD skipped: {e}")
+        try:
+            from raw_alchemy.onnx import grade
+            if grade.is_enabled():
+                grade.apply_grade(
+                    np.full((64, 64, 3), 0.25, np.float32),
+                    gain=1.0, mat_a=np.eye(3, dtype=np.float32),
+                    highlight=0.0, shadow=0.0, saturation=1.0, contrast=1.0,
+                    pivot=0.18,
+                    luma=np.array([0.2126, 0.7152, 0.0722], np.float32),
+                    mat_b=np.eye(3, dtype=np.float32), srgb_encode=True,
+                )
+        except Exception as e:
+            logger.debug(f"[Warmup] grade skipped: {e}")
+        try:
+            from raw_alchemy.onnx import rgb_denoiser
+            if rgb_denoiser.is_available():
+                rgb_denoiser.warmup()  # 仅建会话(SCUNet 加载 ~4s 是大头)
+        except Exception as e:
+            logger.debug(f"[Warmup] SCUNet skipped: {e}")
+        logger.info(f"[Warmup] ONNX sessions ready in {time.time() - t0:.1f}s")
 
     def _release_onnx_sessions(self):
         """Drop every cached ONNX session (demosaic/grade/denoise) → VRAM 归零."""
