@@ -151,6 +151,41 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
 #              鏍稿績澶勭悊鍑芥暟
 # ==========================================
 
+_ORIENT_TO_FLIP = {1: 0, 3: 3, 6: 6, 8: 5}  # EXIF orientation -> libraw flip
+
+
+def _read_orientation_flip(raw_path: str) -> int:
+    """零依赖读取 TIFF/EXIF Orientation(tag 0x0112)→ libraw flip 语义。
+
+    rawspeed C API 不暴露方向;此前为拿 flip 专门做一次 rawpy 解包
+    (整包白付 ~1-2s)。非 TIFF 容器(RAF 等)返回 -1,调用方回退。
+    """
+    import struct
+    try:
+        with open(raw_path, "rb") as f:
+            data = f.read(65536)
+        if len(data) < 8 or data[:2] not in (b"II", b"MM"):
+            return -1
+        bo = "<" if data[:2] == b"II" else ">"
+        u16 = lambda o: struct.unpack_from(bo + "H", data, o)[0]
+        u32 = lambda o: struct.unpack_from(bo + "I", data, o)[0]
+        off = u32(4)
+        if off + 2 > len(data):
+            return -1
+        n = u16(off)
+        if n > 4096:
+            return -1
+        for i in range(n):
+            e = off + 2 + i * 12
+            if e + 12 > len(data):
+                return -1
+            if u16(e) == 0x0112:
+                return _ORIENT_TO_FLIP.get(u16(e + 8), 0)
+        return 0  # 无 Orientation 标签 = 不旋转
+    except Exception:
+        return -1
+
+
 def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     """Decode RAW to working-space linear float32 (H, W, 3).
 
@@ -181,11 +216,13 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
         rs_ok = False
     if rs_ok:
         from raw_alchemy.demosaic_helpers import get_cfa_pattern_from_filters
-        try:
-            with rawpy.imread(raw_path) as _r:
-                flip = _r.sizes.flip
-        except Exception:
-            flip = 0
+        flip = _read_orientation_flip(raw_path)
+        if flip < 0:
+            try:
+                with rawpy.imread(raw_path) as _r:
+                    flip = _r.sizes.flip
+            except Exception:
+                flip = 0
         pattern = (get_cfa_pattern_from_filters(rs.filters) if rs.is_bayer
                    else np.asarray(XTRANS_PATTERN))
         cfa_data = (
