@@ -144,3 +144,36 @@ def test_session_cleared_even_when_denoise_fails(monkeypatch):
     out = p._executor_denoise(p.cpu_linear)
     np.testing.assert_array_equal(out, p.cpu_linear)  # graceful fallback
     assert cleared, "session must be released on the failure path too"
+
+
+def test_view_tier_denoises_roi_buffer_and_caches(monkeypatch):
+    """放大视图:只对(DPI 挡位后的)ROI buffer 降噪,按 rect 缓存。"""
+    p = _processor()
+    p._executor_using_proxy = False
+    p._denoise_view_cache = {}
+    p._executor_params = {"_denoise_tier": "view", "_preview_roi": (64, 64, 320, 256)}
+    calls = []
+
+    def fake_denoise(src, progress_callback=None):
+        calls.append(src.shape)
+        return (src * 0.5).astype(np.float32)
+
+    monkeypatch.setattr(processor_module, "denoise_rgb_linear", fake_denoise)
+    monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: None)
+
+    class _Sig:
+        def emit(self, *a):
+            pass
+
+    p.denoise_started = p.denoise_progress = p.denoise_finished = _Sig()
+    roi_buf = np.full((128, 160, 3), 0.4, np.float32)  # 已是挡位后的小 buffer
+    out1 = p._executor_denoise(roi_buf)
+    assert calls == [(128, 160, 3)]
+    np.testing.assert_allclose(out1, 0.2, atol=1e-6)
+    out2 = p._executor_denoise(roi_buf)
+    assert calls == [(128, 160, 3)]  # rect 命中缓存
+    # rect 变化 → 重新降噪;LRU 上限 4
+    for i in range(5):
+        p._executor_params = {"_denoise_tier": "view", "_preview_roi": (i, 0, 320, 256)}
+        p._executor_denoise(roi_buf)
+    assert len(p._denoise_view_cache) <= 4
