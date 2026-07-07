@@ -200,9 +200,25 @@ class _BaseExecutor:
             # (after geometry/perspective/crop, before the color ops). The
             # worker injects it so zoom>fit runs process only the on-screen
             # region plus margins; export op lists never contain it.
-            x, y, w, h = op.params
+            # 6-tuple form (T7.5+ DPI tier): (x, y, w, h, out_w, out_h) —
+            # after cropping, downscale to the screen-density target so the
+            # colour chain never renders pixels the display cannot show
+            # (zoom levels between fit and 1:1 used to oversample up to 4x).
+            x, y, w, h = op.params[:4]
             dst = GpuImage()
             apply_crop_pixels_gpu(buf, dst, int(x), int(y), int(w), int(h))
+            if len(op.params) == 6:
+                import cv2
+
+                out_w, out_h = int(op.params[4]), int(op.params[5])
+                if 0 < out_w < int(w) or 0 < out_h < int(h):
+                    small = cv2.resize(
+                        dst.to_numpy(), (out_w, out_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    dst.clear()
+                    dst = GpuImage()
+                    dst.upload(np.ascontiguousarray(small))
             buf.clear()
             return dst
 

@@ -847,7 +847,7 @@ class ImageProcessor(QThread):
         return (px0, py0, roi_w, roi_h), (full_w, full_h)
 
     @staticmethod
-    def _insert_roi_op(ops: list, roi_rect) -> list:
+    def _insert_roi_op(ops: list, roi_rect, roi_out=None) -> list:
         """Insert the ROI crop after the shape ops, before the color ops.
 
         The exposure op is always present and is the first color op, so the
@@ -859,7 +859,10 @@ class ImageProcessor(QThread):
             (i for i, op in enumerate(ops) if op.name == "exposure"), len(ops)
         )
         ops = list(ops)
-        ops.insert(index, Op("roi", tuple(int(v) for v in roi_rect)))
+        params = tuple(int(v) for v in roi_rect)
+        if roi_out is not None:
+            params = params + (int(roi_out[0]), int(roi_out[1]))
+        ops.insert(index, Op("roi", params))
         return ops
 
     @staticmethod
@@ -1364,7 +1367,13 @@ class ImageProcessor(QThread):
                 # The ROI crop is a preview-only op: it only narrows the
                 # source region, so the color-pipeline parameter caches
                 # (pipeline key, metering, lens/denoise) stay untouched.
-                ops = self._insert_roi_op(ops, roi_info[0])
+                # DPI 挡位(T7.5+):把"屏幕需要多少像素"的降采样从显示端
+                # 提前到调色链之前——fit 与 1:1 之间的缩放级别不再超采样渲染。
+                _rx, _ry, _rw, _rh = roi_info[0]
+                _fw, _fh = roi_info[1]
+                _tw, _th = self._make_roi_target_size(_rw, _rh, _fw, _fh, params)
+                _roi_out = (_tw, _th) if (_tw < _rw * 0.95 or _th < _rh * 0.95) else None
+                ops = self._insert_roi_op(ops, roi_info[0], _roi_out)
             executor_source = self._select_executor_source(use_proxy)
             executor = self._get_preview_executor()
             # Cooperative cancellation (T7.3): a newer user request aborts

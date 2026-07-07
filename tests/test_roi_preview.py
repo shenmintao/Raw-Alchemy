@@ -626,3 +626,46 @@ def test_roi_results_do_not_feed_scopes_but_full_frames_do(monkeypatch):
     assert not _pump_until(app, lambda: len(harness.scope_updates) > 1, timeout=0.3)
     assert harness.roi_overlays and harness.roi_overlays[-1][1] == (8, 8, 16, 16)
     assert len(harness.scope_updates) == 1  # last full-frame data retained
+
+
+def test_roi_dpi_tier_downscales_before_color_ops():
+    """T7.5+: zoom between fit and 1:1 must not oversample the colour chain.
+
+    The 6-tuple roi op crops then downscales to the screen-density target;
+    the colour ops downstream see the small buffer.
+    """
+    from raw_alchemy.pipeline.executor import PreviewExecutor
+    from raw_alchemy.pipeline.ops import Op
+
+    yy, xx = np.mgrid[0:400, 0:600].astype(np.float32)
+    src = np.stack([xx / 600, yy / 400, (xx + yy) / 1000], -1).astype(np.float32)
+    src *= 0.9  # 平滑渐变——重采样与 OETF 的交换误差在平滑数据上应当很小
+    ex = PreviewExecutor(src)
+    ops = [Op("roi", (64, 64, 320, 256, 160, 128)), Op("exposure", ("Manual", 0.0, "matrix", None)), Op("srgb_out", (None,))]
+    out = ex.run(ops)
+    assert out.shape == (128, 160, 3)
+    # 参考:全分辨率渲染后再缩(降采样与非线性 OETF 不严格交换,
+    # 这是预览级近似——停手后的精化渲染回到全精度;容差放宽)
+    import cv2
+    ref_ops = [Op("roi", (64, 64, 320, 256)), ops[1], ops[2]]
+    ref_full = PreviewExecutor(src.copy()).run(ref_ops)
+    ref = cv2.resize(ref_full, (160, 128), interpolation=cv2.INTER_AREA)
+    assert float(np.abs(out - ref).mean()) < 0.01
+    np.testing.assert_allclose(out, ref, atol=0.08)
+
+
+def test_make_roi_target_size_tiers_by_dpi_and_zoom():
+    from raw_alchemy.workers.image_processor import ImageProcessor
+
+    # 8000 宽全幅,2K 视口(DPR1),zoom=2(仍低于 1:1)→ 目标按屏幕密度缩
+    params = {"viewport_size": (2560, 1440), "device_pixel_ratio": 1.0, "preview_zoom": 2.0}
+    tw, th = ImageProcessor._make_roi_target_size(4000, 3000, 8000, 5320, params)
+    assert tw < 4000 and th < 3000
+    # DPR 2 → 目标翻倍(高 DPI 屏挡位更高)
+    params2 = dict(params, device_pixel_ratio=2.0)
+    tw2, th2 = ImageProcessor._make_roi_target_size(4000, 3000, 8000, 5320, params2)
+    assert tw2 > tw
+    # 1:1 及以上不再放大(封顶原生)
+    params3 = dict(params, preview_zoom=10.0)
+    tw3, th3 = ImageProcessor._make_roi_target_size(4000, 3000, 8000, 5320, params3)
+    assert (tw3, th3) == (4000, 3000)
