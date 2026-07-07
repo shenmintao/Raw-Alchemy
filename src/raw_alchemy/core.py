@@ -21,15 +21,20 @@ from raw_alchemy.pipeline.ops import build_op_list
 def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
     """Per-channel black level subtraction and normalization to [0, 1]."""
     pat_size = cfa_pattern.shape[0]
-    result = np.empty_like(sensor_raw)
+    bl = np.asarray(bl, np.float32)
+    # 常见情况:各通道黑电平相同 → 单次全图向量运算(42MP 省 ~0.5s)
+    if np.all(bl == bl.flat[0]):
+        b = float(bl.flat[0])
+        return np.maximum(sensor_raw - b, 0) / (wl - b)
+    # 通用:黑电平图按 CFA 铺开,单次运算
+    H, W = sensor_raw.shape
+    blk = np.empty((pat_size, pat_size), np.float32)
     for r in range(pat_size):
         for c in range(pat_size):
-            color = cfa_pattern[r, c]
-            bl_c = float(bl[min(color, len(bl) - 1)])
-            result[r::pat_size, c::pat_size] = np.maximum(
-                sensor_raw[r::pat_size, c::pat_size] - bl_c, 0
-            ) / (wl - bl_c)
-    return result
+            blk[r, c] = bl[min(int(cfa_pattern[r, c]), len(bl) - 1)]
+    bl_map = np.tile(blk, ((H + pat_size - 1) // pat_size,
+                           (W + pat_size - 1) // pat_size))[:H, :W]
+    return np.maximum(sensor_raw - bl_map, 0) / (wl - bl_map)
 
 
 def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
@@ -39,12 +44,16 @@ def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
     for r in range(pat_size):
         for c in range(pat_size):
             plane = raw_norm[r::pat_size, c::pat_size]
-            plane32 = plane.astype(np.float32) if plane.dtype != np.float32 else plane
-            med = cv2.medianBlur(plane32, 3)
-            diff = np.abs(plane - med)
-            std = max(np.std(diff), 1e-6)
+            # uint16 量化后中值(cv2 直方图法,较 fp32 快 ~5x);
+            # 检测在量化域,替换值用 fp32 中值邻域近似(量化步长 1/65535,
+            # 远小于热像素阈值,无观感差异)
+            q = np.clip(plane * 65535.0, 0, 65535).astype(np.uint16)
+            med_q = cv2.medianBlur(np.ascontiguousarray(q), 3)
+            diff = np.abs(q.astype(np.int32) - med_q.astype(np.int32)).astype(np.float32)
+            std = max(float(diff.std()), 1e-3)
             hot = diff > threshold * std
-            plane[hot] = med[hot]
+            if hot.any():
+                plane[hot] = med_q[hot].astype(np.float32) / 65535.0
 
 
 # ==========================================
@@ -78,6 +87,9 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     raw_clips = np.array([CLIP / max(wg, 1e-6) for wg in wb_gains],
                          dtype=np.float32)
 
+    # 快速门控:无任何接近饱和的像素时整段跳过(夜景/正常曝光常见)
+    if float(raw_data.max()) < float(raw_clips.min()):
+        return
     refavg, clipped = compute_hl_refavg(raw_data, color_map, wb_gains, raw_clips)
     if not np.any(clipped):
         return
@@ -204,20 +216,20 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
         raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
         fix_hot_pixels(raw_norm, cfa_pattern)
         highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
+        g = wb[1] if wb[1] > 0 else 1.0
+        wb3 = np.array([wb[0] / g, 1.0, wb[2] / g], np.float32)
+        m = cam_to_working_space_matrix(xyz_to_cam).astype(np.float32)
         if cfa_pattern.shape == (2, 2):
+            # WB+矩阵+clip 折叠在 RCD 图输出端(GPU),省 42MP CPU einsum
             from raw_alchemy.onnx.rcd_demosaic import rcd_demosaic as onnx_rcd
-            rgb = onnx_rcd(raw_norm, cfa_pattern)
+            rgb = onnx_rcd(raw_norm, cfa_pattern, wb3=wb3, cam_mat=m)
         else:
             from raw_alchemy.onnx.xtrans_demosaic import xtrans_markesteijn_demosaic
             rgb = xtrans_markesteijn_demosaic(raw_norm, cfa_pattern)
-        rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
-        g = wb[1] if wb[1] > 0 else 1.0
-        rgb[:, :, 0] *= wb[0] / g
-        rgb[:, :, 2] *= wb[2] / g
-        m = cam_to_working_space_matrix(xyz_to_cam).astype(np.float32)
-        rgb = np.einsum('ij,hwj->hwi', m, rgb, optimize=True).astype(np.float32)
-        np.clip(rgb, 0.0, 1.0, out=rgb)
-        return rgb
+            rgb *= wb3
+            rgb = np.einsum('ij,hwj->hwi', m, rgb, optimize=True).astype(np.float32)
+            np.clip(rgb, 0.0, 1.0, out=rgb)
+        return np.ascontiguousarray(_apply_flip(rgb, flip))
 
     # ---- 罕见传感器(Foveon 等):libraw 兜底 ----
     with rawpy.imread(raw_path) as raw:

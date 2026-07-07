@@ -25,7 +25,7 @@ from loguru import logger
 
 from .denoiser import _find_model, _get_providers
 
-MODEL_FILE = "rcd_demosaic_dyn.onnx"
+MODEL_FILE = "rcd_demosaic_dyn2.onnx"
 TILE = 1536   # even (CFA phase), single compiled shape
 OVERLAP = 24  # even; > border(4) + neighbourhood influence (~8px)
 
@@ -104,11 +104,13 @@ def _phase_masks(cfa_pattern: np.ndarray) -> np.ndarray:
 _cpu_fallback = False
 
 
-def _run_tile(session, patch: np.ndarray, m2: np.ndarray) -> np.ndarray:
+def _run_tile(session, patch: np.ndarray, m2: np.ndarray,
+              wb3: np.ndarray, cam_mat: np.ndarray) -> np.ndarray:
     global _cpu_fallback
     feeds = {
         "bayer": np.ascontiguousarray(patch, dtype=np.float32),
         "mr2": m2[0], "mg2": m2[1], "mb2": m2[2],
+        "wb3": wb3, "cam_mat": cam_mat,
     }
     try:
         return session.run(None, feeds)[0]
@@ -124,7 +126,8 @@ def _run_tile(session, patch: np.ndarray, m2: np.ndarray) -> np.ndarray:
         return _get_session().run(None, feeds)[0]
 
 
-def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray) -> np.ndarray:
+def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray,
+                 wb3=None, cam_mat=None) -> np.ndarray:
     """Demosaic a Bayer mosaic with RCD on the ONNX runtime (tiled).
 
     Args:
@@ -143,12 +146,18 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray) -> np.ndarray:
     t0 = time.time()
     session = _get_session()
     m2 = _phase_masks(np.asarray(cfa_pattern))
+    # 输出端在图内折叠 WB 增益 + 相机矩阵 + clip(省 42MP 的 CPU einsum);
+    # 缺省恒等 = 纯去马赛克(数值同旧图 + clip[0,1])
+    wb3 = (np.ones(3, np.float32) if wb3 is None
+           else np.ascontiguousarray(wb3, np.float32))
+    cam_mat = (np.eye(3, dtype=np.float32) if cam_mat is None
+               else np.ascontiguousarray(cam_mat, np.float32))
 
     if H <= TILE and W <= TILE:
         ph, pw = TILE - H, TILE - W
         patch = (np.pad(bayer, ((0, ph), (0, pw)), mode="reflect")
                  if (ph or pw) else bayer)
-        rgb = _run_tile(session, patch, m2)[:H, :W]
+        rgb = _run_tile(session, patch, m2, wb3, cam_mat)[:H, :W]
     else:
         rgb = np.zeros((H, W, 3), np.float32)
         step = TILE - 2 * OVERLAP
@@ -164,7 +173,7 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray) -> np.ndarray:
                 if th < TILE or tw < TILE:
                     patch = np.pad(patch, ((0, TILE - th), (0, TILE - tw)),
                                    mode="reflect")
-                out = _run_tile(session, patch, m2)
+                out = _run_tile(session, patch, m2, wb3, cam_mat)
                 iy0, ix0 = y, x
                 iy1, ix1 = min(H, y + step), min(W, x + step)
                 rgb[iy0:iy1, ix0:ix1] = out[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0]
