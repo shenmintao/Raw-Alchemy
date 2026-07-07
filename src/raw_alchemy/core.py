@@ -155,12 +155,19 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     # ---- CFA fast path: rawspeed/rawpy decode + ONNX demosaic (GPU) ----
     cfa_data = None
     rs = None
+    XTRANS_PATTERN = None
     try:
         from rawspeedpy import try_decode, XTRANS_PATTERN
         rs = try_decode(raw_path)
-    except ImportError:
-        pass
-    if rs and (rs.is_bayer or rs.is_xtrans) and rs.color_matrix is not None:
+    except Exception:
+        # rawspeedpy 在损坏 makernote(如 Sony 转制 DNG 的 Sony2 目录)上
+        # 可能抛 UnicodeDecodeError 等——回退 rawpy 解码,仍走 GPU 去马赛克
+        rs = None
+    try:
+        rs_ok = bool(rs and (rs.is_bayer or rs.is_xtrans) and rs.color_matrix is not None)
+    except Exception:
+        rs_ok = False
+    if rs_ok:
         from raw_alchemy.demosaic_helpers import get_cfa_pattern_from_filters
         try:
             with rawpy.imread(raw_path) as _r:

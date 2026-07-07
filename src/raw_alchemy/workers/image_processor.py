@@ -370,7 +370,12 @@ class ImageProcessor(QThread):
             from raw_alchemy.exif import extract_lens_exif
 
             rgb = _rawpy_decode_to_prophoto(path)
-            exif_data, exif_metadata = extract_lens_exif(path, None)
+            try:
+                exif_data, exif_metadata = extract_lens_exif(path, None)
+            except Exception as e:
+                logger.warning(
+                    f"[Worker] EXIF extract failed ({str(e)[:60]}); continuing without")
+                exif_data, exif_metadata = {}, None
             return rgb, exif_data, exif_metadata
         except Exception as e:
             logger.warning(

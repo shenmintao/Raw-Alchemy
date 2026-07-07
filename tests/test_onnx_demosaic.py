@@ -26,12 +26,26 @@ def test_rcd_zero_regions_produce_no_nan():
     assert np.isfinite(rgb).all()
 
 
-def test_rcd_session_cached_per_size():
+def test_rcd_session_singleton():
     bayer = np.random.default_rng(1).random((64, 64), dtype=np.float32)
     R.rcd_demosaic(bayer, RGGB)
-    s1 = R._get_session(64, 64)
-    R.rcd_demosaic(bayer, RGGB)
-    assert R._get_session(64, 64) is s1
+    s1 = R._get_session()
+    R.rcd_demosaic(np.random.default_rng(2).random((128, 96), dtype=np.float32), RGGB)
+    assert R._get_session() is s1  # 单一 tile 形状,任何尺寸共用一个 session
+
+
+def test_rcd_tiled_matches_single_tile_interior():
+    rng = np.random.default_rng(9)
+    bayer = rng.random((300, 420), dtype=np.float32)
+    full = R.rcd_demosaic(bayer, RGGB)
+    old_tile, old_ov = R.TILE, R.OVERLAP
+    try:
+        R.TILE, R.OVERLAP = 150, 24
+        tiled = R.rcd_demosaic(bayer, RGGB)
+    finally:
+        R.TILE, R.OVERLAP = old_tile, old_ov
+    d = np.abs(tiled - full)[16:-16, 16:-16]
+    assert float(d.max()) < 1e-6
 
 
 def test_rcd_neutral_field_stays_neutral():
