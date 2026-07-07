@@ -86,6 +86,23 @@ def clear_session() -> None:
     gc.collect()
 
 
+_STRIP_PIXELS = 6_000_000  # 单次喂图上限:约束 DML arena 增长(逐像素链,条带切分数学恒等)
+
+
+def _run_strips(session, feeds, img_key="img"):
+    img = feeds[img_key]
+    h, w = img.shape[:2]
+    if h * w <= _STRIP_PIXELS:
+        return session.run(None, feeds)[0]
+    rows = max(1, _STRIP_PIXELS // max(w, 1))
+    out = np.empty((h, w, 3), np.float32)
+    for y in range(0, h, rows):
+        part = dict(feeds)
+        part[img_key] = np.ascontiguousarray(img[y:y + rows])
+        out[y:y + rows] = session.run(None, part)[0]
+    return out
+
+
 def apply_grade(
     img: np.ndarray,
     *,
@@ -115,7 +132,7 @@ def apply_grade(
         "mat_b": np.ascontiguousarray(mat_b, dtype=np.float32),
         "srgb_flag": np.array(1.0 if srgb_encode else 0.0, np.float32),
     }
-    return session.run(None, feeds)[0]
+    return _run_strips(session, feeds)
 
 
 def _core_feeds(img, gain, mat_a, highlight, shadow, saturation, contrast,
@@ -157,7 +174,7 @@ def apply_grade_log(
                    if use3 else np.ones(3, np.float32)),
         "use_lut3d": np.array(1.0 if use3 else 0.0, np.float32),
     })
-    return session.run(None, feeds)[0]
+    return _run_strips(session, feeds)
 
 
 def apply_grade_lut(
@@ -175,4 +192,4 @@ def apply_grade_lut(
         "d3_max": np.ascontiguousarray(d3_max, dtype=np.float32),
         "mat_b": np.ascontiguousarray(mat_b, dtype=np.float32),
     })
-    return session.run(None, feeds)[0]
+    return _run_strips(session, feeds)

@@ -151,6 +151,7 @@ class ImageProcessor(QThread):
         # Most recent user interaction (load/preview request) timestamp,
         # used to postpone the idle full refine (T7.3).
         self._last_interaction = 0.0
+        self._onnx_sessions_released = False
         self.last_preview_source = "full"
 
     def stop_and_cleanup(self):
@@ -224,8 +225,17 @@ class ImageProcessor(QThread):
 
             if not request:
                 time.sleep(0.05)
+                # 空闲定时卸载(T-VRAM):>120s 无请求则释放全部 ONNX 会话
+                # (RCD/X-Trans/grade/SCUNet)。分块+冻结后重建仅 ~1s,
+                # 换来空闲时显存归零。
+                if (
+                    not self._onnx_sessions_released
+                    and time.perf_counter() - self._last_interaction > 120.0
+                ):
+                    self._release_onnx_sessions()
                 continue
 
+            self._onnx_sessions_released = False
             try:
                 if '_export' in request.params:
                     self._do_export(request)
@@ -601,9 +611,23 @@ class ImageProcessor(QThread):
         gpu_pool().clear()
         self.last_metering_key = None
 
+    def _release_onnx_sessions(self):
+        """Drop every cached ONNX session (demosaic/grade/denoise) → VRAM 归零."""
+        try:
+            from raw_alchemy.onnx import grade, rcd_demosaic, xtrans_demosaic
+            rcd_demosaic.clear_session()
+            xtrans_demosaic.clear_session()
+            grade.clear_session()
+            denoise_clear_session()
+            self._onnx_sessions_released = True
+            logger.info("[Worker] Idle: ONNX sessions released (VRAM freed).")
+        except Exception as e:
+            logger.debug(f"[Worker] session release skipped: {e}")
+
     def _release_gpu_buffers(self):
         """Release all GPU buffers while CUDA context is still valid (on worker thread)."""
         try:
+            self._release_onnx_sessions()
             self.gpu_graded.clear()
             self._release_gpu_uint8()
             self._full_refine_request = None
