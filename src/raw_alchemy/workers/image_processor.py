@@ -129,12 +129,6 @@ class ImageProcessor(QThread):
         self.cached_denoise_full = None
         self.cached_denoise_proxy = None
         self.last_denoise_key = None
-        # Fast tier: proxy-resolution denoise (~3s) shown while the full-res
-        # pass (~40s, abortable, idle-scheduled) hasn't landed yet.
-        self.last_denoise_proxy_key = None
-        # View tier: per-ROI denoise results (zoomed views before the full
-        # pass lands). Keyed by (path, roi_rect, shape); tiny LRU.
-        self._denoise_view_cache: dict = {}
 
         self._should_stop = False
         self._gpu_uint8 = None      # Pre-allocated pooled uint8 output buffer
@@ -1045,119 +1039,54 @@ class ImageProcessor(QThread):
             full.trim(remaining)
 
     def _executor_denoise(self, src: np.ndarray) -> np.ndarray:
+        """降噪 = 解码链的一环(去马赛克后):原生分辨率只算一次,
+        内存+磁盘双缓存;所有视图(代理/任意缩放 ROI/导出)从结果派生,
+        缩放拖动永不触发重算。计算期间仅当切换到其他照片时让路。"""
         path = self._executor_path
         if path is None:
             return src
 
         denoise_cache_key = (path, 'denoise')
-
-        # Proxy-mode preview. With the full result cached, serve its
-        # downscale; otherwise denoise the proxy itself (~3s) as the fast
-        # tier — the full pass runs later (idle refine / export) and its
-        # arrival flips the op tier, re-rendering from the exact result.
-        if self._executor_using_proxy:
-            if (
-                denoise_cache_key == self.last_denoise_key
-                and self.cached_denoise_full is not None
-            ):
-                if self.cached_denoise_proxy is None:
-                    self.cached_denoise_proxy = self._make_proxy(self.cached_denoise_full)
-                if self.cached_denoise_proxy is not None:
-                    return np.ascontiguousarray(self.cached_denoise_proxy)
-            proxy_key = (path, 'denoise-proxy')
-            if (
-                proxy_key == self.last_denoise_proxy_key
-                and self.cached_denoise_proxy is not None
-            ):
-                return np.ascontiguousarray(self.cached_denoise_proxy)
-            try:
-                self.denoise_started.emit()
-                logger.info("[Worker] SCUNet proxy-tier denoise (fast preview)...")
-
-                def progress_cb(cur, total):
-                    self.denoise_progress.emit(cur, total)
-
-                denoised = denoise_rgb_linear(src, progress_callback=progress_cb)
-                self.cached_denoise_proxy = denoised
-                self.last_denoise_proxy_key = proxy_key
-                self.denoise_finished.emit()
-                return np.ascontiguousarray(denoised)
-            except Exception as e:
-                logger.error(f"[Worker] Proxy denoise failed: {e}")
-                self.denoise_finished.emit()
-                return src
-            finally:
-                denoise_clear_session()
-
-        if self._executor_params.get('_denoise_tier') == 'view':
-            rect = self._executor_params.get('_preview_roi')
-            vkey = (path, tuple(rect) if rect else None, src.shape)
-            cached = self._denoise_view_cache.get(vkey)
+        missing = (denoise_cache_key != self.last_denoise_key
+                   or self.cached_denoise_full is None)
+        if missing:
+            from raw_alchemy.pipeline import denoise_disk_cache
+            from raw_alchemy.onnx.rgb_denoiser import MODEL_FILE as _DN_TAG
+            cached = denoise_disk_cache.load(path, _DN_TAG)
             if cached is not None:
-                return np.ascontiguousarray(cached)
+                self.cached_denoise_original = self.cpu_linear
+                self.cached_denoise_full = cached
+                self.cached_denoise_proxy = None
+                self.last_denoise_key = denoise_cache_key
+                missing = False
+
+        if missing:
+            # 无论当前视图是代理还是 ROI,都对原生全分辨率源计算
+            source = self.cpu_linear if self.cpu_linear is not None else src
             try:
                 self.denoise_started.emit()
-                logger.info("[Worker] SCUNet view-tier denoise (ROI)...")
-                abortable = bool(self._executor_params.get('_denoise_abortable'))
+                logger.info("[Worker] SCUNet RGB denoise (native, once)...")
 
                 def progress_cb(cur, total):
                     self.denoise_progress.emit(cur, total)
-                    if abortable:
-                        with self.lock:
-                            superseded = self.pending_request is not None
-                        if superseded:
-                            raise PipelineAborted(
-                                f"view denoise superseded at tile {cur}/{total}"
-                            )
+                    with self.lock:
+                        pr = self.pending_request
+                    if pr is not None and pr.path != path:
+                        raise PipelineAborted(
+                            f"denoise superseded by another photo at {cur}/{total}")
 
-                denoised = denoise_rgb_linear(src, progress_callback=progress_cb)
-                if len(self._denoise_view_cache) >= 4:
-                    self._denoise_view_cache.pop(next(iter(self._denoise_view_cache)))
-                self._denoise_view_cache[vkey] = denoised
-                self.denoise_finished.emit()
-                return np.ascontiguousarray(denoised)
-            except PipelineAborted:
-                self.denoise_finished.emit()
-                raise
-            except Exception as e:
-                logger.error(f"[Worker] View denoise failed: {e}")
-                self.denoise_finished.emit()
-                return src
-            finally:
-                denoise_clear_session()
-
-        if denoise_cache_key != self.last_denoise_key or self.cached_denoise_full is None:
-            try:
-                self.denoise_started.emit()
-                logger.info("[Worker] SCUNet RGB denoise (post-demosaic)...")
-
-                abortable = bool(self._executor_params.get('_denoise_abortable'))
-
-                def progress_cb(cur, total):
-                    self.denoise_progress.emit(cur, total)
-                    if abortable:
-                        with self.lock:
-                            superseded = self.pending_request is not None
-                        if superseded:
-                            raise PipelineAborted(
-                                f"full denoise superseded at tile {cur}/{total}"
-                            )
-
-                denoised = denoise_rgb_linear(
-                    src,
-                    progress_callback=progress_cb,
-                )
-
+                denoised = denoise_rgb_linear(source, progress_callback=progress_cb)
                 self.cached_denoise_original = self.cpu_linear
                 self.cached_denoise_full = denoised
                 self.cached_denoise_proxy = None
                 self.last_denoise_key = denoise_cache_key
+                denoise_disk_cache.save(path, _DN_TAG, denoised)
                 self.denoise_finished.emit()
             except PipelineAborted:
                 self.denoise_finished.emit()
                 raise
             except Exception as e:
-                logger.error(f"[Worker] Denoising failed: {e}")
+                logger.error(f"[Worker] Denoising failed: {type(e).__name__}: {e}")
                 self.denoise_finished.emit()
                 self.cached_denoise_original = None
                 self.cached_denoise_full = None
@@ -1165,9 +1094,14 @@ class ImageProcessor(QThread):
                 self.last_denoise_key = None
                 return src
             finally:
-                # Always drop the ONNX session: on DirectML it pins hundreds
-                # of MB of VRAM that the interactive preview renderer needs.
                 denoise_clear_session()
+
+        if self._executor_using_proxy:
+            if self.cached_denoise_proxy is None:
+                self.cached_denoise_proxy = self._make_proxy(self.cached_denoise_full)
+            if self.cached_denoise_proxy is not None:
+                return np.ascontiguousarray(self.cached_denoise_proxy)
+            return np.ascontiguousarray(self.cached_denoise_full)
 
         denoised = np.ascontiguousarray(self.cached_denoise_full)
         if not self._executor_params.get('lens_correct', False):
@@ -1296,16 +1230,11 @@ class ImageProcessor(QThread):
     def _prepare_executor_source_state(self, params: ProcessorParams):
         self._executor_corrected_source = None
         denoise_enabled = params.get('denoise_enabled', False)
-        if not denoise_enabled and (
-            self.last_denoise_key is not None
-            or self.last_denoise_proxy_key is not None
-        ):
+        if not denoise_enabled and self.last_denoise_key is not None:
             self.cached_denoise_original = None
             self.cached_denoise_full = None
             self.cached_denoise_proxy = None
             self.last_denoise_key = None
-            self.last_denoise_proxy_key = None
-            self._denoise_view_cache.clear()
 
         if not params.get('lens_correct', False):
             if denoise_enabled and self.cached_denoise_full is not None:
@@ -1467,25 +1396,6 @@ class ImageProcessor(QThread):
             # zoom>fit ROI rendering (T7.5): resolve the visible-region crop
             # before the output key so the view key covers the ROI rect.
             roi_info = None if use_proxy else self._compute_preview_roi(params)
-            if params.get('denoise_enabled', False):
-                full_ready = (
-                    (request.path, 'denoise') == self.last_denoise_key
-                    and self.cached_denoise_full is not None
-                )
-                # tier(与 DPI 挡位同一哲学:屏幕需要多少就处理多少):
-                #   proxy = fit 视图对 3MP 代理降噪(~3s)
-                #   view  = 放大视图只对 DPI 挡位后的 ROI 降噪(~6-19s,带缓存)
-                #   full  = 精确结果(空闲精化产出/导出)
-                if full_ready:
-                    params['_denoise_tier'] = 'full'
-                elif use_proxy:
-                    params['_denoise_tier'] = 'proxy'
-                elif roi_info is not None:
-                    params['_denoise_tier'] = 'view'
-                else:
-                    params['_denoise_tier'] = 'full'
-                # 预览请求中的降噪按 tile 让路给新交互(空闲精化重试)
-                params['_denoise_abortable'] = True
             if roi_info is not None:
                 params['_preview_roi'] = roi_info[0]
                 params['_roi_full_size'] = roi_info[1]
@@ -1536,13 +1446,6 @@ class ImageProcessor(QThread):
                 _tw, _th = self._make_roi_target_size(_rw, _rh, _fw, _fh, params)
                 _roi_out = (_tw, _th) if (_tw < _rw * 0.95 or _th < _rh * 0.95) else None
                 ops = self._insert_roi_op(ops, roi_info[0], _roi_out)
-                if params.get('_denoise_tier') == 'view':
-                    di = next((k for k, o in enumerate(ops) if o.name == 'denoise'), None)
-                    ri = next((k for k, o in enumerate(ops) if o.name == 'roi'), None)
-                    if di is not None and ri is not None and di < ri:
-                        d_op = ops.pop(di)
-                        ri = next(k for k, o in enumerate(ops) if o.name == 'roi')
-                        ops.insert(ri + 1, d_op)
             executor_source = self._select_executor_source(use_proxy)
             executor = self._get_preview_executor()
             # Cooperative cancellation (T7.3): a newer user request aborts

@@ -47,10 +47,7 @@ def build_op_list(params: ProcessorParams) -> list[Op]:
     working_space = config.WORKING_SPACE
 
     if params.get("denoise_enabled", False):
-        # tier: 'proxy' while only the fast proxy-resolution denoise exists,
-        # 'full' once the full-res result is cached (worker injects it) —
-        # keying prefix/output caches so tier upgrades re-render cleanly.
-        ops.append(Op("denoise", (params.get("_denoise_tier"),)))
+        ops.append(Op("denoise", ()))
 
     if params.get("lens_correct", False):
         ops.append(Op("lens_correct", (_as_hashable(params.get("custom_db_path")),)))

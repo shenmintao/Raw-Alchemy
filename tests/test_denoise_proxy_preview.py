@@ -29,8 +29,10 @@ def _processor(path="img.raw"):
     p.cached_denoise_full = None
     p.cached_denoise_proxy = None
     p.last_denoise_key = None
-    p.last_denoise_proxy_key = None
     p._executor_params = {}
+    p.pending_request = None
+    import threading
+    p.lock = threading.Lock()
     p._executor_using_proxy = False
     p._executor_path = path
     p._executor_corrected_source = None
@@ -62,10 +64,11 @@ def test_proxy_preview_always_allowed_with_denoise():
     assert p._should_use_proxy_preview(_preview_params()) is True
 
 
-def test_proxy_tier_denoises_proxy_and_caches(monkeypatch):
-    """无全图缓存时,代理模式直接对代理降噪并缓存复用。"""
+def test_denoise_runs_once_at_native_then_all_views_derive(monkeypatch, tmp_path):
+    """解码链语义:无论首个视图是代理还是缩放 ROI,降噪都对原生全分辨率
+    源只算一次;之后任何视图(代理/全图/缩放)零重算。"""
+    monkeypatch.setenv("RAWALCHEMY_DENOISE_CACHE_DIR", str(tmp_path / "dc"))
     p = _processor()
-    p._executor_using_proxy = True
     calls = []
 
     def fake_denoise(src, progress_callback=None):
@@ -80,18 +83,53 @@ def test_proxy_tier_denoises_proxy_and_caches(monkeypatch):
             pass
 
     p.denoise_started = p.denoise_progress = p.denoise_finished = _Sig()
-    out1 = p._executor_denoise(p.cpu_proxy_linear)
-    assert calls == [p.cpu_proxy_linear.shape]  # 在代理分辨率上跑
-    np.testing.assert_allclose(out1, p.cpu_proxy_linear * 0.5, atol=1e-6)
-    out2 = p._executor_denoise(p.cpu_proxy_linear)
-    assert calls == [p.cpu_proxy_linear.shape]  # 第二次命中缓存,不重跑
-    np.testing.assert_array_equal(out2, out1)
-    # 全图缓存落地后,代理改用其降采样(精确结果替换近似)
-    p.cached_denoise_full = np.full(FULL, 0.25, np.float32)
-    p.last_denoise_key = (p.current_path, "denoise")
-    p.cached_denoise_proxy = None
-    out3 = p._executor_denoise(p.cpu_proxy_linear)
-    assert abs(float(out3.mean()) - 0.25) < 1e-3
+    p.pending_request = None
+
+    # 首个请求是代理视图:仍然对 FULL 原生源计算,返回其降采样
+    p._executor_using_proxy = True
+    out = p._executor_denoise(p.cpu_proxy_linear)
+    assert calls == [FULL]                      # 原生分辨率,而非代理分辨率
+    assert out.shape[0] < FULL[0]               # 视图拿到的是派生降采样
+    # 全图/缩放视图:零重算
+    p._executor_using_proxy = False
+    out_full = p._executor_denoise(p.cpu_linear)
+    assert calls == [FULL]
+    assert out_full.shape == FULL
+    # 再回代理:仍零重算
+    p._executor_using_proxy = True
+    p._executor_denoise(p.cpu_proxy_linear)
+    assert calls == [FULL]
+
+
+def test_denoise_survives_restart_via_disk_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("RAWALCHEMY_DENOISE_CACHE_DIR", str(tmp_path / "dc"))
+    raw = tmp_path / "img.raw"
+    raw.write_bytes(b"raw bytes")
+    calls = []
+
+    def fake_denoise(src, progress_callback=None):
+        calls.append(1)
+        return (src * 0.5).astype(np.float32)
+
+    monkeypatch.setattr(processor_module, "denoise_rgb_linear", fake_denoise)
+    monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: None)
+
+    class _Sig:
+        def emit(self, *a):
+            pass
+
+    p1 = _processor(path=str(raw))
+    p1.denoise_started = p1.denoise_progress = p1.denoise_finished = _Sig()
+    p1.pending_request = None
+    p1._executor_denoise(p1.cpu_linear)
+    assert calls == [1]
+    # 模拟重启:全新 worker,内存缓存为空 → 磁盘命中,零重算
+    p2 = _processor(path=str(raw))
+    p2.denoise_started = p2.denoise_progress = p2.denoise_finished = _Sig()
+    p2.pending_request = None
+    out = p2._executor_denoise(p2.cpu_linear)
+    assert calls == [1]
+    np.testing.assert_allclose(out, p2.cpu_linear * 0.5, atol=1e-3)
 
 
 def test_executor_denoise_serves_proxy_scale_in_proxy_mode():
@@ -146,34 +184,16 @@ def test_session_cleared_even_when_denoise_fails(monkeypatch):
     assert cleared, "session must be released on the failure path too"
 
 
-def test_view_tier_denoises_roi_buffer_and_caches(monkeypatch):
-    """放大视图:只对(DPI 挡位后的)ROI buffer 降噪,按 rect 缓存。"""
-    p = _processor()
-    p._executor_using_proxy = False
-    p._denoise_view_cache = {}
-    p._executor_params = {"_denoise_tier": "view", "_preview_roi": (64, 64, 320, 256)}
-    calls = []
-
-    def fake_denoise(src, progress_callback=None):
-        calls.append(src.shape)
-        return (src * 0.5).astype(np.float32)
-
-    monkeypatch.setattr(processor_module, "denoise_rgb_linear", fake_denoise)
-    monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: None)
-
-    class _Sig:
-        def emit(self, *a):
-            pass
-
-    p.denoise_started = p.denoise_progress = p.denoise_finished = _Sig()
-    roi_buf = np.full((128, 160, 3), 0.4, np.float32)  # 已是挡位后的小 buffer
-    out1 = p._executor_denoise(roi_buf)
-    assert calls == [(128, 160, 3)]
-    np.testing.assert_allclose(out1, 0.2, atol=1e-6)
-    out2 = p._executor_denoise(roi_buf)
-    assert calls == [(128, 160, 3)]  # rect 命中缓存
-    # rect 变化 → 重新降噪;LRU 上限 4
-    for i in range(5):
-        p._executor_params = {"_denoise_tier": "view", "_preview_roi": (i, 0, 320, 256)}
-        p._executor_denoise(roi_buf)
-    assert len(p._denoise_view_cache) <= 4
+def test_denoise_disk_cache_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAWALCHEMY_DENOISE_CACHE_DIR", str(tmp_path / "dc"))
+    from raw_alchemy.pipeline import denoise_disk_cache as DC
+    raw = tmp_path / "x.dng"
+    raw.write_bytes(b"fake raw content")
+    img = np.random.default_rng(0).random((64, 96, 3)).astype(np.float32)
+    assert DC.load(str(raw), "m1") is None
+    DC.save(str(raw), "m1", img)
+    back = DC.load(str(raw), "m1")
+    np.testing.assert_allclose(back, img, atol=1e-3)  # fp16 存储
+    assert DC.load(str(raw), "m2") is None            # 模型版本失效
+    raw.write_bytes(b"changed content!!")             # 文件变更失效
+    assert DC.load(str(raw), "m1") is None
