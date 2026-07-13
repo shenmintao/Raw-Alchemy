@@ -36,6 +36,20 @@ jobs:
           python -m pip install -e ".[test]"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # rawpy fork 走源码构建:runner 默认生成器换成 Ninja 后 LibRaw
+          # 产物带 lib 前缀(libraw_r.dll),rawpy setup 只认 MSVC 命名
+          # (raw_r.dll)。钉死 VS 生成器恢复旧命名。
+          CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Visual Studio 17 2022' || '' }}
+
+      - name: Use CPU onnxruntime for tests (Linux)
+        if: runner.os == 'Linux'
+        # 依赖声明在 linux 上装 onnxruntime-gpu(打包需要),但 CI runner
+        # 无 CUDA,grade 融合会话起不来只能逐 op 回退,
+        # test_grade_fused 的严格断言随之失败。测试环境换 CPU 构建,
+        # 融合路径在 CPUExecutionProvider 上照常跑,覆盖率不缩水。
+        run: |
+          python -m pip uninstall -y onnxruntime-gpu
+          python -m pip install onnxruntime
 
       - name: Run Ruff
         run: python -m ruff check
