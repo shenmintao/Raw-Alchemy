@@ -1,5 +1,6 @@
 ﻿import sys
 import os
+import math
 from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QListWidget, QFrame, QSplitter, QSizePolicy, QTreeView,
@@ -708,9 +709,10 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
 
     def _kick_zoom_update(self):
         """去抖加前沿(T7.9):一轮交互的第一次事件立即出活,后续事件照旧
-        尾沿合并。纯尾沿的 220ms 让第一拨滚轮/首次平移出界也要干等,是
-        "顿挫感"的固定成分;前沿多付的一次渲染在 ROI/前缀缓存下很廉价,
-        尾沿仍保证终态正确。"""
+        尾沿合并。仅用于平移出界(zoom 稳定,前沿渲染的 DPI 挡位正确);
+        缩放手势必须走纯尾沿——前沿会按手势起点的 zoom 定挡位,渲染完成时
+        用户已在更高倍率,低挡位帧被拉伸显示,就是"缩放中画质劣化"(pre6
+        Bug2)。"""
         import time as _time
         now = _time.monotonic()
         last = getattr(self, '_zoom_leading_fired', 0.0)
@@ -726,13 +728,21 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
             return
-        self._kick_zoom_update()
+        # Native base map (T7.10): zooming samples the full-resolution
+        # texture directly — no re-render, no resolution jumps.
+        if self.viewport.base_is_native():
+            return
+        # Trailing edge only (Bug2): a leading render mid-gesture bakes the
+        # wrong DPI tier; see _kick_zoom_update.
+        self._zoom_update_timer.start()
 
     def _on_viewport_resized(self, w, h):
         self._sync_preview_label_geometry(w, h)
         if not self.current_raw_path:
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
+            return
+        if self.viewport.base_is_native():
             return
         self._zoom_update_timer.start()
 
@@ -838,8 +848,11 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(img)
 
-        if roi_rect is None:
-            # Update thumbnail without scanning the full gallery.
+        if roi_rect is None and h * w <= 16_000_000:
+            # Update thumbnail without scanning the full gallery. Native-size
+            # refine results (T7.10) are skipped: same params as the
+            # interactive result that already refreshed the thumbnail, and
+            # scaling a ~40MP pixmap would stall the GUI thread.
             item = self.gallery_items_by_path.get(image_path)
             if item is not None:
                 scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
@@ -892,6 +905,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         """
         if roi_rect is not None:
             return None
+        # Scopes are statistics: stride-sample huge (native-size, T7.10)
+        # frames so the GUI-thread histogram pass stays bounded.
+        h, w = img_uint8.shape[:2]
+        if h * w > 16_000_000:
+            step = int(math.ceil((h * w / 16_000_000) ** 0.5))
+            return img_uint8[::step, ::step]
         return img_uint8
 
     def _update_histogram_async(self, img_uint8):

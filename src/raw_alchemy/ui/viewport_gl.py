@@ -185,7 +185,10 @@ class ImageViewportGL(QOpenGLWidget):
     def _create_texture():
         texture_id = GL.glGenTextures(1)
         GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+        # Trilinear minification: the native-resolution base map (T7.10) is
+        # sampled far below 1:1 at fit view — plain GL_LINEAR would shimmer.
+        # Mipmaps are (re)generated on every upload in _upload_via_pbo.
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR_MIPMAP_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
@@ -334,15 +337,25 @@ class ImageViewportGL(QOpenGLWidget):
             import ctypes
             ctypes.memmove(ptr, data.ctypes.data, data_size)
             GL.glUnmapBuffer(GL.GL_PIXEL_UNPACK_BUFFER)
+            # PBO → texture (GPU-side transfer)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+            GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h,
+                               GL.GL_RGB, GL.GL_UNSIGNED_BYTE, None)  # None = read from PBO
         else:
-            logger.warning(f"[ViewportGL] glMapBuffer failed for {w}x{h} image, skipping frame")
+            # Never drop the frame: a failed map would leave the previous
+            # texture on screen until the next unrelated repaint — to the
+            # user, "the slider did nothing". Fall back to a synchronous
+            # client-memory upload.
+            logger.warning(
+                f"[ViewportGL] glMapBuffer failed for {w}x{h} image, "
+                f"falling back to direct upload")
             GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
-            return tex_width, tex_height
+            GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+            GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h,
+                               GL.GL_RGB, GL.GL_UNSIGNED_BYTE, data)
 
-        # PBO → texture (GPU-side transfer)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
-        GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h,
-                           GL.GL_RGB, GL.GL_UNSIGNED_BYTE, None)  # None = read from PBO
+        # Keep the mip chain in step with level 0 (trilinear minification).
+        GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
         return tex_width, tex_height
@@ -408,6 +421,28 @@ class ImageViewportGL(QOpenGLWidget):
 
     def has_roi_image(self) -> bool:
         return self._has_roi
+
+    def base_is_native(self) -> bool:
+        """True when the base map holds the frame at full pipeline resolution
+        and no ROI overlay is stacked on it (T7.10).
+
+        In this state zoom/pan are pure texture sampling — the viewport
+        never needs a re-render for a view change. With an ROI overlay the
+        base may be native but stale relative to the overlay's params, so
+        view changes must keep re-rendering until the next full result
+        replaces the pair.
+        """
+        if not self._has_image or self._has_roi:
+            return False
+        if self._pending_data is not None:
+            h, w = self._pending_data.shape[:2]
+        else:
+            w, h = self._img_width, self._img_height
+        return (
+            w > 0 and h > 0
+            and w >= self._source_width
+            and h >= self._source_height
+        )
 
     def visible_source_rect(self) -> Optional[tuple]:
         """Visible region of the displayed frame, normalized to [0, 1].

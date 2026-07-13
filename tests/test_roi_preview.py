@@ -225,8 +225,14 @@ def test_roi_render_matches_crop_of_full_render_at_native_resolution():
     np.testing.assert_array_equal(roi_img, full_img[64:192, 64:192])
 
     assert processor.last_preview_source == "full"
-    # ROI previews never schedule the idle full refine (they *are* full-source).
-    assert processor._full_refine_request is None
+    # ROI previews schedule the idle native-base refine (T7.10) with the ROI
+    # state stripped, so the base map converges to the frame at pipeline
+    # resolution and later zoom/pan need no re-render.
+    refine = processor._full_refine_request
+    assert refine is not None
+    assert refine.params.get('_force_full_preview') is True
+    assert '_preview_roi' not in refine.params
+    assert '_roi_full_size' not in refine.params
 
 
 def test_roi_pan_within_margin_hits_cache_and_beyond_reruns_tail(monkeypatch):
@@ -669,3 +675,63 @@ def test_make_roi_target_size_tiers_by_dpi_and_zoom():
     params3 = dict(params, preview_zoom=10.0)
     tw3, th3 = ImageProcessor._make_roi_target_size(4000, 3000, 8000, 5320, params3)
     assert (tw3, th3) == (4000, 3000)
+
+
+def test_native_base_refine_outputs_pipeline_resolution():
+    """T7.10 — 原生分辨率底图。
+
+    fit 视图的交互渲染输出视口尺寸,并排队 idle refine;refine 结果必须是
+    管线原生尺寸(缩放纯采样的前提),且不得被交互结果的输出缓存槽短路
+    (view key 以 _force_full_preview 区分)。
+    """
+    processor, _source = _make_processor()
+    path = processor.current_path
+
+    emitted = []
+    processor.result_ready.connect(
+        lambda img, p, rid, ev, size: emitted.append((img.copy(), size))
+    )
+
+    # fit 视图(zoom=1):64x64 视口 → 输出 64x64,低于原生 → 排 refine
+    params = _view_params(zoom=1.0)
+    processor._do_process(ProcessRequest(path, dict(params), 1))
+    assert len(emitted) == 1
+    fit_img, fit_size = emitted[0]
+    assert fit_img.shape == (64, 64, 3)
+    refine = processor._full_refine_request
+    assert refine is not None and refine.params.get("_force_full_preview") is True
+
+    # 执行 refine:输出必须为 256x256 原生(短路吞掉会回吐 64x64)
+    processor._full_refine_request = None
+    processor._do_process(refine)
+    assert len(emitted) == 2
+    native_img, native_size = emitted[1]
+    assert native_img.shape == (256, 256, 3)
+    assert tuple(native_size)[:2] == (256, 256)
+    assert getattr(native_size, "roi_rect", None) is None
+    # refine 不自我续期
+    assert processor._full_refine_request is None
+
+    # 再发一次同参交互请求:命中输出缓存,但因内容低于原生仍须再排 refine
+    processor._do_process(ProcessRequest(path, dict(params), 2))
+    assert len(emitted) == 3
+    assert emitted[2][0].shape == (64, 64, 3)
+    assert processor._full_refine_request is not None
+
+
+def test_native_preview_target_size_caps():
+    from raw_alchemy.workers.image_processor import (
+        ImageProcessor,
+        NATIVE_PREVIEW_MAX_PIXELS,
+        NATIVE_PREVIEW_MAX_SIDE,
+    )
+
+    force = {"_force_full_preview": True, "viewport_size": (2560, 1440)}
+    # 常规全幅:原样输出
+    assert ImageProcessor._make_preview_target_size(7968, 5344, dict(force)) == (7968, 5344)
+    # 超长边:按 GL 纹理上限缩
+    tw, th = ImageProcessor._make_preview_target_size(20000, 2000, dict(force))
+    assert tw <= NATIVE_PREVIEW_MAX_SIDE and abs(tw / th - 10.0) < 0.1
+    # 超像素数:按host内存上限缩
+    tw, th = ImageProcessor._make_preview_target_size(12000, 9000, dict(force))
+    assert tw * th <= NATIVE_PREVIEW_MAX_PIXELS

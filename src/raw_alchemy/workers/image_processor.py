@@ -50,6 +50,14 @@ ROI_FULL_COVERAGE_FRACTION = 0.9
 # Safety cap for the ROI output texture (>= 4K viewport * 1.5 margin^2).
 ROI_MAX_OUTPUT_PIXELS = 24_000_000
 
+# ===== native-resolution base map (T7.10) =====
+# The idle full refine outputs the frame at pipeline (native) resolution so
+# the viewport can zoom/pan by pure texture sampling with no re-render and
+# no resolution jumps. Caps: max texture side every desktop GL / D3D11-FL11
+# device guarantees, plus a host-memory bound (~80MP -> 240MB uint8).
+NATIVE_PREVIEW_MAX_SIDE = 16384
+NATIVE_PREVIEW_MAX_PIXELS = 80_000_000
+
 
 class RoiSourceSize(tuple):
     """(width, height) of the full preview frame, plus the ROI pixel rect.
@@ -798,6 +806,11 @@ class ImageProcessor(QThread):
             round(float(params.get('preview_zoom', 1.0) or 1.0), 3),
             round(float(params.get('device_pixel_ratio', 1.0) or 1.0), 2),
             _as_hashable(params.get('_preview_roi')),
+            # A refine renders different pixels (native size, full source)
+            # than the interactive request it followed; without this bit the
+            # refine hits the interactive result's output slot and re-emits
+            # it — the refine never actually refines.
+            bool(params.get('_force_full_preview')),
         )
 
     @classmethod
@@ -807,6 +820,22 @@ class ImageProcessor(QThread):
 
     @staticmethod
     def _make_preview_target_size(src_w: int, src_h: int, params: ProcessorParams):
+        if params.get('_force_full_preview'):
+            # Native-resolution base map: the idle refine outputs the frame
+            # at pipeline resolution so zooming is pure texture sampling —
+            # no re-render, no resolution jumps. Clamped to what a GL
+            # texture can hold (D3D11 FL11 / desktop GL guarantee 16384)
+            # and a host-memory sanity cap.
+            scale = min(
+                1.0,
+                NATIVE_PREVIEW_MAX_SIDE / float(max(src_w, src_h, 1)),
+                (NATIVE_PREVIEW_MAX_PIXELS / float(max(src_w * src_h, 1))) ** 0.5,
+            )
+            return (
+                max(1, int(src_w * scale)),
+                max(1, int(src_h * scale)),
+            )
+
         viewport_size = params.get('viewport_size')
         if not viewport_size or src_w <= 0 or src_h <= 0:
             return src_w, src_h
@@ -992,6 +1021,10 @@ class ImageProcessor(QThread):
         refine_params = params.copy()
         refine_params['_force_full_preview'] = True
         refine_params['_preview_source'] = 'full'
+        # The refine renders the whole frame: ROI state from the interactive
+        # request it follows must not leak into its op list or view key.
+        refine_params.pop('_preview_roi', None)
+        refine_params.pop('_roi_full_size', None)
         with self.lock:
             self._full_refine_request = ProcessRequest(
                 request.path,
@@ -1460,7 +1493,16 @@ class ImageProcessor(QThread):
                 self._restore_export_state_from_entry(cached_item, params)
                 self.last_preview_source = preview_source
                 self.preview_source_changed.emit(preview_source)
-                if use_proxy:
+                # Refine towards the native base map (T7.10) whenever the
+                # cached output is below pipeline resolution: proxy renders,
+                # ROI renders, and fit-size full renders alike.
+                cached_h, cached_w = cached_uint8.shape[:2]
+                below_native = (
+                    use_proxy
+                    or params.get('_preview_roi') is not None
+                    or (cached_w, cached_h) != tuple(cached_source_size)[:2]
+                )
+                if not params.get('_force_full_preview') and below_native:
                     self._schedule_full_refinement(request, params)
                 self.result_ready.emit(
                     cached_uint8,
@@ -1585,10 +1627,12 @@ class ImageProcessor(QThread):
             )
 
             cached_item = self.cache_manager.get(request.path)
-            if cached_item:
+            if cached_item and not params.get('_force_full_preview'):
                 # Multi-slot output cache (T7.4): keeps a few recent outputs
                 # keyed by (pipeline key, view key), so e.g. fit and the
-                # current zoom level survive side by side.
+                # current zoom level survive side by side. Native-size refine
+                # results (T7.10) are display pushes, not cache material —
+                # ten ~130MB slots would be pure host-RAM bloat.
                 cached_item.store_output(
                     output_key, img_uint8.copy(), applied_ev, output_source_size
                 )
@@ -1601,7 +1645,14 @@ class ImageProcessor(QThread):
                 applied_ev,
                 output_source_size,
             )
-            if use_proxy:
+            # Chase the native base map (T7.10): any interactive result below
+            # pipeline resolution — proxy, ROI, or downscaled full frame —
+            # queues an idle refine. Refines never re-queue themselves.
+            if not params.get('_force_full_preview') and (
+                use_proxy
+                or roi_info is not None
+                or (target_w, target_h) != (source_w, source_h)
+            ):
                 self._schedule_full_refinement(request, params)
 
         except Exception as e:
