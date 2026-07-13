@@ -159,6 +159,33 @@ class _BaseExecutor:
         buf.clear()  # recycle the working buffer (export path materializes to host)
         return PipelineResult(image, self.last_applied_ev)
 
+    def _slice_crop(self, src: GpuImage, op: Op) -> GpuImage:
+        """crop 的只读切片实现:不触碰 src(T7.9 恢复点免整帧复制的前提)。"""
+        dst = GpuImage()
+        apply_crop_gpu(src, dst, op.params[0])
+        return dst
+
+    def _slice_roi(self, src: GpuImage, op: Op) -> GpuImage:
+        """roi 的只读切片实现(T7.5 语义不变,见原注释):
+        preview-only 可见区裁剪;6-tuple 形式尾随 DPI 挡位下采样。
+        不触碰 src——run_result 的恢复点借用缓存前缀时直接调用。"""
+        x, y, w, h = op.params[:4]
+        dst = GpuImage()
+        apply_crop_pixels_gpu(src, dst, int(x), int(y), int(w), int(h))
+        if len(op.params) == 6:
+            import cv2
+
+            out_w, out_h = int(op.params[4]), int(op.params[5])
+            if 0 < out_w < int(w) or 0 < out_h < int(h):
+                small = cv2.resize(
+                    dst.to_numpy(), (out_w, out_h),
+                    interpolation=cv2.INTER_AREA,
+                )
+                dst.clear()
+                dst = GpuImage()
+                dst.upload(np.ascontiguousarray(small))
+        return dst
+
     def _apply_op(self, buf: GpuImage, op: Op) -> GpuImage:
         if op.name == "denoise":
             if self.denoiser is None:
@@ -190,36 +217,12 @@ class _BaseExecutor:
             return dst
 
         if op.name == "crop":
-            dst = GpuImage()
-            apply_crop_gpu(buf, dst, op.params[0])
+            dst = self._slice_crop(buf, op)
             buf.clear()
             return dst
 
         if op.name == "roi":
-            # Preview-only visible-region crop (T7.5): integer pixel rect in
-            # the coordinate space of the buffer at this pipeline position
-            # (after geometry/perspective/crop, before the color ops). The
-            # worker injects it so zoom>fit runs process only the on-screen
-            # region plus margins; export op lists never contain it.
-            # 6-tuple form (T7.5+ DPI tier): (x, y, w, h, out_w, out_h) —
-            # after cropping, downscale to the screen-density target so the
-            # colour chain never renders pixels the display cannot show
-            # (zoom levels between fit and 1:1 used to oversample up to 4x).
-            x, y, w, h = op.params[:4]
-            dst = GpuImage()
-            apply_crop_pixels_gpu(buf, dst, int(x), int(y), int(w), int(h))
-            if len(op.params) == 6:
-                import cv2
-
-                out_w, out_h = int(op.params[4]), int(op.params[5])
-                if 0 < out_w < int(w) or 0 < out_h < int(h):
-                    small = cv2.resize(
-                        dst.to_numpy(), (out_w, out_h),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                    dst.clear()
-                    dst = GpuImage()
-                    dst.upload(np.ascontiguousarray(small))
+            dst = self._slice_roi(buf, op)
             buf.clear()
             return dst
 
@@ -721,9 +724,30 @@ class PreviewExecutor(_BaseExecutor):
 
         buf = GpuImage()
         if cached_stage is not None:
-            # Resume from the GPU-resident prefix: device-to-device copy,
-            # zero host traffic (T7.2).
-            buf.copy_from(cached_stage.gpu)
+            resume_op = ops[start_index] if start_index < len(ops) else None
+            if resume_op is not None and resume_op.name in ("roi", "crop"):
+                # T7.9:恢复点是非破坏性裁剪(平移/缩放只改 roi 及其后)时,
+                # 直接在缓存前缀上只读切片,跳过整帧 copy_from——
+                # 45MP≈540MB 的主机 memcpy 是 zoom>1 交互的最大稳态成本。
+                if should_abort is not None and should_abort():
+                    raise PipelineAborted("preview run superseded before resume slice")
+                buf = (self._slice_roi if resume_op.name == "roi"
+                       else self._slice_crop)(cached_stage.gpu, resume_op)
+                snapshot = GpuImage()
+                snapshot.copy_from(buf)
+                prefix_key = prefix_keys[start_index]
+                old_stage = self._prefix_cache.get(prefix_key)
+                if old_stage is not None:
+                    old_stage.gpu.clear()
+                self._prefix_cache[prefix_key] = _CachedStage(
+                    snapshot, self.last_applied_ev
+                )
+                self._prefix_lengths[prefix_key] = start_index + 1
+                start_index += 1
+            else:
+                # Resume from the resident prefix (T7.2): whole-frame copy —
+                # the following op mutates the working buffer in place.
+                buf.copy_from(cached_stage.gpu)
         else:
             source_stage = self._prefix_cache.get(_SOURCE_PREFIX_KEY)
             if source_stage is not None:
