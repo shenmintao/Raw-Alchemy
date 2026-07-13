@@ -8,7 +8,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2022  # runner-images#13638 VS2026 换代,见 ci.yml
             platform: windows
             ext: zip
           - os: ubuntu-latest
