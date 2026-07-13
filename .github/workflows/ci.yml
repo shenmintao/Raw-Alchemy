@@ -25,6 +25,15 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
+      - name: Install Qt headless runtime libs (Linux)
+        if: runner.os == 'Linux'
+        # PySide6 的 import 需要 EGL/GL 动态库,无头 runner 不带
+        # (test_gui_workflow 在 import export_controller 时即
+        # ImportError: libEGL.so.1)。
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libegl1 libgl1 libxkbcommon-x11-0
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

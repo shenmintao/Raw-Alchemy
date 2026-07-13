@@ -14,7 +14,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "rawpy @ git+https://github.com/shenmintao/rawpy.git@f857909f2f308d827065691725df0ec5402210c4",
+    "rawpy @ git+https://github.com/shenmintao/rawpy.git@7859f60f544660b4bbea787a33df680e73ecc3f3",
     "numpy",
     "requests",
     "tifffile",
