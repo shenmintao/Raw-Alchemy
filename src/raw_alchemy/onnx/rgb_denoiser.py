@@ -104,7 +104,10 @@ def denoise_rgb_linear(
     t0 = time.time()
     session = _get_session()
 
-    strength = float(np.clip(strength, 0.01, 0.6))
+    # 上限 0.5:σ 扫描实测(scratch sigma_cast_sweep)σ 超过 0.5 后中性灰
+    # R/G、B/G 漂移超 -5%(偏绿),两种曝光/噪声水平下单调恶化;0.30-0.45
+    # 是最干净带。旧 sidecar 里 >0.5 的值在此一并夹回。
+    strength = float(np.clip(strength, 0.01, 0.5))
     lin = np.clip(linear_rgb.astype(np.float32, copy=False), 0.0, 1.0)
     gain = compute_gain(lin)
     gained = lin * gain

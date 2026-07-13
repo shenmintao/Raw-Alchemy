@@ -326,7 +326,9 @@ class InspectorPanel(ScrollArea):
         dn_header_layout.addWidget(self.denoise_strength_revert_btn)
 
         self.denoise_strength_slider = NoWheelSlider(Qt.Orientation.Horizontal)
-        self.denoise_strength_slider.setRange(5, 60)
+        # σ>0.5 时 FastDenoise v4 中性灰漂移进入肉眼区间(σ 扫描实测:
+        # 0.5 约 -4%,0.6 约 -6%~-7% R/G、B/G),上限收到 0.5。
+        self.denoise_strength_slider.setRange(5, 50)
         self.denoise_strength_slider.setValue(25)
         self.denoise_strength_slider.sliderPressed.connect(self._on_param_interaction_started)
         self.denoise_strength_slider.sliderReleased.connect(self._on_param_interaction_finished)
