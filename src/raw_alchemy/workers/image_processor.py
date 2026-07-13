@@ -1279,6 +1279,39 @@ class ImageProcessor(QThread):
                 self.cached_lens_key = next_lens_key
             self._executor_corrected_source = corrected_source
 
+    def _maybe_swap_denoised_source(self, ops, params: ProcessorParams):
+        """T7.9(病灶2):降噪结果已缓存时,把它直接作为执行器源,并从
+        交互 op 表剔除 denoise op。
+
+        原路径里 denoise op 即使全缓存命中也要付一次整帧
+        to_numpy+upload 往返(45MP≈2×540MB 主机拷贝),且降噪前缀与
+        源前缀各驻一块全帧,在 EXECUTOR_CACHE_LIMIT 预算内互相挤兑。
+        直灌源后:交互链首 op 变为 lens/geometry/roi,少两趟整帧拷贝、
+        少一块常驻全帧;语义不变(denoise 本就是链首,输入=输出源)。
+
+        未缓存(首次开启/换 strength/磁盘缓存未加载)时返回原 op 表:
+        denoise op 现场计算并落缓存,下一次请求自然切换到直灌源。
+        导出路径(_sync_executor_export_source)与测光源
+        (_prepare_executor_source_state)本就独立于交互 op 表,不受影响。
+        """
+        if not ops or ops[0].name != "denoise":
+            return ops, None
+        strength = round(float(params.get('denoise_strength', 0.25) or 0.25), 3)
+        if ((self._executor_path, 'denoise', strength) != self.last_denoise_key
+                or self.cached_denoise_full is None):
+            return ops, None
+        if self._executor_using_proxy:
+            if self.cached_denoise_proxy is None:
+                self.cached_denoise_proxy = self._make_proxy(self.cached_denoise_full)
+            source = self.cached_denoise_proxy
+            if source is None:
+                source = self.cached_denoise_full
+        else:
+            source = self.cached_denoise_full
+        # 直接引用缓存数组:同一对象跨请求身份稳定,executor.set_source
+        # 不会误判源变化而清前缀(它按数组对象身份判断)。
+        return list(ops[1:]), source
+
     def _sync_executor_export_source(self, params: ProcessorParams):
         if self._executor_using_proxy:
             return
@@ -1445,6 +1478,7 @@ class ImageProcessor(QThread):
             self._invalidate_executor_prefix_if_needed(params)
 
             ops = build_op_list(params)
+            ops, denoised_source = self._maybe_swap_denoised_source(ops, params)
             if roi_info is not None:
                 # The ROI crop is a preview-only op: it only narrows the
                 # source region, so the color-pipeline parameter caches
@@ -1456,7 +1490,8 @@ class ImageProcessor(QThread):
                 _tw, _th = self._make_roi_target_size(_rw, _rh, _fw, _fh, params)
                 _roi_out = (_tw, _th) if (_tw < _rw * 0.95 or _th < _rh * 0.95) else None
                 ops = self._insert_roi_op(ops, roi_info[0], _roi_out)
-            executor_source = self._select_executor_source(use_proxy)
+            executor_source = (denoised_source if denoised_source is not None
+                               else self._select_executor_source(use_proxy))
             executor = self._get_preview_executor()
             # Cooperative cancellation (T7.3): a newer user request aborts
             # this run at the next op boundary (completed prefixes stay
