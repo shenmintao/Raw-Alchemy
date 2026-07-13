@@ -17,7 +17,12 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - windows-latest
+          # windows-latest 正在滚动换代到 Server2025+VS2026 beta
+          # (actions/runner-images#13638),裸 pip 环境下 MSVC 工具链
+          # 不在 PATH,rawpy fork 的 LibRaw cmake 构建连环失配。
+          # 钉到稳定镜像;fork 侧的命名自适应(shenmintao/rawpy@eb9ff0b 起)
+          # 留作 2022 退役时的过渡保障。
+          - windows-2022
         python-version:
           - '3.12'
 
