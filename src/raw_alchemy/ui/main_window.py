@@ -706,12 +706,27 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self._schedule_current_sidecar_write()
         self.update_timer.start()
 
+    def _kick_zoom_update(self):
+        """去抖加前沿(T7.9):一轮交互的第一次事件立即出活,后续事件照旧
+        尾沿合并。纯尾沿的 220ms 让第一拨滚轮/首次平移出界也要干等,是
+        "顿挫感"的固定成分;前沿多付的一次渲染在 ROI/前缀缓存下很廉价,
+        尾沿仍保证终态正确。"""
+        import time as _time
+        now = _time.monotonic()
+        last = getattr(self, '_zoom_leading_fired', 0.0)
+        interval = self._zoom_update_timer.interval() / 1000.0
+        if (not self._zoom_update_timer.isActive()
+                and now - last > interval):
+            self._zoom_leading_fired = now
+            self.trigger_processing()
+        self._zoom_update_timer.start()
+
     def _on_viewport_zoom_changed(self, zoom):
         if not self.current_raw_path:
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
             return
-        self._zoom_update_timer.start()
+        self._kick_zoom_update()
 
     def _on_viewport_resized(self, w, h):
         self._sync_preview_label_geometry(w, h)
@@ -722,12 +737,13 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self._zoom_update_timer.start()
 
     def _on_viewport_roi_update_needed(self):
-        """Pan left the rendered ROI coverage (T7.5): re-render, debounced."""
+        """Pan left the rendered ROI coverage (T7.5): re-render, debounced
+        with a leading edge (T7.9)."""
         if not self.current_raw_path:
             return
         if getattr(self, 'processor_connection_mode', 'normal') != 'normal':
             return
-        self._zoom_update_timer.start()
+        self._kick_zoom_update()
 
     def _add_preview_output_params(self, params, include_visible_rect=True):
         params = params.copy()

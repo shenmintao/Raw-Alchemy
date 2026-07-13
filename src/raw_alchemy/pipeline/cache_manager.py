@@ -13,7 +13,10 @@ from raw_alchemy import config
 # most recent output (primary slot) plus a few secondary slots so e.g. the
 # fit view and the current zoom level each keep one — a fit<->100% round
 # trip then costs zero recomputation.
-OUTPUT_SLOT_LIMIT = 4
+# T7.9:4 → 10。zoom>1 的 output_key 含量化 ROI 矩形,连续平移每一步
+# 都占新槽,4 槽只够 2-3 步平移的回看;uint8 ROI 输出是屏幕像素级
+# (数十 MB/槽),10 槽的内存代价远低于回访重算一趟 color 链。
+OUTPUT_SLOT_LIMIT = 10
 
 
 class CachedImage:
