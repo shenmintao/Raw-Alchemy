@@ -1,12 +1,11 @@
 """
 OpenGL Viewport Widget for GPU-accelerated image display.
 
-Uses PBO (Pixel Buffer Object) for efficient GPU→texture upload:
-  Taichi GPU buffer → to_numpy() → PBO (async) → OpenGL texture → screen
+Uses a PBO (Pixel Buffer Object) for efficient host→texture upload:
+  numpy uint8 frame → PBO → OpenGL texture → screen
 
 Data flow:
-  GpuImage (ti.ndarray, GPU) → numpy (CPU) → PBO → texture → fullscreen quad
-  Only viewport-sized data crosses GPU→CPU (e.g. 1920x1080 = ~6MB, <1ms)
+  shared numpy result → PBO → texture → fullscreen quad
 """
 import numpy as np
 from typing import Optional
@@ -23,6 +22,8 @@ from PySide6.QtOpenGL import (
     QOpenGLTexture,
 )
 from OpenGL import GL
+
+from raw_alchemy import config
 
 
 # Vertex shader: fullscreen quad
@@ -102,6 +103,8 @@ class ImageViewportGL(QOpenGLWidget):
         # OpenGL objects (created in initializeGL)
         self._texture_id = 0
         self._pbo_id = 0
+        self._pbo_bytes = 0
+        self._pbo_trim_pending = False
         self._vao = 0
         self._vbo = 0
         self._shader_program = None
@@ -124,6 +127,8 @@ class ImageViewportGL(QOpenGLWidget):
         # ROI rect (x, y, w, h) in full-frame pixel coordinates.
         self._roi_rect_px: Optional[tuple] = None
         self._has_roi = False
+        self._clear_base_texture_pending = False
+        self._clear_roi_texture_pending = False
 
     def initializeGL(self):
         """Set up OpenGL state, shaders, buffers."""
@@ -163,14 +168,16 @@ class ImageViewportGL(QOpenGLWidget):
         GL.glBindVertexArray(0)
 
         # --- Textures (base full-frame + ROI overlay) ---
-        self._texture_id = self._create_texture()
-        self._roi_texture_id = self._create_texture()
+        self._texture_id = self._create_texture(use_mipmaps=True)
+        self._roi_texture_id = self._create_texture(use_mipmaps=False)
         # Fresh GL context: force (re)allocation on the next upload.
         self._img_width = self._img_height = 0
         self._roi_img_width = self._roi_img_height = 0
 
         # --- PBO for async pixel upload ---
         self._pbo_id = GL.glGenBuffers(1)
+        self._pbo_bytes = 0
+        self._pbo_trim_pending = False
 
         self._initialized = True
         logger.debug("[ViewportGL] OpenGL initialized.")
@@ -182,13 +189,17 @@ class ImageViewportGL(QOpenGLWidget):
             self._roi_pending_data = self._roi_last_image
 
     @staticmethod
-    def _create_texture():
+    def _create_texture(*, use_mipmaps: bool):
         texture_id = GL.glGenTextures(1)
         GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
         # Trilinear minification: the native-resolution base map (T7.10) is
         # sampled far below 1:1 at fit view — plain GL_LINEAR would shimmer.
         # Mipmaps are (re)generated on every upload in _upload_via_pbo.
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR_MIPMAP_LINEAR)
+        GL.glTexParameteri(
+            GL.GL_TEXTURE_2D,
+            GL.GL_TEXTURE_MIN_FILTER,
+            GL.GL_LINEAR_MIPMAP_LINEAR if use_mipmaps else GL.GL_LINEAR,
+        )
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
@@ -238,7 +249,18 @@ class ImageViewportGL(QOpenGLWidget):
         """Render the base texture, then the ROI overlay on top (T7.5)."""
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
 
+        # Texture/PBO storage must be reclaimed with a current GL context.
+        if self._clear_base_texture_pending:
+            self._release_texture_storage(self._texture_id)
+            self._img_width = self._img_height = 0
+            self._clear_base_texture_pending = False
+        if self._clear_roi_texture_pending:
+            self._release_texture_storage(self._roi_texture_id)
+            self._roi_img_width = self._roi_img_height = 0
+            self._clear_roi_texture_pending = False
+
         if not self._has_image and not self._has_roi:
+            self._release_pbo_storage()
             return
 
         # Upload pending data via PBO
@@ -246,12 +268,14 @@ class ImageViewportGL(QOpenGLWidget):
             self._img_width, self._img_height = self._upload_via_pbo(
                 self._pending_data, self._texture_id,
                 self._img_width, self._img_height,
+                generate_mipmaps=True,
             )
             self._pending_data = None
         if self._roi_pending_data is not None:
             self._roi_img_width, self._roi_img_height = self._upload_via_pbo(
                 self._roi_pending_data, self._roi_texture_id,
                 self._roi_img_width, self._roi_img_height,
+                generate_mipmaps=False,
             )
             self._roi_pending_data = None
 
@@ -286,6 +310,8 @@ class ImageViewportGL(QOpenGLWidget):
             )
 
         self._shader_program.release()
+        if self._pbo_trim_pending:
+            self._release_pbo_storage()
 
     def _draw_quad(self, texture_id, scale_x, scale_y, offset_x, offset_y):
         """Draw the unit quad with the given texture and NDC placement."""
@@ -305,7 +331,36 @@ class ImageViewportGL(QOpenGLWidget):
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
         GL.glBindVertexArray(0)
 
-    def _upload_via_pbo(self, data: np.ndarray, texture_id, tex_width, tex_height):
+    @staticmethod
+    def _release_texture_storage(texture_id):
+        if not texture_id:
+            return
+        GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+        GL.glTexImage2D(
+            GL.GL_TEXTURE_2D, 0, GL.GL_RGB8,
+            1, 1, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, None,
+        )
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+
+    def _release_pbo_storage(self):
+        if not self._pbo_id or self._pbo_bytes <= 0:
+            self._pbo_trim_pending = False
+            return
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self._pbo_id)
+        GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, 0, None, GL.GL_STREAM_DRAW)
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+        self._pbo_bytes = 0
+        self._pbo_trim_pending = False
+
+    def _upload_via_pbo(
+        self,
+        data: np.ndarray,
+        texture_id,
+        tex_width,
+        tex_height,
+        *,
+        generate_mipmaps: bool,
+    ):
         """Upload pixel data to a texture via PBO (async-friendly).
 
         Returns the texture's (width, height) after the upload so the caller
@@ -329,7 +384,9 @@ class ImageViewportGL(QOpenGLWidget):
 
         # Upload via PBO
         GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self._pbo_id)
-        GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, data_size, None, GL.GL_STREAM_DRAW)
+        if data_size > self._pbo_bytes:
+            GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, data_size, None, GL.GL_STREAM_DRAW)
+            self._pbo_bytes = data_size
 
         # Map PBO, copy data
         ptr = GL.glMapBuffer(GL.GL_PIXEL_UNPACK_BUFFER, GL.GL_WRITE_ONLY)
@@ -354,10 +411,15 @@ class ImageViewportGL(QOpenGLWidget):
             GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h,
                                GL.GL_RGB, GL.GL_UNSIGNED_BYTE, data)
 
-        # Keep the mip chain in step with level 0 (trilinear minification).
-        GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+        # Only the full-frame base needs a mip chain. Detail ROIs are already
+        # rendered near display resolution; mipmaps add 33% texture VRAM and
+        # regeneration cost without a visible benefit.
+        if generate_mipmaps:
+            GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+        if data_size > int(config.PBO_RETAIN_LIMIT_MB) * 1024 * 1024:
+            self._pbo_trim_pending = True
         return tex_width, tex_height
 
     def set_image(self, img_uint8: np.ndarray, source_size=None):
@@ -384,7 +446,7 @@ class ImageViewportGL(QOpenGLWidget):
             self._source_width = img_uint8.shape[1]
             self._source_height = img_uint8.shape[0]
         self._has_image = True
-        self._clear_roi_state()
+        self._clear_roi_state(release_texture=True)
         self.update()  # Schedule repaint
 
     def set_roi_image(self, img_uint8: np.ndarray, source_size, roi_rect):
@@ -413,11 +475,13 @@ class ImageViewportGL(QOpenGLWidget):
         self._has_roi = True
         self.update()
 
-    def _clear_roi_state(self):
+    def _clear_roi_state(self, *, release_texture=False):
         self._has_roi = False
         self._roi_pending_data = None
         self._roi_last_image = None
         self._roi_rect_px = None
+        if release_texture and (self._roi_img_width > 0 or self._roi_img_height > 0):
+            self._clear_roi_texture_pending = True
 
     def has_roi_image(self) -> bool:
         return self._has_roi
@@ -502,7 +566,9 @@ class ImageViewportGL(QOpenGLWidget):
         self._has_image = False
         self._pending_data = None
         self._last_image = None
-        self._clear_roi_state()
+        self._clear_roi_state(release_texture=True)
+        if self._img_width > 0 or self._img_height > 0:
+            self._clear_base_texture_pending = True
         self._source_width = 0
         self._source_height = 0
         self._zoom = 1.0

@@ -19,13 +19,17 @@ from raw_alchemy.pipeline.ops import build_op_list
 # ==========================================
 
 def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
-    """Per-channel black level subtraction and normalization to [0, 1]."""
+    """Per-channel black subtraction, normalising the fresh decode in-place."""
+    sensor_raw = np.asarray(sensor_raw, dtype=np.float32)
     pat_size = cfa_pattern.shape[0]
     bl = np.asarray(bl, np.float32)
     # 常见情况:各通道黑电平相同 → 单次全图向量运算(42MP 省 ~0.5s)
     if np.all(bl == bl.flat[0]):
         b = float(bl.flat[0])
-        return np.maximum(sensor_raw - b, 0) / (wl - b)
+        sensor_raw -= np.float32(b)
+        np.maximum(sensor_raw, np.float32(0.0), out=sensor_raw)
+        sensor_raw /= np.float32(wl - b)
+        return sensor_raw
     # 通用:黑电平图按 CFA 铺开,单次运算
     H, W = sensor_raw.shape
     blk = np.empty((pat_size, pat_size), np.float32)
@@ -34,7 +38,11 @@ def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
             blk[r, c] = bl[min(int(cfa_pattern[r, c]), len(bl) - 1)]
     bl_map = np.tile(blk, ((H + pat_size - 1) // pat_size,
                            (W + pat_size - 1) // pat_size))[:H, :W]
-    return np.maximum(sensor_raw - bl_map, 0) / (wl - bl_map)
+    sensor_raw -= bl_map
+    np.maximum(sensor_raw, np.float32(0.0), out=sensor_raw)
+    np.subtract(np.float32(wl), bl_map, out=bl_map)
+    np.divide(sensor_raw, bl_map, out=sensor_raw)
+    return sensor_raw
 
 
 def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
@@ -80,7 +88,7 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     color_map = np.tile(cfa_pattern,
                         ((H + pat_size - 1) // pat_size,
                          (W + pat_size - 1) // pat_size))[:H, :W]
-    color_map = np.where(color_map >= 3, 1, color_map).astype(np.int32)
+    color_map = np.where(color_map >= 3, 1, color_map).astype(np.uint8)
 
     wb_gains = np.array([wb[0] / g, 1.0, wb[2] / g], dtype=np.float32)
     CLIP = 0.987
@@ -95,6 +103,7 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
         return
 
     diff = raw_data - refavg
+    del refavg
     # 7x7 square SE 鈥?closes gaps up to 6 px wide.
     closing_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
 
@@ -143,7 +152,7 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
         target_labels = labels[target]
         raw_data[target] = np.maximum(
             raw_data[target],
-            refavg[target] + seg_chroma[target_labels]
+            raw_data[target] - diff[target] + seg_chroma[target_labels]
         )
 
 
@@ -264,7 +273,8 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
             from raw_alchemy.onnx.xtrans_demosaic import xtrans_markesteijn_demosaic
             rgb = xtrans_markesteijn_demosaic(raw_norm, cfa_pattern)
             rgb *= wb3
-            rgb = np.einsum('ij,hwj->hwi', m, rgb, optimize=True).astype(np.float32)
+            from raw_alchemy.math_ops import apply_matrix_inplace
+            apply_matrix_inplace(rgb, m)
             np.clip(rgb, 0.0, 1.0, out=rgb)
         return np.ascontiguousarray(_apply_flip(rgb, flip))
 
@@ -311,7 +321,8 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     rgb[:, :, 2] *= wb[2] / g
 
     cam_to_working = cam_to_working_space_matrix(xyz_to_cam).astype(np.float32)
-    rgb = np.einsum('ij,hwj->hwi', cam_to_working, rgb, optimize=True).astype(np.float32)
+    from raw_alchemy.math_ops import apply_matrix_inplace
+    apply_matrix_inplace(rgb, cam_to_working)
     rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
     np.clip(rgb, 0.0, 1.0, out=rgb)
     return rgb
@@ -571,7 +582,10 @@ def export_from_cache(
         hdr_output=hdr_output,
     )
 
-    img = _run_export_executor(cached_img.copy(), params, metering_source=cached_img)
+    # ExportExecutor ingests the source into its own working buffer before any
+    # in-place operation. Passing the immutable cache array directly avoids a
+    # redundant full-resolution copy (about 732MB for 61MP float32 RGB).
+    img = _run_export_executor(cached_img, params, metering_source=cached_img)
     img, color_matrix = _linearize_for_dng(img, output_path, log_space, lut_path, logger)
 
     logger.info(f"  Saving to {filename}...")

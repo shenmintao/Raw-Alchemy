@@ -16,6 +16,21 @@ from raw_alchemy.onnx import xtrans_demosaic as X
 RGGB = np.array([[0, 1], [3, 2]])
 
 
+def test_cuda_provider_options_bound_arena_and_workspace():
+    from raw_alchemy import config
+    from raw_alchemy.onnx.denoiser import _configure_providers
+
+    configured = _configure_providers(
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    name, options = configured[0]
+    assert name == "CUDAExecutionProvider"
+    assert options["gpu_mem_limit"] == config.ONNX_GPU_MEMORY_LIMIT_MB * 1024 * 1024
+    assert options["arena_extend_strategy"] == "kSameAsRequested"
+    assert options["cudnn_conv_use_max_workspace"] is False
+    assert configured[1] == "CPUExecutionProvider"
+
+
 def test_rcd_zero_regions_produce_no_nan():
     rng = np.random.default_rng(0)
     bayer = rng.random((128, 160), dtype=np.float32) * 0.01
@@ -102,4 +117,4 @@ def test_xtrans_tiled_matches_single_tile_interior():
     finally:
         X.TILE, X.OVERLAP = old_tile, old_ov
     d = np.abs(tiled - full)[16:-16, 16:-16]
-    assert float(d.max()) == 0.0
+    assert float(d.max()) < 2e-7

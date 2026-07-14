@@ -185,6 +185,20 @@ class AboutPanel(QWidget):
                 tr('no_update_message', version=latest_version),
                 parent=self
             )
+
+    def shutdown_worker(self):
+        """Join an in-flight update check so its QThread is not destroyed live."""
+        worker = self.version_worker
+        if worker is None:
+            return
+        try:
+            worker.version_checked.disconnect(self.on_version_checked)
+        except (TypeError, RuntimeError):
+            pass
+        if worker.isRunning():
+            worker.wait()
+        worker.deleteLater()
+        self.version_worker = None
     
     def export_logs(self):
         """Export logs to file"""

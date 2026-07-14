@@ -18,7 +18,7 @@ from typing import Optional
 from PySide6.QtCore import QThread, Signal
 from loguru import logger
 
-from raw_alchemy import config, metering
+from raw_alchemy import config, metering, utils
 from raw_alchemy.math_ops import (
     apply_matrix_inplace,
     float_to_uint8_gpu,
@@ -50,13 +50,17 @@ ROI_FULL_COVERAGE_FRACTION = 0.9
 # Safety cap for the ROI output texture (>= 4K viewport * 1.5 margin^2).
 ROI_MAX_OUTPUT_PIXELS = 24_000_000
 
-# ===== native-resolution base map (T7.10) =====
-# The idle full refine outputs the frame at pipeline (native) resolution so
-# the viewport can zoom/pan by pure texture sampling with no re-render and
-# no resolution jumps. Caps: max texture side every desktop GL / D3D11-FL11
-# device guarantees, plus a host-memory bound (~80MP -> 240MB uint8).
-NATIVE_PREVIEW_MAX_SIDE = 16384
-NATIVE_PREVIEW_MAX_PIXELS = 80_000_000
+# ===== bounded quality base map (layered presentation tiers) =====
+# Fit/ordinary zoom uses a quality base capped at 4096px; 1:1 detail comes
+# from the existing native ROI path.  This avoids pinning a full 45/61MP host
+# frame, PBO and mipmapped texture just to show a fit-sized image.
+QUALITY_BASE_MAX_SIDE = int(config.QUALITY_BASE_MAX_SIDE)
+QUALITY_BASE_MAX_PIXELS = int(config.QUALITY_BASE_MAX_PIXELS)
+# Compatibility aliases for older integrations importing these names.
+NATIVE_PREVIEW_MAX_SIDE = QUALITY_BASE_MAX_SIDE
+NATIVE_PREVIEW_MAX_PIXELS = QUALITY_BASE_MAX_PIXELS
+
+DECODE_SESSION_IDLE_SECONDS = 15.0
 
 
 class RoiSourceSize(tuple):
@@ -76,10 +80,10 @@ class RoiSourceSize(tuple):
 
 class ImageProcessor(QThread):
     """
-    GPU-resident image processing worker.
+    Sequential worker using pooled numpy buffers plus ONNX acceleration.
 
-    Processing pipeline (all on GPU via ti.ndarray):
-      RAW decode -> upload -> lens -> geometry -> perspective -> crop ->
+    Processing pipeline:
+      RAW decode -> lens -> geometry -> perspective -> crop ->
       exposure -> WB/HS/Sat/Con -> Log/Matrix -> LUT -> sRGB ->
       denoise -> sharpen -> display
 
@@ -96,9 +100,11 @@ class ImageProcessor(QThread):
     export_finished = Signal(bool, str)
     preview_source_changed = Signal(str)
 
-    def __init__(self):
+    def __init__(self, *, retain_preview_cache: bool = True, warmup_sessions: bool = True):
         super().__init__()
         self.lock = threading.Lock()
+        self.retain_preview_cache = bool(retain_preview_cache)
+        self.warmup_sessions = bool(warmup_sessions)
 
         # Request management
         self.pending_request: Optional[ProcessRequest] = None
@@ -154,13 +160,30 @@ class ImageProcessor(QThread):
         # used to postpone the idle full refine (T7.3).
         self._last_interaction = 0.0
         self._onnx_sessions_released = False
+        self._decode_sessions_released = False
+        self._last_decode_activity = 0.0
         self.last_preview_source = "full"
 
     def stop_and_cleanup(self):
-        """Signal the worker to stop and wait for GPU cleanup."""
-        self._should_stop = True
+        """Signal the worker to stop and wait until every resource is released."""
+        with self.lock:
+            self._should_stop = True
+            # Queued work can retain decoded frames or export payloads. None of
+            # it should outlive an application shutdown request.
+            self.pending_request = None
+            self._preload_queue.clear()
+            self._export_queue.clear()
+            self._full_refine_request = None
         if self.isRunning():
-            self.wait(5000)  # Wait up to 5s for thread to finish
+            self.wait(5000)
+            if self.isRunning():
+                # Destroying a running QThread is a fatal Qt error. An active
+                # RAW decode/export may exceed the grace period, so finish the
+                # join instead of returning a live worker to window teardown.
+                self.wait()
+        else:
+            # A one-shot/baseline worker may never have been started.
+            self._release_gpu_buffers()
 
     def load_image(self, path: str):
         with self.lock:
@@ -217,7 +240,7 @@ class ImageProcessor(QThread):
         # Compatibility stubs (no-ops since the numpy/cv2 port of math_ops).
         from raw_alchemy.math_ops import init_taichi, warmup
         init_taichi()
-        if not self._warmed_up:
+        if not self._warmed_up and self.warmup_sessions:
             warmup()
             self._warm_onnx_sessions()
             self._warmed_up = True
@@ -236,6 +259,13 @@ class ImageProcessor(QThread):
                     and time.perf_counter() - self._last_interaction > 120.0
                 ):
                     self._release_onnx_sessions()
+                elif (
+                    not self._decode_sessions_released
+                    and self._last_decode_activity > 0.0
+                    and time.perf_counter() - self._last_decode_activity
+                    > DECODE_SESSION_IDLE_SECONDS
+                ):
+                    self._release_decode_sessions()
                 continue
 
             self._onnx_sessions_released = False
@@ -255,7 +285,7 @@ class ImageProcessor(QThread):
                 traceback.print_exc()
                 self.error_occurred.emit(str(e))
 
-        # Release GPU buffers on shutdown while CUDA context is still valid
+        # Release pipeline buffers and ONNX sessions before thread shutdown.
         self._release_gpu_buffers()
 
     def _take_next_request(self) -> Optional[ProcessRequest]:
@@ -364,7 +394,7 @@ class ImageProcessor(QThread):
         rgb[:, :, 2] *= wb[2] / g
         # cam->working matrix, per-pixel (M @ [r,g,b]); numpy keeps it GPU-free.
         m = cam_to_working_space_matrix(xyz).astype(np.float32)
-        rgb = np.einsum('ij,hwj->hwi', m, rgb, optimize=True).astype(np.float32)
+        apply_matrix_inplace(rgb, m)
         rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
         np.clip(rgb, 0.0, 1.0, out=rgb)
         exif_data, exif_metadata = extract_lens_exif(path, None)
@@ -378,6 +408,8 @@ class ImageProcessor(QThread):
         (colour-matched) so one bad file degrades to a slower load instead of
         a dead preview.
         """
+        self._last_decode_activity = time.perf_counter()
+        self._decode_sessions_released = False
         try:
             from raw_alchemy.core import _rawpy_decode_to_prophoto
             from raw_alchemy.exif import extract_lens_exif
@@ -624,6 +656,8 @@ class ImageProcessor(QThread):
             from raw_alchemy.onnx import rcd_demosaic
             dummy = np.full((64, 64), 0.25, np.float32)
             rcd_demosaic.rcd_demosaic(dummy, np.array([[0, 1], [3, 2]]))
+            self._last_decode_activity = time.perf_counter()
+            self._decode_sessions_released = False
         except Exception as e:
             logger.debug(f"[Warmup] RCD skipped: {e}")
         try:
@@ -639,13 +673,18 @@ class ImageProcessor(QThread):
                 )
         except Exception as e:
             logger.debug(f"[Warmup] grade skipped: {e}")
-        try:
-            from raw_alchemy.onnx import rgb_denoiser
-            if rgb_denoiser.is_available():
-                rgb_denoiser.warmup()  # 仅建会话(SCUNet 加载 ~4s 是大头)
-        except Exception as e:
-            logger.debug(f"[Warmup] SCUNet skipped: {e}")
         logger.info(f"[Warmup] ONNX sessions ready in {time.time() - t0:.1f}s")
+
+    def _release_decode_sessions(self):
+        """Release demosaic-only arenas once editing no longer needs them."""
+        try:
+            from raw_alchemy.onnx import rcd_demosaic, xtrans_demosaic
+            rcd_demosaic.clear_session()
+            xtrans_demosaic.clear_session()
+            self._decode_sessions_released = True
+            logger.info("[Worker] Decode idle: demosaic ONNX sessions released.")
+        except Exception as e:
+            logger.debug(f"[Worker] decode-session release skipped: {e}")
 
     def _release_onnx_sessions(self):
         """Drop every cached ONNX session (demosaic/grade/denoise) → VRAM 归零."""
@@ -656,35 +695,88 @@ class ImageProcessor(QThread):
             grade.clear_session()
             denoise_clear_session()
             self._onnx_sessions_released = True
+            self._decode_sessions_released = True
             logger.info("[Worker] Idle: ONNX sessions released (VRAM freed).")
         except Exception as e:
             logger.debug(f"[Worker] session release skipped: {e}")
 
     def _release_gpu_buffers(self):
-        """Release all GPU buffers while CUDA context is still valid (on worker thread)."""
+        """Release ONNX, pipeline and host cache ownership on shutdown."""
         try:
             self._release_onnx_sessions()
             self.gpu_graded.clear()
             self._release_gpu_uint8()
             self._full_refine_request = None
             self._clear_all_executor_caches()
+            # Executors retain their most recent source arrays even after the
+            # stage caches are empty. Drop the executor objects themselves so
+            # shutdown cannot pin a native RAW frame through _source.
+            self._preview_executors.clear()
+            self.cpu_linear = None
+            self.cpu_proxy_linear = None
+            self.cpu_corrected = None
+            self.cpu_proxy_corrected = None
+            self.cached_denoise_original = None
+            self.cached_denoise_full = None
+            self.cached_denoise_proxy = None
+            self.last_denoise_key = None
+            self.cached_lens_key = None
+            self.cached_proxy_lens_key = None
+            self._executor_corrected_source = None
+            self._executor_path = None
+            self._executor_params = {}
+            self.current_path = None
+            self.exif_data = None
+            self.exif_metadata = None
+            # The baseline worker may borrow the main worker's cache manager;
+            # only the persistent owner is allowed to clear it here.
+            if self.retain_preview_cache:
+                self.cache_manager.clear()
             gpu_pool().clear()
+            gc.collect()
             logger.debug("[Worker] GPU buffers released.")
         except Exception as e:
             logger.debug(f"[Worker] GPU buffer release error (non-critical): {e}")
+
+    @staticmethod
+    def _denoise_strength(params: ProcessorParams) -> float:
+        """Canonical strength used by op, memory and disk cache keys."""
+        return round(float(params.get('denoise_strength', 0.25) or 0.25), 3)
+
+    @classmethod
+    def _denoise_signature(cls, params: ProcessorParams):
+        """False when disabled, otherwise the canonical denoise strength."""
+        if not params.get('denoise_enabled', False):
+            return False
+        return cls._denoise_strength(params)
+
+    def _has_current_denoise(self, params: ProcessorParams) -> bool:
+        path = self.current_path
+        return (
+            bool(params.get('denoise_enabled', False))
+            and self.cached_denoise_full is not None
+            and self.last_denoise_key
+            == (path, 'denoise', self._denoise_strength(params))
+        )
 
     @staticmethod
     def _normalize_lens_state_key(key) -> Optional[tuple]:
         """Canonical form of a (lens_correct, custom_db_path, denoise) key.
 
         The worker stores these keys with raw param values (True/False/None
-        for lens_correct); normalizing the booleans lets state written by
-        different code paths compare equal when semantically identical.
+        for lens_correct). The third field is False when denoise is disabled
+        and the rounded strength when enabled. Legacy boolean-True entries are
+        accepted but intentionally do not match a strength-aware key, forcing
+        one safe recompute instead of serving stale corrected pixels.
         """
         if key is None:
             return None
-        lens_correct, custom_db_path, denoise_enabled = key
-        return (bool(lens_correct), custom_db_path, bool(denoise_enabled))
+        lens_correct, custom_db_path, denoise_signature = key
+        if isinstance(denoise_signature, (bool, np.bool_)) or denoise_signature is None:
+            normalized_denoise = bool(denoise_signature)
+        else:
+            normalized_denoise = round(float(denoise_signature), 3)
+        return (bool(lens_correct), custom_db_path, normalized_denoise)
 
     @classmethod
     def _expected_lens_state_key(cls, params: ProcessorParams) -> tuple:
@@ -693,7 +785,7 @@ class ImageProcessor(QThread):
         return (
             bool(params.get('lens_correct', False)),
             params.get('custom_db_path'),
-            bool(params.get('denoise_enabled', False)),
+            cls._denoise_signature(params),
         )
 
     def get_cached_for_export(self, params: Optional[ProcessorParams] = None) -> Optional[dict]:
@@ -725,7 +817,7 @@ class ImageProcessor(QThread):
             if self._normalize_lens_state_key(self.cached_lens_key) != expected:
                 return None
             if expected[2]:
-                want = round(float(params.get('denoise_strength', 0.25) or 0.25), 3)
+                want = self._denoise_strength(params)
                 dk = self.last_denoise_key
                 if not dk or len(dk) < 3 or dk[2] != want:
                     return None
@@ -760,7 +852,7 @@ class ImageProcessor(QThread):
             self.export_finished.emit(False, str(e))
 
     # =================================================================
-    # Processing Pipeline (GPU-resident)
+    # Processing pipeline (pooled numpy; ONNX may use a GPU provider)
     # =================================================================
 
     @staticmethod
@@ -769,13 +861,13 @@ class ImageProcessor(QThread):
 
         Covers the source identity (proxy/full, denoise, lens) and every op
         parameter — but *no* view state (zoom/viewport/DPR). Two requests
-        with equal pipeline keys share the same GPU-resident pipeline
+        with equal pipeline keys share the same pooled pipeline
         output; only the final resampling to uint8 differs.
         """
         return _as_hashable((
             params.get('_preview_source', 'full'),
             params.get('denoise_enabled', False),
-            (round(float(params.get('denoise_strength', 0.25) or 0.25), 3)
+            (ImageProcessor._denoise_strength(params)
              if params.get('denoise_enabled', False) else None),
             params.get('lens_correct'), params.get('custom_db_path'),
             params.get('rotation', 0),
@@ -788,7 +880,9 @@ class ImageProcessor(QThread):
             params.get('wb_temp', 0.0), params.get('wb_tint', 0.0),
             params.get('highlight', 0.0), params.get('shadow', 0.0),
             params.get('saturation', 1.0), params.get('contrast', 1.0),
-            params.get('log_space'), params.get('lut_path'),
+            params.get('log_space'),
+            (utils.lut_revision_token(params.get('lut_path'))
+             if params.get('lut_path') else None),
             params.get('sharpen_strength', 0.0),
         ))
 
@@ -821,19 +915,16 @@ class ImageProcessor(QThread):
     @staticmethod
     def _make_preview_target_size(src_w: int, src_h: int, params: ProcessorParams):
         if params.get('_force_full_preview'):
-            # Native-resolution base map: the idle refine outputs the frame
-            # at pipeline resolution so zooming is pure texture sampling —
-            # no re-render, no resolution jumps. Clamped to what a GL
-            # texture can hold (D3D11 FL11 / desktop GL guarantee 16384)
-            # and a host-memory sanity cap.
+            # Quality-base tier: bounded full-frame presentation. Native
+            # detail is supplied by the ROI tier when the user zooms in.
             scale = min(
                 1.0,
-                NATIVE_PREVIEW_MAX_SIDE / float(max(src_w, src_h, 1)),
-                (NATIVE_PREVIEW_MAX_PIXELS / float(max(src_w * src_h, 1))) ** 0.5,
+                QUALITY_BASE_MAX_SIDE / float(max(src_w, src_h, 1)),
+                (QUALITY_BASE_MAX_PIXELS / float(max(src_w * src_h, 1))) ** 0.5,
             )
             return (
-                max(1, int(src_w * scale)),
-                max(1, int(src_h * scale)),
+                max(1, int(round(src_w * scale))),
+                max(1, int(round(src_h * scale))),
             )
 
         viewport_size = params.get('viewport_size')
@@ -1059,6 +1150,14 @@ class ImageProcessor(QThread):
             self._preview_executors[mode] = executor
         return executor
 
+    def _executor_run_budget(self) -> int:
+        """Live cache allowance for the current proxy/full executor."""
+        total = int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024
+        if self._executor_source_mode() == 'proxy':
+            return total
+        proxy = self._preview_executors.get('proxy')
+        return max(0, total - (proxy.cache_bytes() if proxy is not None else 0))
+
     def _trim_executor_caches(self, budget_bytes: Optional[int] = None):
         """Apply the shared cache byte budget across both executors (T7.4).
 
@@ -1086,7 +1185,7 @@ class ImageProcessor(QThread):
         if path is None:
             return src
 
-        strength = round(float(self._executor_params.get('denoise_strength', 0.25) or 0.25), 3)
+        strength = self._denoise_strength(self._executor_params)
         denoise_cache_key = (path, 'denoise', strength)
         missing = (denoise_cache_key != self.last_denoise_key
                    or self.cached_denoise_full is None)
@@ -1143,26 +1242,39 @@ class ImageProcessor(QThread):
             if self.cached_denoise_proxy is None:
                 self.cached_denoise_proxy = self._make_proxy(self.cached_denoise_full)
             if self.cached_denoise_proxy is not None:
-                return np.ascontiguousarray(self.cached_denoise_proxy)
-            return np.ascontiguousarray(self.cached_denoise_full)
+                denoised = np.ascontiguousarray(self.cached_denoise_proxy)
+            else:
+                denoised = np.ascontiguousarray(self.cached_denoise_full)
+        else:
+            denoised = np.ascontiguousarray(self.cached_denoise_full)
 
-        denoised = np.ascontiguousarray(self.cached_denoise_full)
         if not self._executor_params.get('lens_correct', False):
-            self.cpu_corrected = denoised
-            self.cached_lens_key = (
+            lens_key = (
                 False,
                 self._executor_params.get('custom_db_path'),
-                True,
+                strength,
             )
+            if self._executor_using_proxy:
+                self.cpu_proxy_corrected = denoised
+                self.cached_proxy_lens_key = lens_key
+            else:
+                self.cpu_corrected = denoised
+                self.cached_lens_key = lens_key
+            # Auto exposure intentionally meters the full corrected source
+            # rather than a cropped ROI. Publish the just-produced denoise
+            # result before the exposure op runs so the first preview and all
+            # subsequent cache hits use the same pixels/EV.
+            self._executor_corrected_source = denoised
+            self.last_metering_key = None
         return denoised
 
     def _executor_lens_correct(self, src: np.ndarray) -> np.ndarray:
         params = self._executor_params
-        denoise_enabled = params.get('denoise_enabled', False)
+        denoise_signature = self._denoise_signature(params)
         current_lens_key = (
             params.get('lens_correct'),
             params.get('custom_db_path'),
-            denoise_enabled,
+            denoise_signature,
         )
 
         if self._executor_using_proxy:
@@ -1176,11 +1288,13 @@ class ImageProcessor(QThread):
         if params.get('lens_correct') and self.exif_data:
             try:
                 import cv2
-                from raw_alchemy.lensfun_wrapper import compute_lens_distortion_map
+                from raw_alchemy.lensfun_wrapper import (
+                    apply_lens_correction_tiled,
+                    compute_lens_distortion_map,
+                )
 
                 lf_params = {**self.exif_data}
-                dist_result = compute_lens_distortion_map(
-                    src,
+                lens_kwargs = dict(
                     camera_maker=lf_params.get('camera_maker'),
                     camera_model=lf_params.get('camera_model'),
                     lens_maker=lf_params.get('lens_maker'),
@@ -1190,21 +1304,28 @@ class ImageProcessor(QThread):
                     crop_factor=lf_params.get('crop_factor'),
                     custom_db_path=params.get('custom_db_path'),
                 )
-
-                if dist_result is not None:
-                    coords, oob_mask, vignette_img = dist_result
-                    corrected = np.empty_like(vignette_img)
-                    for ch in range(3):
-                        corrected[:, :, ch] = cv2.remap(
-                            vignette_img[:, :, ch],
-                            coords[:, :, ch, 0],
-                            coords[:, :, ch, 1],
-                            cv2.INTER_CUBIC,
-                            borderMode=cv2.BORDER_REPLICATE,
-                        )
-                    corrected[oob_mask] = 0
+                estimated_map_bytes = src.shape[0] * src.shape[1] * 25
+                map_cache_limit = int(config.DISTORTION_MAP_CACHE_LIMIT_MB) * 1024 * 1024
+                if estimated_map_bytes > map_cache_limit:
+                    corrected = apply_lens_correction_tiled(src, **lens_kwargs)
+                    if corrected is None:
+                        corrected = src
                 else:
-                    corrected = src
+                    dist_result = compute_lens_distortion_map(src, **lens_kwargs)
+                    if dist_result is not None:
+                        coords, oob_mask, vignette_img = dist_result
+                        corrected = np.empty_like(vignette_img)
+                        for ch in range(3):
+                            corrected[:, :, ch] = cv2.remap(
+                                vignette_img[:, :, ch],
+                                coords[:, :, ch, 0],
+                                coords[:, :, ch, 1],
+                                cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_REPLICATE,
+                            )
+                        corrected[oob_mask] = 0
+                    else:
+                        corrected = src
             except Exception as e:
                 logger.error(f"[Worker] Lens correction failed: {e}")
                 corrected = src
@@ -1280,7 +1401,8 @@ class ImageProcessor(QThread):
             self.last_denoise_key = None
 
         if not params.get('lens_correct', False):
-            if denoise_enabled and self.cached_denoise_full is not None:
+            denoise_ready = self._has_current_denoise(params)
+            if denoise_ready:
                 if self._executor_using_proxy:
                     # Proxy pipeline must stay at proxy resolution: feeding it
                     # the full-res denoised image silently turns every
@@ -1299,7 +1421,7 @@ class ImageProcessor(QThread):
             next_lens_key = (
                 False,
                 params.get('custom_db_path'),
-                denoise_enabled,
+                self._denoise_signature(params) if denoise_ready else False,
             )
             current_key = self.cached_proxy_lens_key if self._executor_using_proxy else self.cached_lens_key
             if next_lens_key != current_key:
@@ -1329,7 +1451,7 @@ class ImageProcessor(QThread):
         """
         if not ops or ops[0].name != "denoise":
             return ops, None
-        strength = round(float(params.get('denoise_strength', 0.25) or 0.25), 3)
+        strength = self._denoise_strength(params)
         if ((self._executor_path, 'denoise', strength) != self.last_denoise_key
                 or self.cached_denoise_full is None):
             return ops, None
@@ -1345,17 +1467,53 @@ class ImageProcessor(QThread):
         # 不会误判源变化而清前缀(它按数组对象身份判断)。
         return list(ops[1:]), source
 
+    def _maybe_swap_corrected_source(self, ops, params: ProcessorParams):
+        """Feed a cached lens-corrected frame directly into interactive ops.
+
+        Once lens correction has run, keeping ``lens_correct`` in the op list
+        forces every slider/ROI request to copy the native source out of the
+        working buffer and upload the cached corrected frame again. A 61MP
+        photo pays roughly two 732MB host copies per request when its full-size
+        lens prefix cannot coexist with proxy prefixes inside the cache budget.
+
+        The corrected arrays already carry a key covering lens enablement,
+        custom DB path and denoise state. When that key matches, make the
+        immutable corrected array the executor source and remove the leading
+        lens op. Geometry/ROI/color ordering and export state stay unchanged.
+        """
+        if not ops or ops[0].name != "lens_correct":
+            return ops, None
+        expected = self._expected_lens_state_key(params)
+        if self._executor_using_proxy:
+            corrected = self.cpu_proxy_corrected
+            current_key = self.cached_proxy_lens_key
+        else:
+            corrected = self.cpu_corrected
+            current_key = self.cached_lens_key
+        if (
+            corrected is None
+            or self._normalize_lens_state_key(current_key) != expected
+        ):
+            return ops, None
+        self._executor_corrected_source = corrected
+        return list(ops[1:]), corrected
+
     def _sync_executor_export_source(self, params: ProcessorParams):
         if self._executor_using_proxy:
             return
         if params.get('lens_correct', False):
             return
 
-        denoise_enabled = params.get('denoise_enabled', False)
-        if denoise_enabled and self.cached_denoise_full is not None:
+        if self._has_current_denoise(params):
             self.cpu_corrected = np.ascontiguousarray(self.cached_denoise_full)
+            self.cached_lens_key = self._expected_lens_state_key(params)
         else:
             self.cpu_corrected = self.cpu_linear
+            self.cached_lens_key = (
+                False,
+                params.get('custom_db_path'),
+                False,
+            )
 
     def _restore_export_state_from_entry(
         self, cached_item: Optional[CachedImage], params: ProcessorParams
@@ -1390,7 +1548,7 @@ class ImageProcessor(QThread):
         denoise_enabled = bool(params.get('denoise_enabled', False))
         if not params.get('lens_correct', False):
             if denoise_enabled:
-                if self.cached_denoise_full is None:
+                if not self._has_current_denoise(params):
                     return  # nothing cheap to resync; export re-runs fully
                 corrected = np.ascontiguousarray(self.cached_denoise_full)
             else:
@@ -1401,7 +1559,7 @@ class ImageProcessor(QThread):
             self.cached_lens_key = (
                 False,
                 params.get('custom_db_path'),
-                denoise_enabled,
+                self._denoise_signature(params),
             )
             return
 
@@ -1438,16 +1596,15 @@ class ImageProcessor(QThread):
         if executor is None:
             return
 
-        denoise_enabled = params.get('denoise_enabled', False)
         desired_lens_key = (
             params.get('lens_correct'),
             params.get('custom_db_path'),
-            denoise_enabled,
+            self._denoise_signature(params),
         )
         current_lens_key = self.cached_proxy_lens_key if self._executor_using_proxy else self.cached_lens_key
 
         needs_clear = False
-        if denoise_enabled and self.cached_denoise_full is None:
+        if params.get('denoise_enabled', False) and not self._has_current_denoise(params):
             needs_clear = True
         if desired_lens_key != current_lens_key:
             needs_clear = True
@@ -1493,16 +1650,20 @@ class ImageProcessor(QThread):
                 self._restore_export_state_from_entry(cached_item, params)
                 self.last_preview_source = preview_source
                 self.preview_source_changed.emit(preview_source)
-                # Refine towards the native base map (T7.10) whenever the
-                # cached output is below pipeline resolution: proxy renders,
-                # ROI renders, and fit-size full renders alike.
+                # Refine a full-frame fit result towards the quality base.
+                # A native ROI is already the final zoomed presentation tier;
+                # replacing it one second later with a 4096px full frame would
+                # visibly throw away 1:1 detail.
                 cached_h, cached_w = cached_uint8.shape[:2]
-                below_native = (
+                is_roi_output = params.get('_preview_roi') is not None
+                needs_quality_base = (
                     use_proxy
-                    or params.get('_preview_roi') is not None
-                    or (cached_w, cached_h) != tuple(cached_source_size)[:2]
+                    or (
+                        not is_roi_output
+                        and (cached_w, cached_h) != tuple(cached_source_size)[:2]
+                    )
                 )
-                if not params.get('_force_full_preview') and below_native:
+                if not params.get('_force_full_preview') and needs_quality_base:
                     self._schedule_full_refinement(request, params)
                 self.result_ready.emit(
                     cached_uint8,
@@ -1521,6 +1682,8 @@ class ImageProcessor(QThread):
 
             ops = build_op_list(params)
             ops, denoised_source = self._maybe_swap_denoised_source(ops, params)
+            ops, corrected_source = self._maybe_swap_corrected_source(ops, params)
+            quality_base_full_size = None
             if roi_info is not None:
                 # The ROI crop is a preview-only op: it only narrows the
                 # source region, so the color-pipeline parameter caches
@@ -1532,9 +1695,27 @@ class ImageProcessor(QThread):
                 _tw, _th = self._make_roi_target_size(_rw, _rh, _fw, _fh, params)
                 _roi_out = (_tw, _th) if (_tw < _rw * 0.95 or _th < _rh * 0.95) else None
                 ops = self._insert_roi_op(ops, roi_info[0], _roi_out)
-            executor_source = (denoised_source if denoised_source is not None
-                               else self._select_executor_source(use_proxy))
+            elif params.get('_force_full_preview'):
+                # Downsample before the expensive colour tail, not after it.
+                # Shape/lens prefixes remain reusable at source resolution;
+                # exposure/WB/LUT/grade operate only on the <=4096 base tier.
+                src_h0, src_w0 = self.cpu_linear.shape[:2]
+                full_w, full_h = self._pipeline_output_dims(src_w0, src_h0, params)
+                base_w, base_h = self._make_preview_target_size(full_w, full_h, params)
+                quality_base_full_size = (full_w, full_h)
+                if base_w < full_w or base_h < full_h:
+                    ops = self._insert_roi_op(
+                        ops, (0, 0, full_w, full_h), (base_w, base_h)
+                    )
+            executor_source = (
+                corrected_source
+                if corrected_source is not None
+                else denoised_source
+                if denoised_source is not None
+                else self._select_executor_source(use_proxy)
+            )
             executor = self._get_preview_executor()
+            executor.set_cache_budget(self._executor_run_budget())
             # Cooperative cancellation (T7.3): a newer user request aborts
             # this run at the next op boundary (completed prefixes stay
             # cached). Applies to interactive runs and idle full refines.
@@ -1544,10 +1725,9 @@ class ImageProcessor(QThread):
                 should_abort=self._interactive_abort_requested,
             )
             self._sync_executor_export_source(params)
-            # Prefix-cache byte budget (T7.6): VRAM budget since T7.2 moved
-            # pipeline residency to the GPU; shared across the proxy/full
-            # executor pair since T7.4. Even if the trim evicts `result`
-            # from the final cache, the local reference keeps its GPU buffer
+            # Prefix-cache host-byte budget shared by proxy/full executors.
+            # Even if trim evicts `result` from the final cache, the local
+            # reference keeps its working buffer
             # alive for the output stage below.
             self._trim_executor_caches()
 
@@ -1571,14 +1751,13 @@ class ImageProcessor(QThread):
 
         try:
             t_out = time.perf_counter()
-            # T7.2: convert the executor's GPU-resident output straight to
-            # uint8 on-device — only the final (viewport-sized) uint8 image
-            # crosses back to the host, not the full-frame float32.
+            # Convert the pooled float output directly into the bounded uint8
+            # destination without a second full float32 copy.
             if result.gpu is not None and result.gpu.valid:
                 graded_arr = result.gpu.arr
                 source_h, source_w = result.gpu.height, result.gpu.width
             else:
-                # Fallback (results without a GPU buffer): legacy host round-trip.
+                # Fallback for results without a pooled working buffer.
                 processed = result.image
                 if processed.dtype != np.float32:
                     processed = processed.astype(np.float32)
@@ -1602,7 +1781,11 @@ class ImageProcessor(QThread):
                 target_w, target_h = self._make_preview_target_size(
                     source_w, source_h, params
                 )
-                output_source_size = (source_w, source_h)
+                output_source_size = (
+                    quality_base_full_size
+                    if quality_base_full_size is not None
+                    else (source_w, source_h)
+                )
 
             if self._gpu_uint8 is None or self._gpu_uint8.shape != (target_h, target_w, 3):
                 self._release_gpu_uint8()
@@ -1634,7 +1817,7 @@ class ImageProcessor(QThread):
                 # results (T7.10) are display pushes, not cache material —
                 # ten ~130MB slots would be pure host-RAM bloat.
                 cached_item.store_output(
-                    output_key, img_uint8.copy(), applied_ev, output_source_size
+                    output_key, img_uint8, applied_ev, output_source_size
                 )
                 self.cache_manager.notify_entry_updated(request.path)
 
@@ -1645,18 +1828,54 @@ class ImageProcessor(QThread):
                 applied_ev,
                 output_source_size,
             )
-            # Chase the native base map (T7.10): any interactive result below
-            # pipeline resolution — proxy, ROI, or downscaled full frame —
-            # queues an idle refine. Refines never re-queue themselves.
+            # Proxy/fit results chase the quality base after interaction stops.
+            # Native ROIs do not: they must remain on top while zoomed instead
+            # of being replaced by a lower-density full-frame texture.
             if not params.get('_force_full_preview') and (
                 use_proxy
-                or roi_info is not None
-                or (target_w, target_h) != (source_w, source_h)
+                or (
+                    roi_info is None
+                    and (target_w, target_h) != (source_w, source_h)
+                )
             ):
                 self._schedule_full_refinement(request, params)
+
+            if not self.retain_preview_cache:
+                self._release_ephemeral_preview_resources(result)
 
         except Exception as e:
             logger.error(f"[Worker] Error in unified output: {e}")
             import traceback
             traceback.print_exc()
             self.error_occurred.emit(f"Output error: {str(e)}")
+
+    def _release_ephemeral_preview_resources(self, result=None):
+        """Drop baseline/one-shot worker state after its frame was emitted."""
+        self._clear_all_executor_caches()
+        if result is not None and result.gpu is not None:
+            result.gpu.clear()
+            result.gpu = None
+        self.gpu_graded.clear()
+        self._release_gpu_uint8()
+        self.cpu_linear = None
+        self.cpu_proxy_linear = None
+        self.cpu_corrected = None
+        self.cpu_proxy_corrected = None
+        self._executor_corrected_source = None
+        self.cached_denoise_original = None
+        self.cached_denoise_full = None
+        self.cached_denoise_proxy = None
+        self.last_denoise_key = None
+        self.cached_lens_key = None
+        self.cached_proxy_lens_key = None
+        self.last_metering_key = None
+        self._executor_path = None
+        self._executor_params = {}
+        # clear_cache() intentionally keeps an executor's source identity for
+        # the next interactive hit. A one-shot baseline has no next hit, so
+        # retain no source alias after emitting its result.
+        self._preview_executors.clear()
+        self.exif_data = None
+        self.exif_metadata = None
+        self.current_path = None
+        gpu_pool().clear()

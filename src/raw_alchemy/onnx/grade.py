@@ -20,7 +20,12 @@ import threading
 import numpy as np
 from loguru import logger
 
-from .denoiser import _find_model, _get_providers
+from .denoiser import (
+    _configure_providers,
+    _find_model,
+    _get_providers,
+    _make_session_options,
+)
 
 MODEL_FILE = "grade_dyn.onnx"
 MODEL_FILE_LOG = "grade_log_dyn.onnx"   # ...→log 矩阵→max→1D LUT→[3D LUT]
@@ -61,15 +66,10 @@ def _get_session(model_file: str):
         import onnxruntime as ort
 
         model_path = _find_model(model_file)
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so = _make_session_options(ort)
         providers = _get_providers()
-        provider_options = [
-            ({"device_id": 0} if p in ("CUDAExecutionProvider", "DmlExecutionProvider") else {})
-            for p in providers
-        ]
         sess = ort.InferenceSession(
-            model_path, so, providers=providers, provider_options=provider_options,
+            model_path, so, providers=_configure_providers(providers),
         )
         _sessions[model_file] = sess
         _session_provider = sess.get_providers()[0]

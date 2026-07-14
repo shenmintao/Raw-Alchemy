@@ -225,14 +225,9 @@ def test_roi_render_matches_crop_of_full_render_at_native_resolution():
     np.testing.assert_array_equal(roi_img, full_img[64:192, 64:192])
 
     assert processor.last_preview_source == "full"
-    # ROI previews schedule the idle native-base refine (T7.10) with the ROI
-    # state stripped, so the base map converges to the frame at pipeline
-    # resolution and later zoom/pan need no re-render.
-    refine = processor._full_refine_request
-    assert refine is not None
-    assert refine.params.get('_force_full_preview') is True
-    assert '_preview_roi' not in refine.params
-    assert '_roi_full_size' not in refine.params
+    # A native ROI is the final zoomed tier. It must stay visible instead of
+    # being replaced one second later by a lower-density quality-base frame.
+    assert processor._full_refine_request is None
 
 
 def test_roi_pan_within_margin_hits_cache_and_beyond_reruns_tail(monkeypatch):
@@ -247,9 +242,10 @@ def test_roi_pan_within_margin_hits_cache_and_beyond_reruns_tail(monkeypatch):
 
     center = _view_params((0.375, 0.375, 0.625, 0.625), zoom=4.0)
     ops_len = len(build_op_list(center)) + 1  # + injected roi op
+    counted_ops = ops_len - 1  # leading read-only ROI bypasses _apply_op
 
     processor._do_process(ProcessRequest(path, dict(center), 1))
-    assert len(op_calls) == ops_len
+    assert len(op_calls) == counted_ops
 
     # Pan inside the margin: same snapped ROI => pure output-cache hit.
     small_pan = _view_params((0.385, 0.375, 0.635, 0.625), zoom=4.0)
@@ -258,7 +254,7 @@ def test_roi_pan_within_margin_hits_cache_and_beyond_reruns_tail(monkeypatch):
         == processor._compute_preview_roi(center)[0]
     )
     processor._do_process(ProcessRequest(path, dict(small_pan), 2))
-    assert len(op_calls) == ops_len  # zero op re-runs
+    assert len(op_calls) == counted_ops  # zero op re-runs
     assert len(emitted) == 2
     np.testing.assert_array_equal(emitted[1][0], emitted[0][0])
     assert emitted[1][1] == (256, 256)
@@ -271,7 +267,7 @@ def test_roi_pan_within_margin_hits_cache_and_beyond_reruns_tail(monkeypatch):
     assert new_roi != (64, 64, 128, 128)
     executor_before = processor._preview_executors.get("full")
     processor._do_process(ProcessRequest(path, dict(big_pan), 3))
-    assert len(op_calls) == 2 * ops_len
+    assert len(op_calls) == 2 * counted_ops
     assert processor._preview_executors.get("full") is executor_before
     assert len(emitted) == 3
     assert getattr(emitted[2][1], "roi_rect", None) == new_roi
@@ -406,11 +402,10 @@ def _install_upload_spy(monkeypatch):
     return uploads
 
 
-def test_roi_change_reuses_resident_source_without_reupload(monkeypatch):
-    """In the default unedited case the roi op sits at position 0, so a
-    cross-margin pan / zoom-tier change invalidates every nonzero prefix.
-    The executor must resume from the device-resident length-0 source
-    entry instead of re-uploading the full float32 frame over PCIe (m4)."""
+def test_roi_change_slices_host_source_without_full_frame_upload(monkeypatch):
+    """Host-backed ROI runs borrow the cache-owned source for a read-only
+    leading crop. They retain neither a duplicate source frame nor pay a
+    native-frame upload/memcpy on cross-margin pans."""
     from raw_alchemy.pipeline.executor import ExportExecutor
 
     processor, source = _make_processor()
@@ -424,24 +419,26 @@ def test_roi_change_reuses_resident_source_without_reupload(monkeypatch):
 
     center = _view_params((0.375, 0.375, 0.625, 0.625), zoom=4.0)
     processor._do_process(ProcessRequest(path, dict(center), 1))
-    assert uploads == [source.nbytes]  # single source ingestion
+    assert uploads == []
 
-    # Cross-margin pan: new ROI rect, all nonzero prefixes stale — but the
-    # source comes from the resident copy, no second host->device transfer.
+    # Cross-margin pan: new ROI rect, all nonzero prefixes stale, still no
+    # full-frame working copy.
     big_pan = _view_params((0.7, 0.7, 0.95, 0.95), zoom=4.0)
     new_roi = processor._compute_preview_roi(big_pan)[0]
     assert new_roi != processor._compute_preview_roi(center)[0]
     processor._do_process(ProcessRequest(path, dict(big_pan), 2))
-    assert uploads == [source.nbytes]
+    assert uploads == []
 
     # Another cross-margin move: still zero further uploads.
     third_pan = _view_params((0.05, 0.05, 0.3, 0.3), zoom=4.0)
     third_roi = processor._compute_preview_roi(third_pan)[0]
     assert third_roi not in (new_roi, processor._compute_preview_roi(center)[0])
     processor._do_process(ProcessRequest(path, dict(third_pan), 3))
-    assert uploads == [source.nbytes]
+    assert uploads == []
 
-    # The renders resumed from the resident source are pixel-correct: each
+    # equals the same crop of a from-scratch full-frame reference (the
+    # worker's preview executors round the exposure gain; match that).
+    # The borrowed-source renders are pixel-correct.
     # equals the same crop of a from-scratch full-frame reference (the
     # worker's preview executors round the exposure gain; match that).
     expected_float = ExportExecutor(round_exposure_gain=True).run(
@@ -457,11 +454,9 @@ def test_roi_change_reuses_resident_source_without_reupload(monkeypatch):
         np.testing.assert_array_equal(img, expected_uint8[y:y + h, x:x + w])
 
 
-def test_source_residency_accounting_trim_and_reingest():
-    """The length-0 source entry participates in cache_bytes()/trim() like
-    any prefix: it survives ROI-rect generations, is evicted only after
-    all longer (cheaper-to-recompute) prefixes, and a zero budget clears
-    it; the next run then re-ingests and re-caches the source."""
+def test_host_roi_cache_omits_duplicate_source_and_trims_prefixes():
+    """ROI cache accounting contains only ROI-sized prefixes/final output;
+    the cache-owned native source is borrowed and never duplicated."""
     from raw_alchemy.pipeline.executor import (
         ExportExecutor,
         PreviewExecutor,
@@ -478,32 +473,31 @@ def test_source_residency_accounting_trim_and_reingest():
 
     preview = PreviewExecutor(src)
     preview.run_result(roi_ops_a, source=src)
-    assert preview._prefix_lengths.get(_SOURCE_PREFIX_KEY) == 0
-    assert preview.cache_bytes() == src.nbytes + (n + 1) * roi_bytes
+    assert _SOURCE_PREFIX_KEY not in preview._prefix_cache
+    assert preview.cache_bytes() == (n + 1) * roi_bytes
 
-    # A different rect drops the stale roi-tagged generation but keeps the
-    # source entry (its validity depends only on the source array).
+    # A different rect drops the stale ROI generation without adding a source
+    # residency entry.
     result_b = preview.run_result(roi_ops_b, source=src)
-    assert preview._prefix_lengths.get(_SOURCE_PREFIX_KEY) == 0
-    assert preview.cache_bytes() == src.nbytes + (n + 1) * roi_bytes
+    assert _SOURCE_PREFIX_KEY not in preview._prefix_cache
+    assert preview.cache_bytes() == (n + 1) * roi_bytes
     expected_b = ExportExecutor().run(roi_ops_b, src.copy())
     np.testing.assert_allclose(result_b.image, expected_b, rtol=1e-5, atol=1e-5)
 
-    # Trim evicts longest prefixes first; the source entry outlives them
-    # (dropping it would force a PCIe re-upload, the cost m4 removes).
-    freed = preview.trim(src.nbytes + 2 * roi_bytes)
+    # Trim evicts longest prefixes first and keeps the cheapest early prefix.
+    freed = preview.trim(2 * roi_bytes)
     assert freed == (n - 1) * roi_bytes
-    assert set(preview._prefix_lengths.values()) == {0, 1}
+    assert set(preview._prefix_lengths.values()) == {1}
 
-    # A zero budget clears the source entry too (T7.6 semantics intact).
+    # A zero budget clears every derived entry.
     preview.trim(0)
     assert preview.cache_bytes() == 0
     assert _SOURCE_PREFIX_KEY not in preview._prefix_cache
 
-    # The next run re-ingests the source and re-caches the residency.
+    # The next run borrows the source again and rebuilds ROI prefixes.
     again = preview.run_result(roi_ops_b, source=src)
     np.testing.assert_allclose(again.image, expected_b, rtol=1e-5, atol=1e-5)
-    assert preview._prefix_lengths.get(_SOURCE_PREFIX_KEY) == 0
+    assert _SOURCE_PREFIX_KEY not in preview._prefix_cache
 
 
 def test_non_roi_runs_do_not_create_source_residency():
@@ -564,6 +558,9 @@ class _ScopeHarness:
             def get_params():
                 return {}
 
+            def update_scope_data(_self, img):
+                harness.scope_updates.append(img)
+
         self.right_panel = _Panel()
 
         class _Viewport:
@@ -583,10 +580,6 @@ class _ScopeHarness:
                 pass
 
         self.preview_lbl = _Label()
-
-    def _update_histogram_async(self, img):
-        self.scope_updates.append(img)
-
 
 def _pump_until(app, predicate, timeout=2.0):
     import time
@@ -616,6 +609,7 @@ def test_roi_results_do_not_feed_scopes_but_full_frames_do(monkeypatch):
 
     harness = _ScopeHarness("photo.raw")
     harness._scope_source_for_result = MainWindow._scope_source_for_result
+    harness._update_histogram_async = MainWindow._update_histogram_async.__get__(harness)
 
     # Control: a full-frame result refreshes the scopes (deferred update).
     img_full = np.full((64, 64, 3), 40, np.uint8)
@@ -677,11 +671,11 @@ def test_make_roi_target_size_tiers_by_dpi_and_zoom():
     assert (tw3, th3) == (4000, 3000)
 
 
-def test_native_base_refine_outputs_pipeline_resolution():
-    """T7.10 — 原生分辨率底图。
+def test_quality_base_refine_outputs_bounded_full_frame():
+    """Bounded quality-base presentation tier.
 
     fit 视图的交互渲染输出视口尺寸,并排队 idle refine;refine 结果必须是
-    管线原生尺寸(缩放纯采样的前提),且不得被交互结果的输出缓存槽短路
+    小图保持原生尺寸；大图由独立上限测试覆盖。refine 不得被交互输出缓存短路
     (view key 以 _force_full_preview 区分)。
     """
     processor, _source = _make_processor()
@@ -719,7 +713,7 @@ def test_native_base_refine_outputs_pipeline_resolution():
     assert processor._full_refine_request is not None
 
 
-def test_native_preview_target_size_caps():
+def test_quality_base_preview_target_size_caps():
     from raw_alchemy.workers.image_processor import (
         ImageProcessor,
         NATIVE_PREVIEW_MAX_PIXELS,
@@ -727,11 +721,38 @@ def test_native_preview_target_size_caps():
     )
 
     force = {"_force_full_preview": True, "viewport_size": (2560, 1440)}
-    # 常规全幅:原样输出
-    assert ImageProcessor._make_preview_target_size(7968, 5344, dict(force)) == (7968, 5344)
-    # 超长边:按 GL 纹理上限缩
+    # 常规高像素全幅:长边限制到质量基础层，不再创建原生纹理。
+    tw, th = ImageProcessor._make_preview_target_size(7968, 5344, dict(force))
+    assert tw == NATIVE_PREVIEW_MAX_SIDE and abs(tw / th - 7968 / 5344) < 0.01
+    # 超长边:按基础层上限缩
     tw, th = ImageProcessor._make_preview_target_size(20000, 2000, dict(force))
     assert tw <= NATIVE_PREVIEW_MAX_SIDE and abs(tw / th - 10.0) < 0.1
-    # 超像素数:按host内存上限缩
+    # 超像素数:同时服从 host/texture 像素上限
     tw, th = ImageProcessor._make_preview_target_size(12000, 9000, dict(force))
     assert tw * th <= NATIVE_PREVIEW_MAX_PIXELS
+
+
+def test_quality_base_downsamples_before_colour_tail(monkeypatch):
+    from raw_alchemy.workers import image_processor as processor_module
+
+    monkeypatch.setattr(processor_module, "QUALITY_BASE_MAX_SIDE", 64)
+    monkeypatch.setattr(processor_module, "QUALITY_BASE_MAX_PIXELS", 64 * 64)
+    processor, _source = _make_processor()
+    path = processor.current_path
+    emitted = []
+    processor.result_ready.connect(
+        lambda img, p, rid, ev, size: emitted.append((img.copy(), size))
+    )
+
+    params = _view_params(zoom=1.0)
+    params["_force_full_preview"] = True
+    processor._do_process(ProcessRequest(path, params, 1))
+
+    assert emitted[-1][0].shape == (64, 64, 3)
+    assert tuple(emitted[-1][1]) == (256, 256)
+    executor = processor._preview_executors["full"]
+    assert executor._prefix_cache
+    assert all(
+        stage.gpu.width <= 64 and stage.gpu.height <= 64
+        for stage in executor._prefix_cache.values()
+    )

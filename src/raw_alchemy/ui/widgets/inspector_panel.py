@@ -604,6 +604,10 @@ class InspectorPanel(ScrollArea):
         self.hist_widget.shutdown_worker()
         self.waveform_widget.shutdown_worker()
 
+    def reset_scope_data(self):
+        self.hist_widget.reset_data()
+        self.waveform_widget.reset_data()
+
     def _update_exposure_switch_text(self):
         """Update the switch button text based on its state"""
         if self.auto_exp_radio.isChecked():

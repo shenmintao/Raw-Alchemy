@@ -1,6 +1,7 @@
 ﻿import sys
 import os
 import math
+import time
 from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QListWidget, QFrame, QSplitter, QSizePolicy, QTreeView,
@@ -25,6 +26,7 @@ from loguru import logger
 # New structure imports
 from raw_alchemy.ui.image_state import ImageState
 from raw_alchemy.workers.image_processor import ImageProcessor
+from raw_alchemy.pipeline.ops import _as_hashable
 from raw_alchemy.ui.widgets.inspector_panel import InspectorPanel
 from raw_alchemy.ui.widgets.title_bar import CenteredFluentTitleBar
 from raw_alchemy.ui.widgets.crop_rotate_viewer import CropRotateViewer
@@ -79,6 +81,11 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         # Request tracking
         self.current_request_id = 0
         self._suppress_gallery_change = False
+        self._pending_scope_update = None
+        self._scope_update_scheduled = False
+        self._param_interaction_active = False
+        self._last_param_leading_time = 0.0
+        self._last_param_submit_key = None
         
         # Preload lensfun database in the background.
         self._preload_lensfun_database()
@@ -116,13 +123,18 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.denoise_progress_dialog = None
         
         # Baseline processor
-        self.baseline_processor = ImageProcessor()
+        self.baseline_processor = ImageProcessor(
+            retain_preview_cache=False,
+            warmup_sessions=False,
+        )
         self.baseline_processor.result_ready.connect(self.on_baseline_result)
         
         # Processing Debounce
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
-        self.update_timer.setInterval(150) # 150ms debounce
+        # Proxy processing and prefix-cache reuse support a tighter cadence;
+        # avoid adding 150ms of input latency before work even begins.
+        self.update_timer.setInterval(80)
         self.update_timer.timeout.connect(self.trigger_processing)
 
         self._preload_neighbors_args = None
@@ -196,6 +208,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         
         import threading
         preload_thread = threading.Thread(target=preload, daemon=True)
+        self._lensfun_preload_thread = preload_thread
         preload_thread.start()
     
     def load_settings(self):
@@ -542,6 +555,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.right_panel = InspectorPanel()
         self.right_panel.setFixedWidth(360) 
         self.right_panel.param_changed.connect(self.on_param_changed)
+        self.right_panel.param_interaction_started.connect(
+            self._on_param_interaction_started
+        )
+        self.right_panel.param_interaction_finished.connect(
+            self._on_param_interaction_finished
+        )
         self.right_panel.enter_crop_mode.connect(self.enter_crop_mode)
         self.right_panel.enter_perspective_mode.connect(self.enter_perspective_mode)
         self.right_panel.save_baseline_btn.clicked.connect(self.save_baseline_image)
@@ -705,7 +724,32 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         if self.current_raw_path:
             self.file_params_cache[self.current_raw_path] = params.copy()
             self._schedule_current_sidecar_write()
-        self.update_timer.start()
+        if self._param_interaction_active:
+            now = time.monotonic()
+            if now - self._last_param_leading_time >= 0.08:
+                self.update_timer.stop()
+                self._last_param_leading_time = now
+                self.trigger_processing()
+            else:
+                self.update_timer.start()
+        else:
+            self.update_timer.start()
+
+    def _on_param_interaction_started(self):
+        self._param_interaction_active = True
+        self._last_param_leading_time = 0.0
+        self.update_timer.stop()
+
+    def _on_param_interaction_finished(self, params):
+        self._param_interaction_active = False
+        self.update_timer.stop()
+        if self.current_raw_path:
+            self.file_params_cache[self.current_raw_path] = params.copy()
+            self._schedule_current_sidecar_write()
+        # Submit the exact release value unless that same parameter set was
+        # already handed to the worker by the leading/throttled path.
+        if self._last_param_submit_key != _as_hashable(params):
+            self.trigger_processing()
 
     def _kick_zoom_update(self):
         """去抖加前沿(T7.9):一轮交互的第一次事件立即出活,后续事件照旧
@@ -778,6 +822,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
     def trigger_processing(self):
         if not self.current_raw_path: return
         params = self._get_preview_params()
+        self._last_param_submit_key = _as_hashable(self.right_panel.get_params())
         self.current_request_id = self.processor.update_preview(self.current_raw_path, params)
     
     def save_baseline_image(self):
@@ -788,9 +833,13 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         if self.processor.cpu_linear is not None:
             # Share CPU cache so baseline processor can load from it
             self.baseline_processor.cache_manager = self.processor.cache_manager
+            baseline_preview_params = self._add_preview_output_params(
+                current_params, include_visible_rect=False
+            )
+            baseline_preview_params['_force_full_preview'] = True
             self.baseline_processor.update_preview(
                 self.current_raw_path,
-                self._add_preview_output_params(current_params, include_visible_rect=False),
+                baseline_preview_params,
             )
 
         InfoBar.success(tr('baseline_saved'), tr('baseline_saved_message'), parent=self)
@@ -798,10 +847,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         
     def on_baseline_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
         if image_path != self.current_raw_path: return
-        h, w, c = img_uint8.shape
-        qimg = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg.copy())
-        self.baseline.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
+        self.baseline.update_full(None, None, img_uint8, source_size=source_size)
     
     def regenerate_baseline_for_current_image(self):
         if not self.current_raw_path or self.current_raw_path not in self.file_baseline_params_cache: return
@@ -809,9 +855,13 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
 
         baseline_params = self.file_baseline_params_cache[self.current_raw_path]
         self.baseline_processor.cache_manager = self.processor.cache_manager
+        baseline_preview_params = self._add_preview_output_params(
+            baseline_params, include_visible_rect=False
+        )
+        baseline_preview_params['_force_full_preview'] = True
         self.baseline_processor.update_preview(
             self.current_raw_path,
-            self._add_preview_output_params(baseline_params, include_visible_rect=False),
+            baseline_preview_params,
         )
 
     def on_process_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
@@ -846,8 +896,6 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
 
         h, w, c = img_uint8.shape
         img = QImage(img_uint8.data, w, h, c * w, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(img)
-
         if roi_rect is None and h * w <= 16_000_000:
             # Update thumbnail without scanning the full gallery. Native-size
             # refine results (T7.10) are skipped: same params as the
@@ -855,17 +903,19 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             # scaling a ~40MP pixmap would stall the GUI thread.
             item = self.gallery_items_by_path.get(image_path)
             if item is not None:
-                scaled = pixmap.scaledToHeight(300, Qt.TransformationMode.FastTransformation)
-                item.setIcon(QIcon(scaled))
+                scaled = img.scaledToHeight(
+                    300, Qt.TransformationMode.FastTransformation
+                )
+                item.setIcon(QIcon(QPixmap.fromImage(scaled)))
                 rect = self.gallery_list.visualItemRect(item)
                 self.gallery_list.viewport().update(rect)
 
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
 
         if roi_rect is None:
-            self.current.update_full(pixmap, None, img_uint8.copy(), source_size=source_size)
-            if self.original.full is None:
-                self.original.update_full(pixmap.copy(), None, img_uint8.copy(), source_size=source_size)
+            self.current.update_full(None, None, img_uint8, source_size=source_size)
+            if getattr(self.original, 'uint8_data', None) is None:
+                self.original.update_full(None, None, img_uint8, source_size=source_size)
         if self.current_raw_path:
              self.file_params_cache[self.current_raw_path] = self.right_panel.get_params()
 
@@ -890,7 +940,13 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         # Defer visible scope update to the next event loop iteration.
         img_for_hist = self._scope_source_for_result(img_uint8, roi_rect)
         if img_for_hist is not None:
-            QTimer.singleShot(0, lambda: self._update_histogram_async(img_for_hist))
+            self.current.scope_uint8_data = img_for_hist
+            if getattr(self.original, 'uint8_data', None) is img_uint8:
+                self.original.scope_uint8_data = img_for_hist
+            self._pending_scope_update = (image_path, img_for_hist)
+            if not getattr(self, '_scope_update_scheduled', False):
+                self._scope_update_scheduled = True
+                QTimer.singleShot(0, self._update_histogram_async)
 
     @staticmethod
     def _scope_source_for_result(img_uint8, roi_rect):
@@ -913,9 +969,16 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             return img_uint8[::step, ::step]
         return img_uint8
 
-    def _update_histogram_async(self, img_uint8):
-        """Deferred scope update; runs after viewport display."""
-        self.right_panel.update_scope_data(img_uint8)
+    def _update_histogram_async(self):
+        """Coalesced deferred scope update; runs after viewport display."""
+        self._scope_update_scheduled = False
+        pending = self._pending_scope_update
+        self._pending_scope_update = None
+        if pending is None:
+            return
+        image_path, img_uint8 = pending
+        if image_path == self.current_raw_path:
+            self.right_panel.update_scope_data(img_uint8)
 
     def on_load_complete(self, image_path, request_id):
         if request_id != self.current_request_id or image_path != self.current_raw_path: return
@@ -992,8 +1055,24 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             # qFatal abort, so exiting may block on one decode (m1/m5).
             worker.stop_and_join(2000)
         if hasattr(self, 'right_panel'):
+            self._pending_scope_update = None
             self.right_panel.shutdown_scope_workers()
-        self.processor.stop_and_cleanup()
+        if hasattr(self, 'settings_widget'):
+            self.settings_widget.shutdown_worker()
+        if hasattr(self, 'about_widget'):
+            self.about_widget.shutdown_worker()
+        if hasattr(self, 'viewport'):
+            self.viewport.clear_image()
+        self.original.clear()
+        self.current.clear()
+        self.baseline.clear()
         if hasattr(self, 'baseline_processor'):
             self.baseline_processor.stop_and_cleanup()
+        self.processor.stop_and_cleanup()
+        preload_thread = getattr(self, '_lensfun_preload_thread', None)
+        if preload_thread is not None and preload_thread.is_alive():
+            preload_thread.join()
+        if hasattr(self, 'thumb_cache'):
+            self.thumb_cache.wait_for_prune()
+        lensfun_wrapper.clear_lensfun_database_cache()
         super().closeEvent(event)

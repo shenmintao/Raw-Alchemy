@@ -22,7 +22,12 @@ import time
 import numpy as np
 from loguru import logger
 
-from .denoiser import _find_model, _get_providers
+from .denoiser import (
+    _configure_providers,
+    _find_model,
+    _get_providers,
+    _make_session_options,
+)
 
 MODEL_FILE = "xtrans_markesteijn_dyn.onnx"
 TILE = 1560  # multiple of 6
@@ -37,7 +42,7 @@ CANONICAL_PATTERN = np.array([
     [0, 2, 1, 2, 0, 1],
 ], dtype=np.int32)
 
-_session = None
+_sessions = {}
 _session_lock = threading.Lock()
 _session_provider = None
 _masks = None
@@ -88,38 +93,38 @@ def _build_masks(xt: np.ndarray) -> np.ndarray:
 
 
 def _get_session():
-    global _session, _session_provider, _masks
-    if _session is not None:
-        return _session
+    global _session_provider, _masks
+    session = _sessions.get(TILE)
+    if session is not None:
+        return session
     with _session_lock:
-        if _session is not None:
-            return _session
+        session = _sessions.get(TILE)
+        if session is not None:
+            return session
         import onnxruntime as ort
 
         model_path = _find_model(MODEL_FILE)
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so = _make_session_options(ort)
+        so.add_free_dimension_override_by_name("h", TILE)
+        so.add_free_dimension_override_by_name("w", TILE)
         if _cpu_fallback:
             providers = ["CPUExecutionProvider"]
         else:
             providers = _get_providers()
-        provider_options = [
-            ({"device_id": 0} if p in ("CUDAExecutionProvider", "DmlExecutionProvider") else {})
-            for p in providers
-        ]
-        _session = ort.InferenceSession(
-            model_path, so, providers=providers, provider_options=provider_options,
+        session = ort.InferenceSession(
+            model_path, so, providers=_configure_providers(providers),
         )
-        _session_provider = _session.get_providers()[0]
+        _sessions[TILE] = session
+        _session_provider = session.get_providers()[0]
         _masks = _build_masks(CANONICAL_PATTERN)
-        logger.info(f"X-Trans demosaic session: {_session_provider}")
-    return _session
+        logger.info(f"X-Trans demosaic session (tile {TILE}): {_session_provider}")
+    return session
 
 
 def clear_session() -> None:
-    global _session, _session_provider
+    global _session_provider
     with _session_lock:
-        _session = None
+        _sessions.clear()
         _session_provider = None
     import gc
     gc.collect()
@@ -130,6 +135,10 @@ _cpu_fallback = False
 
 def _run_graph(session, feeds):
     global _cpu_fallback
+    # A previous tile may have rebuilt the process-global session on CPU.
+    # Always adopt the current session instead of retrying a stale GPU object
+    # for every remaining tile.
+    session = _get_session()
     try:
         return session.run(None, feeds)[0]
     except Exception as e:

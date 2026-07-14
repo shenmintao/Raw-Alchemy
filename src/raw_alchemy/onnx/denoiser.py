@@ -37,6 +37,8 @@ import numpy as np
 from typing import Optional, Callable
 from loguru import logger
 
+from raw_alchemy import config
+
 
 # ---------------------------------------------------------------------------
 # CUDA setup (must run before importing onnxruntime)
@@ -645,6 +647,43 @@ def _get_providers() -> list:
     return providers
 
 
+def _make_session_options(ort, *, enable_mem_pattern: bool = False):
+    """Memory-conscious ONNX Runtime defaults shared by every model."""
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.log_severity_level = 3
+    options.enable_mem_pattern = bool(enable_mem_pattern)
+    options.enable_cpu_mem_arena = True
+    options.intra_op_num_threads = max(1, int(config.DEFAULT_CPU_THREADS))
+    options.inter_op_num_threads = 1
+    if hasattr(ort, "ExecutionMode"):
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    return options
+
+
+def _configure_providers(providers: list):
+    """Attach bounded arena/workspace options to GPU execution providers."""
+    configured = []
+    gpu_limit = max(1, int(config.ONNX_GPU_MEMORY_LIMIT_MB)) * 1024 * 1024
+    for provider in providers:
+        if provider == 'CUDAExecutionProvider':
+            configured.append((provider, {
+                'device_id': 0,
+                'gpu_mem_limit': gpu_limit,
+                'arena_extend_strategy': 'kSameAsRequested',
+                'cudnn_conv_algo_search': 'HEURISTIC',
+                'do_copy_in_default_stream': True,
+                # Max-workspace search can reserve hundreds of MiB per
+                # session; tiled fixed-shape inference does not need it.
+                'cudnn_conv_use_max_workspace': False,
+            }))
+        elif provider in ('DmlExecutionProvider', 'ROCMExecutionProvider'):
+            configured.append((provider, {'device_id': 0}))
+        else:
+            configured.append(provider)
+    return configured
+
+
 def _get_session(sensor: str):
     """Get or create ONNX session for the given sensor type."""
     global _session_bayer, _session_xtrans, _session_provider
@@ -662,24 +701,8 @@ def _get_session(sensor: str):
 
     logger.info(f"Loading CANS raw-main v14 ({sensor}) from: {model_path}")
 
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_options.log_severity_level = 3
-    sess_options.enable_mem_pattern = True
-    sess_options.enable_cpu_mem_arena = True
-
-    provider_options = []
-    for p in providers:
-        if p == 'CUDAExecutionProvider':
-            provider_options.append((p, {
-                'device_id': 0,
-                'arena_extend_strategy': 'kSameAsRequested',
-                'cudnn_conv_algo_search': 'HEURISTIC',
-                'do_copy_in_default_stream': True,
-                'cudnn_conv_use_max_workspace': True,
-            }))
-        else:
-            provider_options.append(p)
+    sess_options = _make_session_options(ort)
+    provider_options = _configure_providers(providers)
 
     session = ort.InferenceSession(model_path, sess_options, providers=provider_options)
     _session_provider = session.get_providers()[0]

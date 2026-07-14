@@ -10,6 +10,7 @@ import pytest
 
 from raw_alchemy.pipeline.executor import PreviewExecutor, ExportExecutor, _BaseExecutor
 from raw_alchemy.pipeline.ops import Op, build_op_list
+from raw_alchemy.gpu_buffer import GpuImage, gpu_pool
 
 
 def _params(**over):
@@ -90,6 +91,49 @@ def test_full_hit_runs_nothing(fusion_on, monkeypatch):
     calls.clear()
     ex.run(ops)
     assert calls == []
+
+
+def test_fused_grade_uses_working_buffer_and_adopts_output(monkeypatch):
+    """Host-backed pipeline must not emulate a GPU download/upload roundtrip."""
+    from raw_alchemy.onnx import grade
+
+    gpu_pool().clear()
+    source = _src(shape=(32, 48, 3))
+    buf = GpuImage()
+    buf.upload(source)
+    original_arr = buf.arr
+    captured = []
+    uploads = []
+
+    def fake_apply(img, **_kwargs):
+        captured.append(img)
+        return np.ascontiguousarray(img * np.float32(0.5))
+
+    original_upload = GpuImage.upload
+
+    def spy_upload(self, array):
+        uploads.append(array.nbytes)
+        return original_upload(self, array)
+
+    monkeypatch.setattr(grade, "apply_grade", fake_apply)
+    monkeypatch.setattr(GpuImage, "upload", spy_upload)
+    monkeypatch.setattr(
+        GpuImage,
+        "to_numpy",
+        lambda self: (_ for _ in ()).throw(AssertionError("unexpected full-frame copy")),
+    )
+
+    seq = [
+        Op("exposure", ("Manual", 0.0, "matrix", "ProPhoto RGB")),
+        Op("srgb_out", ("ProPhoto RGB",)),
+    ]
+    result = _BaseExecutor()._apply_grade_fused(buf, seq)
+
+    assert captured == [original_arr]
+    assert uploads == []
+    np.testing.assert_allclose(result.arr, source * 0.5)
+    result.clear()
+    gpu_pool().clear()
 
 
 def test_export_path_fuses_and_matches(fusion_on, monkeypatch):

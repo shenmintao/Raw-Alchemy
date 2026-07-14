@@ -21,10 +21,37 @@ from raw_alchemy.math_ops import (
 import cv2
 
 @lru_cache(maxsize=8)
+def _load_lut_cached(resolved_path: str, mtime_ns: int, size: int):
+    """Parse one immutable file revision and normalize hot-path arrays."""
+    del mtime_ns, size  # values are part of the cache key
+    logger.info(f"Parsing LUT: {os.path.basename(resolved_path)}")
+    lut = colour.read_LUT(resolved_path)
+    if isinstance(lut, colour.LUT3D):
+        # The executor and ONNX graph both consume float32. Normalize once on
+        # cache fill instead of re-casting the table/domain for every slider
+        # request. colour's public setters coerce back to its default float64,
+        # so keep explicit prepared views alongside the parsed object.
+        lut._raw_alchemy_table32 = np.ascontiguousarray(lut.table, dtype=np.float32)
+        lut._raw_alchemy_domain32 = np.ascontiguousarray(lut.domain, dtype=np.float32)
+    return lut
+
+
 def load_lut_cached(lut_path: str):
-    """Cache parsed LUT objects to avoid re-reading .cube files."""
-    logger.info(f"Parsing LUT: {os.path.basename(lut_path)}")
-    return colour.read_LUT(lut_path)
+    """Cache parsed LUTs by file revision, reloading when a LUT is edited."""
+    resolved, mtime_ns, size = lut_revision_token(lut_path)
+    if mtime_ns is None:
+        raise FileNotFoundError(resolved)
+    return _load_lut_cached(resolved, mtime_ns, size)
+
+
+def lut_revision_token(lut_path: str) -> tuple[str, Optional[int], Optional[int]]:
+    """Hashable LUT identity used by parsed, pipeline and output caches."""
+    resolved = os.path.abspath(os.path.expanduser(os.fspath(lut_path)))
+    try:
+        stat = os.stat(resolved)
+    except OSError:
+        return (resolved, None, None)
+    return (resolved, int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def resource_path(relative_path):
@@ -68,29 +95,23 @@ def compute_histogram_fast(img_array, bins=100, sample_rate=4):
         if len(img_array.shape) != 3 or img_array.shape[2] != 3:
             return None
 
-        # 瀛愰噰鏍峰厛锛屽啀杞崲锛堥伩鍏嶅叏鍥綾opy+杞崲锛?
-        sample = img_array[::sample_rate, ::sample_rate, :].copy()
+        sample_rate = max(1, int(sample_rate))
+        sample = img_array[::sample_rate, ::sample_rate, :]
 
-        # uint8 鈫?float32 [0,1]锛堜粎瀵瑰瓙閲囨牱鍚庣殑灏忔暟鎹級
-        if sample.dtype == np.uint8:
-            sample = sample.astype(np.float32) * (1.0 / 255.0)
-        elif sample.dtype != np.float32:
-            sample = sample.astype(np.float32)
-
-        # 纭繚鏁版嵁鍦ㄦ湁鏁堣寖鍥村唴
-        sample = np.clip(sample, 0.0, 1.0)
-        
         hist_data = []
         for channel in range(3):
-            # 灞曞钩閫氶亾鏁版嵁 - 浣跨敤copy()纭繚杩炵画鍐呭瓨
-            channel_data = sample[:, :, channel].ravel().copy()
-            
-            # 纭繚鏄疌杩炵画鏁扮粍
-            if not channel_data.flags['C_CONTIGUOUS']:
-                channel_data = np.ascontiguousarray(channel_data)
-            
-            # numpy histogram (runs on main thread, Taichi context may be on worker thread)
-            hist, _ = np.histogram(channel_data, bins=bins, range=(0.0, 1.0))
+            if sample.dtype == np.uint8:
+                # Histogramming the native bytes with a [0,255] range is
+                # exactly equivalent to the old uint8->float32 /255 path and
+                # avoids a sampled RGB float frame plus three channel copies.
+                channel_data = sample[:, :, channel]
+                hist, _ = np.histogram(channel_data, bins=bins, range=(0, 255))
+            else:
+                channel_data = np.array(
+                    sample[:, :, channel], dtype=np.float32, copy=True, order='C'
+                )
+                np.clip(channel_data, 0.0, 1.0, out=channel_data)
+                hist, _ = np.histogram(channel_data, bins=bins, range=(0.0, 1.0))
             hist_data.append(hist.astype(np.float64))
         
         return hist_data
@@ -121,7 +142,8 @@ def compute_waveform_fast(img_array, bins=100, sample_rate=4):
         if len(img_array.shape) != 3 or img_array.shape[2] != 3:
             return None
 
-        h, w, c = img_array.shape
+        _h, w, _c = img_array.shape
+        sample_rate = max(1, int(sample_rate))
 
         # 姘村钩鏂瑰悜閲囨牱浠ユ彁楂樻€ц兘
         sampled_width = w // sample_rate
@@ -130,46 +152,40 @@ def compute_waveform_fast(img_array, bins=100, sample_rate=4):
 
         # 鍨傜洿涔熷瓙閲囨牱锛堜笌histogram涓€鑷达級锛岄伩鍏嶅叏鍥捐绠?
         v_step = max(1, sample_rate // 2)
-        img_sub = img_array[::v_step, :, :]
+        # Only every ``sample_rate``-th column contributes to the result. The
+        # retired implementation converted all columns to float/luma and then
+        # discarded most of them inside a Python loop (24MP ~= 0.9s).
+        img_sub = img_array[
+            ::v_step,
+            :sampled_width * sample_rate:sample_rate,
+            :,
+        ]
 
         # uint8 鈫?float32 [0,1]锛堜粎瀵瑰瓙閲囨牱鍚庣殑灏忔暟鎹級
+        img_f = np.array(img_sub, dtype=np.float32, copy=True, order='C')
         if img_sub.dtype == np.uint8:
-            img_f = img_sub.astype(np.float32) * (1.0 / 255.0)
-        elif img_sub.dtype != np.float32:
-            img_f = img_sub.astype(np.float32)
-        else:
-            img_f = img_sub.copy()
-
-        img_f = np.clip(img_f, 0.0, 1.0)
+            img_f *= np.float32(1.0 / 255.0)
+        np.clip(img_f, 0.0, 1.0, out=img_f)
 
         # 璁＄畻浜害锛堜娇鐢?Rec.709 绯绘暟锛?
         # Y = 0.2126*R + 0.7152*G + 0.0722*B
-        luma = (img_f[:, :, 0] * 0.2126 +
-                img_f[:, :, 1] * 0.7152 +
-                img_f[:, :, 2] * 0.0722).astype(np.float32)
-        
-        # 纭繚鏄疌杩炵画鏁扮粍
-        if not luma.flags['C_CONTIGUOUS']:
-            luma = np.ascontiguousarray(luma)
-        
-        # 鍒涘缓娉㈠舰杈撳嚭鏁扮粍
-        waveform = np.zeros((sampled_width, bins), dtype=np.float32)
-        
-        # 纭繚杈撳嚭鏁扮粍涔熸槸C杩炵画鐨?
-        if not waveform.flags['C_CONTIGUOUS']:
-            waveform = np.ascontiguousarray(waveform)
-        
-        # numpy waveform (runs on main thread, Taichi context may be on worker thread)
-        for col_idx in range(sampled_width):
-            src_col = col_idx * sample_rate
-            col_data = luma[:, src_col]
-            bin_indices = np.clip((col_data * bins).astype(np.int32), 0, bins - 1)
-            np.add.at(waveform[col_idx], bin_indices, 1.0)
+        luma = np.empty(img_f.shape[:2], dtype=np.float32)
+        np.multiply(img_f[:, :, 0], np.float32(0.2126), out=luma)
+        luma += img_f[:, :, 1] * np.float32(0.7152)
+        luma += img_f[:, :, 2] * np.float32(0.0722)
+
+        bin_indices = (luma * np.float32(bins)).astype(np.int32)
+        np.clip(bin_indices, 0, bins - 1, out=bin_indices)
+        offsets = np.arange(sampled_width, dtype=np.int32) * int(bins)
+        bin_indices += offsets[None, :]
+        waveform = np.bincount(
+            bin_indices.ravel(), minlength=sampled_width * bins
+        ).reshape(sampled_width, bins).astype(np.float32)
         
         # 褰掍竴鍖?
         max_val = np.max(waveform)
         if max_val > 0:
-            waveform = waveform / max_val
+            waveform /= max_val
         
         return waveform
     except Exception as e:
@@ -285,8 +301,7 @@ def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Op
     try:
         # lensfun_wrapper 鍐呴儴浼氳皟鐢?cv2.remap
         # 杩欏繀鐒惰繑鍥炴柊鍥惧儚
-        corrected = lf.apply_lens_correction(
-            image=image,
+        lens_kwargs = dict(
             camera_maker=params.get('camera_maker'),
             camera_model=params.get('camera_model'),
             lens_maker=params.get('lens_maker'),
@@ -300,6 +315,14 @@ def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Op
             distance=params.get('distance', 1000.0),
             custom_db_path=custom_db_path,
         )
+        estimated_map_bytes = image.shape[0] * image.shape[1] * 25
+        map_limit = int(config.DISTORTION_MAP_CACHE_LIMIT_MB) * 1024 * 1024
+        if estimated_map_bytes > map_limit:
+            corrected = lf.apply_lens_correction_tiled(image=image, **lens_kwargs)
+            if corrected is None:
+                corrected = image
+        else:
+            corrected = lf.apply_lens_correction(image=image, **lens_kwargs)
         
         # 鏄惧紡甯姪 GC (铏界劧 Python 浼氳嚜鍔ㄥ鐞嗭紝浣嗗湪澶у唴瀛樺帇鍔涗笅 explicit is better)
         # 杩欓噷鍘熸潵鐨?image 寮曠敤璁℃暟浼氬噺灏戯紝濡傛灉澶栭潰娌℃湁寮曠敤锛屾棫鍐呭瓨浼氳閲婃斁

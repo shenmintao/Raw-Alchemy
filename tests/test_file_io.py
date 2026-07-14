@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pillow_heif
 
-from raw_alchemy.file_io import save_image
+from raw_alchemy.file_io import _quantize_image, save_image
 
 
 class DummyLogger:
@@ -15,6 +15,18 @@ class DummyLogger:
 
     def error(self, *_args, **_kwargs):
         pass
+
+
+def test_quantize_image_rounds_to_nearest_without_mutating_source():
+    img = np.linspace(0.0, 1.0, 17 * 13 * 3, dtype=np.float32).reshape(17, 13, 3)
+    original = img.copy()
+
+    for dtype, scale in ((np.uint8, 255), (np.uint16, 65535)):
+        expected = np.floor(img * scale + 0.5).astype(dtype)
+        actual = _quantize_image(img, dtype, scale)
+        np.testing.assert_array_equal(actual, expected)
+
+    np.testing.assert_array_equal(img, original)
 
 
 def test_save_hdr_heif_writes_readable_10_bit_pq_file():

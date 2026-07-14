@@ -24,6 +24,10 @@ class _HistogramWorker(QThread):
                 logger.error(f"Histogram update error: {type(e).__name__}: {e}")
             except Exception:
                 pass
+        finally:
+            # Do not let a completed QThread wrapper pin the previous frame
+            # until Qt eventually processes deleteLater().
+            self.img_array = None
         self.result_ready.emit(result, self.generation)
 
 
@@ -91,9 +95,22 @@ class HistogramWidget(QWidget):
     def shutdown_worker(self):
         self.update_timer.stop()
         self.pending_data = None
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(1500)
+        self._generation += 1
+        if self._worker is not None:
+            if self._worker.isRunning():
+                self._worker.wait()
+            self._worker.deleteLater()
             self._worker = None
+
+    def reset_data(self):
+        """Drop queued/visible data when the selected photo changes."""
+        self.update_timer.stop()
+        self.pending_data = None
+        self._generation += 1
+        self.hist_data = None
+        self._hist_image = None
+        self._hist_image_size = None
+        self.update()
 
     def _render_hist_image(self, w, h):
         """Pre-render histogram to a QImage with additive blending."""

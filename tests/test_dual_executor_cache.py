@@ -177,6 +177,21 @@ def test_output_slots_capacity_evicts_lru():
     assert 1 + len(item._output_slots) == OUTPUT_SLOT_LIMIT
 
 
+def test_output_slots_also_obey_byte_cap(monkeypatch):
+    from raw_alchemy.pipeline import cache_manager as cache_module
+
+    monkeypatch.setattr(cache_module, "OUTPUT_CACHE_LIMIT_BYTES", 200)
+    item = CachedImage("p", np.zeros((8, 8, 3), np.float32), None, None)
+    for i in range(3):
+        item.store_output(
+            ("pipe", i), np.full((5, 5, 3), i, np.uint8), 0.0, (5, 5)
+        )
+
+    assert item.get_output(("pipe", 0)) is None
+    assert item.get_output(("pipe", 1)) is not None
+    assert item.get_output(("pipe", 2)) is not None
+
+
 def test_output_slots_size_accounting_and_drop_stage():
     item = CachedImage("p", np.zeros((8, 8, 3), np.float32), None, None)
     item.store_output(("k", 1), np.zeros((16, 16, 3), np.uint8), 0.0, (8, 8))

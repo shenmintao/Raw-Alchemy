@@ -11,6 +11,25 @@ from typing import List, Optional
 from raw_alchemy.logger import Logger
 import pyexiv2
 
+
+def _quantize_image(img: np.ndarray, dtype, scale: int) -> np.ndarray:
+    """Round a clipped float image to integer with bounded scratch memory."""
+    output = np.empty(img.shape, dtype=dtype)
+    src = np.asarray(img).reshape(-1)
+    dst = output.reshape(-1)
+    if src.size == 0:
+        return output
+    chunk_size = min(src.size, 3_000_000)
+    scratch_dtype = np.float64 if src.dtype == np.float64 else np.float32
+    scratch = np.empty(chunk_size, dtype=scratch_dtype)
+    for start in range(0, src.size, chunk_size):
+        stop = min(start + chunk_size, src.size)
+        work = scratch[:stop - start]
+        np.multiply(src[start:stop], scale, out=work, casting='unsafe')
+        work += 0.5
+        np.copyto(dst[start:stop], work, casting='unsafe')
+    return output
+
 def save_image(
     img: np.ndarray,
     output_path: str,
@@ -92,7 +111,7 @@ def save_image(
 def _save_tiff(img: np.ndarray, output_path: str, logger: Logger):
     """保存为 16-bit TIFF 格式"""
     logger.info("    Format: TIFF (16-bit, ZLIB Optimized)")
-    output_image_uint16 = (img * 65535).astype(np.uint16)
+    output_image_uint16 = _quantize_image(img, np.uint16, 65535)
     
     tifffile.imwrite(
         output_path,
@@ -107,12 +126,14 @@ def _save_tiff(img: np.ndarray, output_path: str, logger: Logger):
 def _save_heif(img: np.ndarray, output_path: str, logger: Logger):
     """保存为 10-bit HEIF 格式"""
     logger.info("    Format: HEIF (10-bit, High Quality)")
-    output_image_uint16 = (img * 65535).astype(np.uint16)
+    output_image_uint16 = _quantize_image(img, np.uint16, 65535)
     
     heif_file = pillow_heif.from_bytes(
         mode='RGB;16',
         size=(output_image_uint16.shape[1], output_image_uint16.shape[0]),
-        data=output_image_uint16.tobytes()
+        # memoryview satisfies pillow-heif's bytes-like input contract without
+        # duplicating the entire 16-bit frame into a Python bytes object.
+        data=memoryview(output_image_uint16)
     )
     heif_file.save(output_path, quality=85, bit_depth=10)
 
@@ -124,12 +145,12 @@ def _save_hdr_heif_pq(img: np.ndarray, output_path: str, logger: Logger):
     pipeline's pq_out operation.
     """
     logger.info("    Format: HDR HEIF (10-bit BT.2020/PQ)")
-    output_image_uint16 = (np.clip(img, 0.0, 1.0) * 65535).astype(np.uint16)
+    output_image_uint16 = _quantize_image(img, np.uint16, 65535)
 
     heif_file = pillow_heif.from_bytes(
         mode='RGB;16',
         size=(output_image_uint16.shape[1], output_image_uint16.shape[0]),
-        data=output_image_uint16.tobytes()
+        data=memoryview(output_image_uint16)
     )
     heif_file.save(
         output_path,
@@ -147,7 +168,7 @@ def _save_hdr_heif_pq(img: np.ndarray, output_path: str, logger: Logger):
 def _save_dng(img: np.ndarray, output_path: str, color_matrix, logger: Logger):
     """保存为 16-bit DNG 格式 (Adobe Digital Negative)"""
     logger.info("    Format: DNG (16-bit, Linear Raw)")
-    output_image_uint16 = (img * 65535).astype(np.uint16)
+    output_image_uint16 = _quantize_image(img, np.uint16, 65535)
     
     # 34892 = LinearRaw (表示数据是线性的且已去马赛克)
     photometric = 34892
@@ -250,7 +271,7 @@ def _save_jpeg_or_other(img: np.ndarray, output_path: str, file_ext: str, logger
     logger.info(f"    Format: {file_ext.upper()} (8-bit High Quality)")
     
     # 转换为 8-bit（img 已经在 save_image 中被 clip 过了）
-    output_image_uint8 = (img * 255).astype(np.uint8)
+    output_image_uint8 = _quantize_image(img, np.uint8, 255)
     
     # JPEG 特殊优化参数
     save_params = {}

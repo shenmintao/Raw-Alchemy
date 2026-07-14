@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from raw_alchemy import config
+from raw_alchemy import config, utils
 from raw_alchemy.pipeline.request import ProcessorParams
 
 
@@ -111,7 +111,8 @@ def build_op_list(params: ProcessorParams) -> list[Op]:
 
     lut_path = params.get("lut_path")
     if not hdr_output and lut_path:
-        ops.append(Op("lut", (str(lut_path),)))
+        lut_path = str(lut_path)
+        ops.append(Op("lut", (lut_path, utils.lut_revision_token(lut_path))))
 
     if hdr_output:
         ops.append(

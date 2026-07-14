@@ -4,6 +4,18 @@ from pathlib import Path
 import numpy as np
 
 
+def test_image_state_keeps_numpy_frame_without_full_pixmap_copy():
+    from raw_alchemy.ui.image_state import ImageState
+
+    state = ImageState()
+    frame = np.zeros((32, 48, 3), np.uint8)
+    state.update_full(object(), None, frame, source_size=(48, 32))
+
+    assert state.full is None
+    assert state.uint8_data is frame
+    assert state.source_size == (48, 32)
+
+
 class _FakeSignal:
     def __init__(self):
         self.handlers = []
@@ -325,6 +337,59 @@ class _FakeTimer:
 
     def stop(self):
         self.stopped += 1
+
+
+class _ParamTimer(_FakeTimer):
+    def __init__(self):
+        super().__init__()
+        self.started = 0
+
+    def start(self):
+        self.started += 1
+
+
+def test_slider_interaction_has_leading_preview_and_exact_release(monkeypatch):
+    from raw_alchemy.pipeline.ops import _as_hashable
+    from raw_alchemy.ui import main_window
+
+    class Harness:
+        def __init__(self):
+            self.current_raw_path = "photo.raw"
+            self.file_params_cache = {}
+            self.update_timer = _ParamTimer()
+            self._param_interaction_active = False
+            self._last_param_leading_time = 0.0
+            self._last_param_submit_key = None
+            self.current_params = None
+            self.triggered = []
+            self.sidecar_writes = 0
+
+        def _schedule_current_sidecar_write(self):
+            self.sidecar_writes += 1
+
+        def trigger_processing(self):
+            self._last_param_submit_key = _as_hashable(self.current_params)
+            self.triggered.append(self.current_params.copy())
+
+    harness = Harness()
+    times = iter((1.0, 1.02))
+    monkeypatch.setattr(main_window.time, "monotonic", lambda: next(times))
+
+    main_window.MainWindow._on_param_interaction_started(harness)
+    first = {"exposure": 0.1}
+    harness.current_params = first
+    main_window.MainWindow.on_param_changed(harness, first)
+    assert harness.triggered == [first]
+
+    second = {"exposure": 0.2}
+    harness.current_params = second
+    main_window.MainWindow.on_param_changed(harness, second)
+    assert harness.update_timer.started == 1
+    assert harness.triggered == [first]
+
+    main_window.MainWindow._on_param_interaction_finished(harness, second)
+    assert harness.triggered == [first, second]
+    assert harness._param_interaction_active is False
 
 
 class _FakeStack:

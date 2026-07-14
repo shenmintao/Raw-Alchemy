@@ -6,9 +6,13 @@ import sys
 import os
 import platform
 import ctypes
+import threading
+from collections import OrderedDict
 from typing import Optional
 import numpy as np
 from loguru import logger
+
+from raw_alchemy import config
 
 def _get_base_path():
     """
@@ -86,7 +90,55 @@ except RuntimeError as e:
     logger.warning(f"  ⚠️ [Lensfun] Warning: {e}")
     logger.warning("  ⚠️ [Lensfun] Lens correction will be disabled.")
 
-_distortion_map_cache = {}
+_distortion_map_cache = OrderedDict()
+_distortion_map_cache_bytes = 0
+_distortion_map_cache_lock = threading.Lock()
+
+
+def _distortion_entry_bytes(entry) -> int:
+    coords, oob_mask = entry
+    return int(coords.nbytes) + int(oob_mask.nbytes)
+
+
+def _get_distortion_map(cache_key):
+    with _distortion_map_cache_lock:
+        entry = _distortion_map_cache.get(cache_key)
+        if entry is not None:
+            _distortion_map_cache.move_to_end(cache_key)
+        return entry
+
+
+def _put_distortion_map(cache_key, entry) -> bool:
+    """Byte-bounded LRU for reusable proxy-sized Lensfun maps."""
+    global _distortion_map_cache_bytes
+    size = _distortion_entry_bytes(entry)
+    limit = int(config.DISTORTION_MAP_CACHE_LIMIT_MB) * 1024 * 1024
+    if size <= 0 or size > limit:
+        logger.debug(
+            f"  [Lensfun] Map not cached: {size / 1048576:.0f}MB "
+            f"> {limit / 1048576:.0f}MB cap"
+        )
+        return False
+    with _distortion_map_cache_lock:
+        old = _distortion_map_cache.pop(cache_key, None)
+        if old is not None:
+            _distortion_map_cache_bytes -= _distortion_entry_bytes(old)
+        _distortion_map_cache[cache_key] = entry
+        _distortion_map_cache_bytes += size
+        while _distortion_map_cache_bytes > limit and _distortion_map_cache:
+            _key, evicted = _distortion_map_cache.popitem(last=False)
+            _distortion_map_cache_bytes -= _distortion_entry_bytes(evicted)
+    return True
+
+
+def clear_distortion_map_cache() -> int:
+    """Release all cached coordinate maps; returns bytes dropped."""
+    global _distortion_map_cache_bytes
+    with _distortion_map_cache_lock:
+        freed = _distortion_map_cache_bytes
+        _distortion_map_cache.clear()
+        _distortion_map_cache_bytes = 0
+        return freed
 
 
 # ============================================================================
@@ -364,9 +416,13 @@ class LensfunDatabase:
             except IOError as e:
                 raise RuntimeError(f"Could not read custom database file: {custom_db_path}. Error: {e}")
     
-    def __del__(self):
+    def close(self):
         if hasattr(self, 'db') and self.db and _lensfun is not None:
             _lensfun.lf_db_destroy(self.db)
+            self.db = None
+
+    def __del__(self):
+        self.close()
     
     def find_camera(self, maker: Optional[str], model: str) -> Optional[ctypes.POINTER(lfCamera)]:
         """查找相机"""
@@ -485,9 +541,25 @@ class LensfunModifier:
 # 全局数据库缓存
 # ============================================================================
 
-# 全局数据库缓存，避免每次都重新加载
-_global_db_cache = {}
-_global_db_lock = None
+# 全局数据库缓存，避免每次都重新加载。条目数受限，避免用户在长会话中
+# 切换许多自定义数据库路径后永久保留每一个原生数据库对象。
+_global_db_cache = OrderedDict()
+_global_db_lock = threading.Lock()
+
+
+def _database_cache_key(custom_db_path: Optional[str] = None) -> str:
+    if not custom_db_path:
+        return '__default__'
+    return os.path.normcase(os.path.abspath(custom_db_path))
+
+
+def _trim_database_cache_locked() -> None:
+    limit = max(1, int(config.LENSFUN_DB_CACHE_ENTRIES))
+    while len(_global_db_cache) > limit:
+        # Dropping the cache reference is concurrency-safe: an in-flight
+        # correction still owns a local reference, so __del__/close runs only
+        # after that operation finishes.
+        _global_db_cache.popitem(last=False)
 
 def _get_or_create_database(custom_db_path: Optional[str] = None):
     """
@@ -499,25 +571,21 @@ def _get_or_create_database(custom_db_path: Optional[str] = None):
     返回:
         LensfunDatabase对象
     """
-    global _global_db_cache, _global_db_lock
-    
-    # 初始化锁（线程安全）
-    if _global_db_lock is None:
-        import threading
-        _global_db_lock = threading.Lock()
-    
-    # 使用custom_db_path作为缓存键
-    cache_key = custom_db_path if custom_db_path else '__default__'
+    cache_key = _database_cache_key(custom_db_path)
     
     with _global_db_lock:
         # 检查缓存
-        if cache_key in _global_db_cache:
-            return _global_db_cache[cache_key]
+        db = _global_db_cache.get(cache_key)
+        if db is not None:
+            _global_db_cache.move_to_end(cache_key)
+            return db
         
         # 创建新数据库并缓存
         try:
             db = LensfunDatabase(custom_db_path=custom_db_path)
             _global_db_cache[cache_key] = db
+            _global_db_cache.move_to_end(cache_key)
+            _trim_database_cache_locked()
             return db
         except Exception as e:
             logger.error(f"  ❌ [Lensfun] Failed to create database: {e}")
@@ -530,33 +598,38 @@ def reload_lensfun_database(custom_db_path: Optional[str] = None):
     参数:
         custom_db_path: 自定义数据库路径，None表示重新加载默认数据库
     """
-    global _global_db_cache, _global_db_lock
-    
-    if _global_db_lock is None:
-        import threading
-        _global_db_lock = threading.Lock()
-    
-    cache_key = custom_db_path if custom_db_path else '__default__'
-    
-    with _global_db_lock:
-        # 删除旧缓存
-        if cache_key in _global_db_cache:
-            old_db = _global_db_cache[cache_key]
-            del _global_db_cache[cache_key]
-            # 显式销毁旧数据库
-            if hasattr(old_db, 'db') and old_db.db:
-                _lensfun.lf_db_destroy(old_db.db)
-                old_db.db = None
-        
-        # 创建新数据库
-        try:
-            db = LensfunDatabase(custom_db_path=custom_db_path)
+    cache_key = _database_cache_key(custom_db_path)
+
+    # Build outside the lock: loading XML can be slow and readers may safely
+    # keep using the previous database until the replacement is ready.
+    try:
+        db = LensfunDatabase(custom_db_path=custom_db_path)
+        with _global_db_lock:
+            _global_db_cache.pop(cache_key, None)
             _global_db_cache[cache_key] = db
-            logger.success(f"  ✅ [Lensfun] Database reloaded successfully")
-            return db
-        except Exception as e:
-            logger.error(f"  ❌ [Lensfun] Failed to reload database: {e}")
-            raise
+            _global_db_cache.move_to_end(cache_key)
+            _trim_database_cache_locked()
+        # Coordinate maps contain the old database's calibration result.
+        clear_distortion_map_cache()
+        logger.success(f"  ✅ [Lensfun] Database reloaded successfully")
+        return db
+    except Exception as e:
+        logger.error(f"  ❌ [Lensfun] Failed to reload database: {e}")
+        raise
+
+
+def clear_lensfun_database_cache() -> int:
+    """Drop cached database owners and stale coordinate maps.
+
+    In-flight callers keep their local database reference until their current
+    correction completes. Returns the number of database cache entries
+    removed.
+    """
+    with _global_db_lock:
+        count = len(_global_db_cache)
+        _global_db_cache.clear()
+    clear_distortion_map_cache()
+    return count
 
 # ============================================================================
 # 便捷函数
@@ -822,9 +895,12 @@ def compute_lens_distortion_map(
         return None
 
     # Cache key: same lens + focal + aperture + image size = same distortion map
-    cache_key = (lens_model, focal_length, aperture, crop_factor, width, height,
-                 correct_distortion, correct_tca)
-    cached = _distortion_map_cache.get(cache_key)
+    cache_key = (
+        camera_maker, camera_model, lens_maker, lens_model,
+        focal_length, aperture, crop_factor, width, height,
+        correct_distortion, correct_tca, custom_db_path,
+    )
+    cached = _get_distortion_map(cache_key)
     if cached is not None:
         logger.info("  ⚡ [Lensfun] Distortion map cache hit")
         coords, oob_mask = cached
@@ -898,9 +974,145 @@ def compute_lens_distortion_map(
     np.clip(all_x, 0, width - 1, out=all_x)
     np.clip(all_y, 0, height - 1, out=all_y)
 
-    _distortion_map_cache[cache_key] = (coords, oob_mask)
+    _put_distortion_map(cache_key, (coords, oob_mask))
 
     return coords, oob_mask, image
+
+
+def apply_lens_correction_tiled(
+    image: np.ndarray,
+    camera_maker: Optional[str] = None,
+    camera_model: str = "",
+    lens_maker: Optional[str] = None,
+    lens_model: str = "",
+    focal_length: float = 0.0,
+    aperture: float = 0.0,
+    distance: float = 1000.0,
+    crop_factor: Optional[float] = None,
+    correct_distortion: bool = True,
+    correct_tca: bool = True,
+    correct_vignetting: bool = True,
+    custom_db_path: Optional[str] = None,
+    stripe_rows: int = 256,
+) -> Optional[np.ndarray]:
+    """Apply Lensfun geometry with bounded coordinate-map scratch.
+
+    A full per-channel x/y map costs about 24 bytes/pixel (about 1.46GB at
+    61MP). This path scans map bounds in stripes, derives the same safety
+    scaling as the full-map path, then regenerates/remaps one stripe at a time.
+    """
+    if not _lensfun:
+        return None
+    import cv2
+
+    height, width = image.shape[:2]
+    db = _get_or_create_database(custom_db_path=custom_db_path)
+    camera = db.find_camera(camera_maker, camera_model)
+    lens = db.find_lens(camera, lens_maker, lens_model)
+    if not lens:
+        return None
+    if crop_factor is None:
+        if camera:
+            try:
+                crop_factor = float(camera.contents.CropFactor)
+            except (AttributeError, ValueError):
+                crop_factor = 1.0
+        else:
+            crop_factor = 1.0
+    if not crop_factor or crop_factor <= 0:
+        crop_factor = 1.0
+
+    modifier = LensfunModifier(lens, focal_length, crop_factor, width, height, LF_PF_F32)
+    if correct_vignetting:
+        modifier.enable_vignetting_correction(aperture, distance)
+        modifier.apply_color_modification(image, 0.0, 0.0, width, height)
+    if not correct_distortion and not correct_tca:
+        return image
+    if correct_distortion:
+        modifier.enable_distortion_correction()
+    if correct_tca:
+        modifier.enable_tca_correction()
+    try:
+        auto_scale = float(modifier.get_auto_scale(False))
+        if np.isfinite(auto_scale) and auto_scale > 0.0:
+            modifier.enable_scaling(auto_scale)
+    except Exception as e:
+        logger.debug(f"  [Lensfun] Auto-scale unavailable: {e}")
+
+    stripe_rows = max(16, min(int(stripe_rows), height))
+    x_min = y_min = float("inf")
+    x_max = y_max = float("-inf")
+    for y in range(0, height, stripe_rows):
+        rows = min(stripe_rows, height - y)
+        coords = modifier.apply_subpixel_geometry_distortion(0.0, float(y), width, rows)
+        if coords is None:
+            return None
+        x = coords[:, :, :, 0]
+        yy = coords[:, :, :, 1]
+        x_min = min(x_min, float(x.min()))
+        x_max = max(x_max, float(x.max()))
+        y_min = min(y_min, float(yy.min()))
+        y_max = max(y_max, float(yy.max()))
+
+    # Match the full-map auto-crop and interpolation-margin safety scaling.
+    scale1 = 1.0
+    cx1, cy1 = float(width) / 2.0, float(height) / 2.0
+    if x_min < 0 or y_min < 0 or x_max >= width or y_max >= height:
+        x_range, y_range = x_max - x_min, y_max - y_min
+        scale1 = min(
+            (width - 1) / x_range if x_range > 0 else 1.0,
+            (height - 1) / y_range if y_range > 0 else 1.0,
+        )
+        x_min, x_max = cx1 + (x_min - cx1) * scale1, cx1 + (x_max - cx1) * scale1
+        y_min, y_max = cy1 + (y_min - cy1) * scale1, cy1 + (y_max - cy1) * scale1
+
+    margin = 2.0
+    x_hi, y_hi = width - 1 - margin, height - 1 - margin
+    scale2 = 1.0
+    cx2, cy2 = (float(width) - 1.0) / 2.0, (float(height) - 1.0) / 2.0
+    if x_min < margin or y_min < margin or x_max > x_hi or y_max > y_hi:
+        scales = [1.0]
+        if x_min < cx2:
+            scales.append((cx2 - margin) / max(cx2 - x_min, 1e-6))
+        if x_max > cx2:
+            scales.append((x_hi - cx2) / max(x_max - cx2, 1e-6))
+        if y_min < cy2:
+            scales.append((cy2 - margin) / max(cy2 - y_min, 1e-6))
+        if y_max > cy2:
+            scales.append((y_hi - cy2) / max(y_max - cy2, 1e-6))
+        scale2 = max(0.0, min(scales))
+
+    output = np.empty_like(image)
+    for y in range(0, height, stripe_rows):
+        rows = min(stripe_rows, height - y)
+        coords = modifier.apply_subpixel_geometry_distortion(0.0, float(y), width, rows)
+        if coords is None:
+            return None
+        all_x = coords[:, :, :, 0]
+        all_y = coords[:, :, :, 1]
+        if scale1 != 1.0:
+            all_x[:] = cx1 + (all_x - cx1) * scale1
+            all_y[:] = cy1 + (all_y - cy1) * scale1
+        if scale2 != 1.0:
+            all_x[:] = cx2 + (all_x - cx2) * scale2
+            all_y[:] = cy2 + (all_y - cy2) * scale2
+        oob = (
+            (all_x < margin) | (all_x > x_hi)
+            | (all_y < margin) | (all_y > y_hi)
+        ).any(axis=2)
+        np.clip(all_x, 0, width - 1, out=all_x)
+        np.clip(all_y, 0, height - 1, out=all_y)
+        dst = output[y:y + rows]
+        for channel in range(3):
+            dst[:, :, channel] = cv2.remap(
+                image[:, :, channel],
+                all_x[:, :, channel],
+                all_y[:, :, channel],
+                cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        dst[oob] = 0
+    return output
 
 
 def get_lens_info(

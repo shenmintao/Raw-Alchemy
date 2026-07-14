@@ -263,6 +263,9 @@ class LibraryControllerMixin:
         self.update_window_title()
         self._load_sidecar_for_path(path)
 
+        self._pending_scope_update = None
+        if hasattr(self.right_panel, 'reset_scope_data'):
+            self.right_panel.reset_scope_data()
         self.original.clear()
         self.current.clear()
         self.baseline.clear()
@@ -428,15 +431,15 @@ class LibraryControllerMixin:
                     InfoBar.error(tr("delete_failed"), str(e2), parent=self)
 
     def show_original(self):
-        img_to_show = self.baseline if self.baseline.full else self.original
-        if not img_to_show.full:
+        img_to_show = self.baseline if self.baseline.uint8_data is not None else self.original
+        if img_to_show.uint8_data is None:
             return
         if img_to_show.uint8_data is not None:
             self.viewport.set_image(img_to_show.uint8_data, source_size=img_to_show.source_size)
         InfoBar.info(tr("compare_showing_baseline"), "", parent=self)
 
     def show_processed(self):
-        if not self.current.full:
+        if self.current.uint8_data is None:
             if self.original.uint8_data is not None:
                 self.viewport.set_image(
                     self.original.uint8_data, source_size=self.original.source_size

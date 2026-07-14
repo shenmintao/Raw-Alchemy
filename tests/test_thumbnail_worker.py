@@ -224,10 +224,11 @@ def test_stop_check_skips_fallback_after_failed_embedded(monkeypatch):
 
 def test_default_worker_count_leaves_cores_for_ui(monkeypatch):
     _ensure_qapp(monkeypatch)
+    from raw_alchemy.config import THUMBNAIL_MAX_WORKERS
     from raw_alchemy.workers.thumbnail_worker import ThumbnailWorker
 
     worker = ThumbnailWorker("/nonexistent")
-    assert worker.max_workers == max(2, (os.cpu_count() or 4) - 2)
+    assert worker.max_workers == max(1, min(THUMBNAIL_MAX_WORKERS, os.cpu_count() or 1))
     # explicit value still honored
     assert ThumbnailWorker("/nonexistent", max_workers=3).max_workers == 3
 

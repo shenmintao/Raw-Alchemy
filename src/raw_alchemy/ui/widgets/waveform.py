@@ -23,6 +23,8 @@ class _WaveformWorker(QThread):
             logger.warning(f"Waveform update error: {type(e).__name__}: {e}")
         except BaseException as e:
             logger.error(f"Waveform update error: {type(e).__name__}: {e}")
+        finally:
+            self.img_array = None
         self.result_ready.emit(result, self.generation)
 
 
@@ -90,9 +92,22 @@ class WaveformWidget(QWidget):
     def shutdown_worker(self):
         self.update_timer.stop()
         self.pending_data = None
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(1500)
+        self._generation += 1
+        if self._worker is not None:
+            if self._worker.isRunning():
+                self._worker.wait()
+            self._worker.deleteLater()
             self._worker = None
+
+    def reset_data(self):
+        """Drop queued/visible data when the selected photo changes."""
+        self.update_timer.stop()
+        self.pending_data = None
+        self._generation += 1
+        self.waveform_data = None
+        self._waveform_image = None
+        self._waveform_rgba = None
+        self.update()
 
     def _render_waveform_image(self):
         """Pre-render waveform data to a QImage buffer using numpy (no Python loops)."""

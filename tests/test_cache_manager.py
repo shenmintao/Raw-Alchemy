@@ -207,3 +207,51 @@ def test_stats_reports_per_field_totals(huge_available_ram):
     assert stats["output"] == pytest.approx(20, rel=0.01)
     assert stats["total"] == pytest.approx(750, rel=0.01)
     assert stats["total"] == pytest.approx(manager.current_memory_mb)
+def test_distortion_map_cache_is_byte_bounded(monkeypatch):
+    from raw_alchemy import config
+    from raw_alchemy import lensfun_wrapper as lensfun
+
+    monkeypatch.setattr(config, "DISTORTION_MAP_CACHE_LIMIT_MB", 1)
+    lensfun.clear_distortion_map_cache()
+    # ~625 KiB per entry: only the most recent one fits under a 1 MiB cap.
+    entry_a = (
+        np.zeros((160, 160, 3, 2), np.float32),
+        np.zeros((160, 160), bool),
+    )
+    entry_b = (
+        np.ones((160, 160, 3, 2), np.float32),
+        np.zeros((160, 160), bool),
+    )
+    assert lensfun._put_distortion_map("a", entry_a) is True
+    assert lensfun._put_distortion_map("b", entry_b) is True
+    assert lensfun._get_distortion_map("a") is None
+    assert lensfun._get_distortion_map("b") is entry_b
+    assert lensfun._distortion_map_cache_bytes <= 1024 * 1024
+    lensfun.clear_distortion_map_cache()
+
+
+def test_lens_database_cache_is_entry_bounded(monkeypatch):
+    from raw_alchemy import config
+    from raw_alchemy import lensfun_wrapper as lensfun
+
+    created = []
+
+    class FakeDatabase:
+        def __init__(self, custom_db_path=None):
+            self.path = custom_db_path
+            created.append(custom_db_path)
+
+    monkeypatch.setattr(config, "LENSFUN_DB_CACHE_ENTRIES", 2)
+    monkeypatch.setattr(lensfun, "LensfunDatabase", FakeDatabase)
+    lensfun.clear_lensfun_database_cache()
+    try:
+        first = lensfun._get_or_create_database("db-a.xml")
+        lensfun._get_or_create_database("db-b.xml")
+        lensfun._get_or_create_database("db-c.xml")
+
+        assert len(lensfun._global_db_cache) == 2
+        assert lensfun._database_cache_key("db-a.xml") not in lensfun._global_db_cache
+        assert lensfun._get_or_create_database("db-a.xml") is not first
+        assert created == ["db-a.xml", "db-b.xml", "db-c.xml", "db-a.xml"]
+    finally:
+        lensfun.clear_lensfun_database_cache()

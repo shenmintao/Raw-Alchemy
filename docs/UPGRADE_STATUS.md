@@ -1,5 +1,33 @@
 # Upgrade Status
 
+## Post-`studio-v0.6.0-pre7` — bounded working set and VRAM reclamation
+
+This follow-up pass removes the remaining high-water allocations that were
+outside the Phase 7 cache accounting:
+
+- 4096px quality-base + native ROI presentation tiers replace the persistent
+  native full-frame base texture.
+- GUI full-resolution QPixmap/uint8 duplicates are removed; presentation and
+  cache consumers share immutable result arrays.
+- Executor budgets are enforced during prefix construction; host source
+  residency duplicates are removed and leading ROI/crop reads directly from
+  the decoded cache frame.
+- Cached full/proxy lens-corrected arrays become direct executor sources, so
+  slider and native ROI requests do not repeat full-frame lens callback copies.
+- CPU colour/LUT/output conversion and RGB denoise use bounded scratch.
+- Lensfun native correction uses a byte-bounded map LRU or a striped two-pass
+  remap; database objects use an entry-bounded LRU.
+- Export quantization, HEIF handoff, denoise disk cache and PQ transfer avoid
+  whole-frame temporary byte/float copies.
+- OpenGL releases large PBO and stale texture storage; ROI mipmaps are disabled.
+- ONNX CUDA arenas/workspaces are bounded and decode sessions expire after 15s.
+- Thumbnail extraction is capped at four workers; GPU CLI batches serialize
+  per-device inference and CPU batches are capped by available RAM.
+- Slider drag uses immediate leading feedback, 80ms throttling and exact
+  release submission. Scope/update/download threads have explicit teardown.
+
+See `docs/PERFORMANCE_MEMORY.md` for ownership rules and measurements.
+
 ## `studio-v0.6.0-pre3` — Phase 7 交互性能与内存治理
 
 pre3 在 pre2 之上实施了完整的 Phase 7（任务全文见 `docs/PHASE7_PLAN.md`）：

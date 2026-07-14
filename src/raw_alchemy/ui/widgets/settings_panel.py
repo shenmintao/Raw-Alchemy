@@ -15,12 +15,20 @@ class CudaDownloadWorker(QObject):
     """Worker thread for downloading CUDA runtime."""
     progress = Signal(int, int)  # downloaded, total
     finished = Signal(bool)  # success
+
+    def __init__(self):
+        super().__init__()
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
     
     def run(self):
         try:
             from raw_alchemy.onnx import gpu_runtime
             success = gpu_runtime.download_cuda_runtime(
-                progress_callback=lambda d, t: self.progress.emit(d, t)
+                progress_callback=lambda d, t: self.progress.emit(d, t),
+                cancel_callback=lambda: self._cancel_requested,
             )
             self.finished.emit(success)
         except Exception as e:
@@ -324,6 +332,25 @@ class SettingsPanel(QWidget):
             )
         
         self._update_cuda_status()
+
+    def shutdown_worker(self):
+        """Cancel and join an active runtime download before window teardown."""
+        worker = self._download_worker
+        thread = self._download_thread
+        if worker is not None:
+            worker.cancel()
+            try:
+                worker.progress.disconnect(self._on_download_progress)
+                worker.finished.disconnect(self._on_download_finished)
+            except (TypeError, RuntimeError):
+                pass
+        if thread is not None:
+            thread.quit()
+            if thread.isRunning():
+                thread.wait()
+            thread.deleteLater()
+        self._download_thread = None
+        self._download_worker = None
     
     def on_cuda_remove_clicked(self):
         """Remove installed CUDA runtime."""

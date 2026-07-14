@@ -23,7 +23,12 @@ import time
 import numpy as np
 from loguru import logger
 
-from .denoiser import _find_model, _get_providers
+from .denoiser import (
+    _configure_providers,
+    _find_model,
+    _get_providers,
+    _make_session_options,
+)
 
 MODEL_FILE = "rcd_demosaic_dyn2.onnx"
 TILE = 1536   # even (CFA phase), single compiled shape
@@ -46,33 +51,19 @@ def _get_session():
         import onnxruntime as ort
 
         model_path = _find_model(MODEL_FILE)
-        # Freeze the (constant) tile dims into the graph: DirectML compiles a
-        # static graph in <1s, vs ~11s JIT for the dynamic one at first use.
-        model_bytes = None
-        try:
-            import onnx
-
-            m = onnx.load(model_path)
-            for d in m.graph.input[0].type.tensor_type.shape.dim:
-                d.ClearField("dim_param")
-                d.dim_value = TILE
-            m = onnx.shape_inference.infer_shapes(m)
-            model_bytes = m.SerializeToString()
-        except Exception as e:
-            logger.warning(f"RCD: tile-dim freeze unavailable ({e}); dynamic graph")
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so = _make_session_options(ort)
+        # Freeze the dynamic h/w symbols through ORT itself. This avoids
+        # importing/rewriting the model with the optional ``onnx`` package and
+        # still gives CUDA/DirectML one fixed compiled tile graph.
+        so.add_free_dimension_override_by_name("h", TILE)
+        so.add_free_dimension_override_by_name("w", TILE)
         if _cpu_fallback:
             providers = ["CPUExecutionProvider"]
         else:
             providers = _get_providers()
-        provider_options = [
-            ({"device_id": 0} if p in ("CUDAExecutionProvider", "DmlExecutionProvider") else {})
-            for p in providers
-        ]
         sess = ort.InferenceSession(
-            model_bytes if model_bytes is not None else model_path,
-            so, providers=providers, provider_options=provider_options,
+            model_path,
+            so, providers=_configure_providers(providers),
         )
         _sessions[TILE] = sess
         _session_provider = sess.get_providers()[0]
@@ -107,6 +98,9 @@ _cpu_fallback = False
 def _run_tile(session, patch: np.ndarray, m2: np.ndarray,
               wb3: np.ndarray, cam_mat: np.ndarray) -> np.ndarray:
     global _cpu_fallback
+    # If an earlier tile fell back from GPU to CPU, do not keep invoking the
+    # stale failed session for every later tile.
+    session = _get_session()
     feeds = {
         "bayer": np.ascontiguousarray(patch, dtype=np.float32),
         "mr2": m2[0], "mg2": m2[1], "mb2": m2[2],

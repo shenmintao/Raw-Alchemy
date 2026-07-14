@@ -1,8 +1,52 @@
 import os
 import concurrent.futures
-from raw_alchemy import core
+from raw_alchemy import config, core
 
 from raw_alchemy.config import SUPPORTED_RAW_EXTENSIONS
+
+
+def _discover_raw_files(directory: str) -> list[str]:
+    """Scan a batch directory once and return deterministic RAW filenames."""
+    suffixes = frozenset(ext.lower() for ext in SUPPORTED_RAW_EXTENSIONS)
+    with os.scandir(directory) as entries:
+        files = [
+            entry.name
+            for entry in entries
+            if entry.is_file() and os.path.splitext(entry.name)[1].lower() in suffixes
+        ]
+    return sorted(files, key=str.casefold)
+
+
+def _effective_batch_jobs(requested: int, file_count: int) -> int:
+    """Bound process count by workload, available RAM and GPU ownership."""
+    jobs = max(1, min(int(requested or 1), max(1, int(file_count))))
+    try:
+        import psutil
+
+        available_mb = int(psutil.virtual_memory().available // (1024 * 1024))
+        # Keep one GiB for the OS/UI and budget a conservative native-frame
+        # working set per process.
+        memory_jobs = max(
+            1,
+            (max(0, available_mb - 1024)
+             // max(1, int(config.BATCH_MEMORY_PER_JOB_MB))),
+        )
+        jobs = min(jobs, memory_jobs)
+    except Exception:
+        pass
+
+    try:
+        import onnxruntime as ort
+
+        providers = set(ort.get_available_providers())
+        if providers.intersection({
+            'CUDAExecutionProvider', 'DmlExecutionProvider',
+            'ROCMExecutionProvider', 'CoreMLExecutionProvider',
+        }):
+            jobs = min(jobs, max(1, int(config.GPU_BATCH_MAX_JOBS)))
+    except Exception:
+        pass
+    return max(1, jobs)
 
 def process_path(
     input_path,
@@ -68,9 +112,7 @@ def process_path(
             log_message(f"❌ Error: {error_msg}")
             raise ValueError(error_msg)
 
-        raw_files = []
-        for ext in SUPPORTED_RAW_EXTENSIONS:
-            raw_files.extend([f for f in os.listdir(input_path) if f.lower().endswith(ext)])
+        raw_files = _discover_raw_files(input_path)
 
         if not raw_files:
             log_message("⚠️ No supported RAW files found in the input directory.")
@@ -80,8 +122,15 @@ def process_path(
         count = len(raw_files)
         log_message(f"🔍 Found {count} RAW files for parallel processing.")
         send_signal({'total_files': count}) 
-        
-        with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as executor:
+
+        effective_jobs = _effective_batch_jobs(jobs, count)
+        if effective_jobs != max(1, int(jobs or 1)):
+            log_message(
+                f"ℹ️ Batch concurrency limited to {effective_jobs} "
+                "to protect RAM/VRAM."
+            )
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=effective_jobs) as executor:
             futures = {
                 executor.submit(
                     core.process_image,

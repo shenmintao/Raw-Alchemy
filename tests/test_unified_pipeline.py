@@ -160,7 +160,7 @@ def test_export_executor_pq_out_matches_colour_reference():
     )
     expected_linear = np.clip(src @ matrix.T, 0.0, None)
     expected = colour.cctf_encoding(
-        expected_linear * (config.HDR_PEAK_NITS / config.HDR_PQ_MASTERING_NITS),
+        expected_linear * config.HDR_PEAK_NITS,
         function=config.HDR_PQ_TRANSFER_FUNCTION,
     )
     expected = np.clip(expected, 0.0, 1.0).astype(np.float32)
@@ -714,7 +714,13 @@ def test_image_processor_applies_executor_cache_budget(monkeypatch):
 
     processor._do_process(ProcessRequest(path, _case({"exposure": 1.0}), 1))
 
-    assert trim_calls == [int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024]
+    budget = int(config.EXECUTOR_CACHE_LIMIT_MB) * 1024 * 1024
+    # Budgeting now happens before and during prefix construction, not only
+    # once after the high-water allocation has already occurred.
+    assert trim_calls
+    assert trim_calls[0] == budget
+    assert trim_calls[-1] == budget
+    assert all(0 <= value <= budget for value in trim_calls)
 
 
 # =====================================================================

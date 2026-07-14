@@ -6,13 +6,18 @@ import numpy as np
 import concurrent.futures
 from loguru import logger
 
-from raw_alchemy.config import SUPPORTED_RAW_EXTENSIONS
+from raw_alchemy.config import SUPPORTED_RAW_EXTENSIONS, THUMBNAIL_MAX_WORKERS
 
 
 def _default_max_workers():
-    """Leave a couple of cores free so thumbnail extraction never starves
-    the UI thread or the preview pipeline."""
-    return max(2, (os.cpu_count() or 4) - 2)
+    """Bound decode concurrency by memory as well as CPU count.
+
+    On a 32-core machine the previous ``cpu_count - 2`` policy launched 30
+    rawpy jobs; fallback decodes can each hold a large native buffer and swamp
+    both RAM and the interactive pipeline. Embedded-JPEG extraction is fast
+    enough that four low-priority workers keep the viewport fed.
+    """
+    return max(1, min(int(THUMBNAIL_MAX_WORKERS), os.cpu_count() or 1))
 
 
 def _lower_thread_priority():

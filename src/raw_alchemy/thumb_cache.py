@@ -298,6 +298,13 @@ class ThumbnailCache:
         except Exception as e:  # never propagate from the background thread
             logger.debug(f"[ThumbCache] prune failed: {e}")
 
+    def wait_for_prune(self):
+        """Join the optional prune thread during application shutdown."""
+        with self._lock:
+            thread = self._prune_thread
+        if thread is not None and thread.is_alive():
+            thread.join()
+
     def clear(self):
         """Delete every cache entry (works even when disabled). Returns the
         number of files removed."""

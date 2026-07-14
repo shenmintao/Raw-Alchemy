@@ -62,21 +62,65 @@ METERING_MODES = [
 # ==========================================
 
 # Absolute cap (MB) for the decoded-image cache. Adjustable in Settings.
-CACHE_LIMIT_MB = 4096
+# Keep this conservative: the active frame, executor working set, Qt/OpenGL
+# presentation buffers and ONNX arenas live outside this cache.
+CACHE_LIMIT_MB = 2048
 # Relative cap as a fraction of available memory; effective quota is
 # min(relative, absolute).
-CACHE_MEMORY_FRACTION = 0.5
-# Byte budget (MB) for the preview pipeline prefix cache. Since T7.2 the
-# prefix/final caches hold GPU-resident buffers, so this is a VRAM budget.
-EXECUTOR_CACHE_LIMIT_MB = 1536
-# Byte budget (MB) for *free* (recyclable) GPU buffers retained by the
-# shape-keyed ndarray pool (T7.2). Released buffers above this budget are
-# actually freed instead of pooled.
-GPU_POOL_LIMIT_MB = 1024
+CACHE_MEMORY_FRACTION = 0.35
+# Byte budget (MB) for the numpy-backed preview prefix/final cache. ONNX and
+# OpenGL allocations have separate VRAM lifetimes and are not counted here.
+EXECUTOR_CACHE_LIMIT_MB = 768
+# Byte budget (MB) for free recyclable host ndarrays retained by the legacy-
+# named GPU pool. Released buffers above this budget are freed, not pooled.
+GPU_POOL_LIMIT_MB = 256
 # At most this many free buffers are retained per (dtype, shape) key.
-# Sharpen holds 4 same-shape 2D scratch buffers and RCD demosaic up to 7;
-# the global byte budget above is the primary bound.
-GPU_POOL_MAX_PER_KEY = 8
+# Sharpen holds 3 same-shape 2D scratch buffers; the global byte budget above
+# is the primary bound.
+GPU_POOL_MAX_PER_KEY = 4
+
+# Per-image cap for cached final uint8 preview frames.  ROI/pan keys can
+# otherwise retain ten tens-of-megabytes frames before the outer cache gets a
+# chance to evict the whole output category.
+OUTPUT_CACHE_LIMIT_MB = 256
+
+# Lensfun coordinate maps cost roughly 24 bytes/pixel (per-channel x/y) and
+# previously lived in an unbounded module-global dictionary. Full-resolution
+# maps larger than this cap are used once and discarded; proxy maps are LRU.
+DISTORTION_MAP_CACHE_LIMIT_MB = 256
+
+# Lens databases are much smaller than coordinate maps, but custom database
+# paths used during a long session must still not grow a process-global cache
+# without bound.  The default database plus a few recent custom databases is
+# enough for normal interactive and batch workflows.
+LENSFUN_DB_CACHE_ENTRIES = 4
+
+# Presentation tiers use a bounded quality base map and native-resolution
+# detail ROIs. The base texture is deliberately not a full
+# 45/61MP frame; this keeps host copies, PBO staging and mipmapped texture VRAM
+# bounded while preserving 1:1 detail through the ROI path.
+QUALITY_BASE_MAX_SIDE = 4096
+QUALITY_BASE_MAX_PIXELS = 16_000_000
+
+# One large PBO upload is released after presentation instead of pinning its
+# high-water allocation for the rest of the session.
+PBO_RETAIN_LIMIT_MB = 64
+
+# Thumbnail RAW/JPEG extraction is I/O heavy and each fallback decoder can
+# carry a sizeable native buffer.  More workers hurt latency and memory on
+# high-core-count machines.
+THUMBNAIL_MAX_WORKERS = 4
+
+# ONNX Runtime CUDA arena cap per session. DirectML ignores this option, but
+# still benefits from tiled/strip execution and prompt session cleanup.
+ONNX_GPU_MEMORY_LIMIT_MB = 2048
+
+# CLI batch workers are separate processes, so every worker owns independent
+# decode arrays and ONNX arenas. Multiple GPU processes multiply VRAM without
+# improving a single-device queue; CPU-only jobs are additionally capped by
+# available system memory.
+GPU_BATCH_MAX_JOBS = 1
+BATCH_MEMORY_PER_JOB_MB = 3072
 
 # ==========================================
 #           GUI 閰嶇疆

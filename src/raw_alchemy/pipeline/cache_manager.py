@@ -17,6 +17,7 @@ from raw_alchemy import config
 # 都占新槽,4 槽只够 2-3 步平移的回看;uint8 ROI 输出是屏幕像素级
 # (数十 MB/槽),10 槽的内存代价远低于回访重算一趟 color 链。
 OUTPUT_SLOT_LIMIT = 10
+OUTPUT_CACHE_LIMIT_BYTES = int(config.OUTPUT_CACHE_LIMIT_MB) * 1024 * 1024
 
 
 class CachedImage:
@@ -178,6 +179,20 @@ class CachedImage:
             self.output_source_size = source_size
             while len(self._output_slots) > OUTPUT_SLOT_LIMIT - 1:
                 self._output_slots.popitem(last=False)
+            # A slot-count limit alone is not a memory limit: ten 24MP ROI
+            # frames are ~720 MiB. Keep the newest primary and evict secondary
+            # LRU slots until this entry's output category fits its byte cap.
+            secondary_bytes = sum(
+                int(img.nbytes) for img, _ev, _size in self._output_slots.values()
+            )
+            primary_bytes = int(img_uint8.nbytes) if img_uint8 is not None else 0
+            while self._output_slots and (
+                primary_bytes + secondary_bytes > OUTPUT_CACHE_LIMIT_BYTES
+            ):
+                _old_key, (old_img, _old_ev, _old_size) = self._output_slots.popitem(
+                    last=False
+                )
+                secondary_bytes -= int(old_img.nbytes)
 
     def drop_stage(self, stage: str) -> float:
         """Drop one eviction stage's arrays (and their validity keys).

@@ -12,6 +12,40 @@ def _scratch_dir(name):
     return root
 
 
+def test_batch_job_budget_serializes_gpu_and_caps_cpu_by_ram(monkeypatch):
+    import onnxruntime as ort
+    import psutil
+
+    from raw_alchemy import config, orchestrator
+
+    class Memory:
+        available = 7 * 1024 * 1024 * 1024
+
+    monkeypatch.setattr(config, "GPU_BATCH_MAX_JOBS", 1)
+    monkeypatch.setattr(config, "BATCH_MEMORY_PER_JOB_MB", 3072)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: Memory())
+
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["CUDAExecutionProvider"])
+    assert orchestrator._effective_batch_jobs(8, 10) == 1
+
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["CPUExecutionProvider"])
+    assert orchestrator._effective_batch_jobs(8, 10) == 2
+
+
+def test_batch_discovery_scans_supported_files_once_and_sorts(tmp_path):
+    from raw_alchemy import orchestrator
+
+    for name in ("b.CR3", "A.dng", "notes.txt", "c.NEF"):
+        (tmp_path / name).write_bytes(b"x")
+    (tmp_path / "folder.arw").mkdir()
+
+    assert orchestrator._discover_raw_files(str(tmp_path)) == [
+        "A.dng",
+        "b.CR3",
+        "c.NEF",
+    ]
+
+
 def test_cli_single_file_forwards_entrypoint_options(monkeypatch):
     from raw_alchemy import cli
 
@@ -214,6 +248,7 @@ def test_orchestrator_batch_submits_supported_raw_files(monkeypatch):
         return fake_executor
 
     monkeypatch.setattr(orchestrator, "SUPPORTED_RAW_EXTENSIONS", (".dng", ".nef"))
+    monkeypatch.setattr(orchestrator, "_effective_batch_jobs", lambda requested, count: requested)
     monkeypatch.setattr(
         orchestrator.concurrent.futures,
         "ProcessPoolExecutor",

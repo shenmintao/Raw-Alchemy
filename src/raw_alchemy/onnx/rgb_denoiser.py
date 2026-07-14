@@ -29,7 +29,13 @@ from typing import Callable, Optional
 import numpy as np
 from loguru import logger
 
-from .denoiser import _find_model, _get_providers, _tile_weight
+from .denoiser import (
+    _configure_providers,
+    _find_model,
+    _get_providers,
+    _make_session_options,
+    _tile_weight,
+)
 
 MODEL_FILE = "fastdenoise_v4_512_fp16.onnx"
 MODEL_TILE = 512
@@ -59,16 +65,11 @@ def _get_session():
 
     model_path = _find_model(MODEL_FILE)
     logger.info(f"Loading FastDenoise v4 from: {model_path}")
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options = _make_session_options(ort)
     providers = _get_providers()
-    provider_options = [
-        ({"device_id": 0} if p in ("CUDAExecutionProvider", "DmlExecutionProvider") else {})
-        for p in providers
-    ]
     _session = ort.InferenceSession(
         model_path, sess_options,
-        providers=providers, provider_options=provider_options,
+        providers=_configure_providers(providers),
     )
     _session_provider = _session.get_providers()[0]
     logger.info(f"FastDenoise session: {_session_provider}")
@@ -108,22 +109,15 @@ def denoise_rgb_linear(
     # R/G、B/G 漂移超 -5%(偏绿),两种曝光/噪声水平下单调恶化;0.30-0.45
     # 是最干净带。旧 sidecar 里 >0.5 的值在此一并夹回。
     strength = float(np.clip(strength, 0.01, 0.5))
-    lin = np.clip(linear_rgb.astype(np.float32, copy=False), 0.0, 1.0)
-    gain = compute_gain(lin)
-    gained = lin * gain
-    clipped = gained >= 1.0  # saturated after gain: passthrough at the end
-    enc = np.clip(gained, 0.0, 1.0) ** (1.0 / GAMMA)
+    source = linear_rgb.astype(np.float32, copy=False)
+    gain = compute_gain(source)
 
-    H, W = enc.shape[:2]
+    H, W = source.shape[:2]
     tile = MODEL_TILE
     overlap = int(np.clip(tile_overlap, 0, tile - 1))
     step = tile - overlap
 
-    pad_h = max(tile - H, 0)
-    pad_w = max(tile - W, 0)
-    if pad_h or pad_w:
-        enc = np.pad(enc, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
-    PH, PW = enc.shape[:2]
+    PH, PW = max(tile, H), max(tile, W)
 
     ys = list(range(0, PH - tile + 1, step))
     xs = list(range(0, PW - tile + 1, step))
@@ -133,34 +127,79 @@ def denoise_rgb_linear(
         xs.append(PW - tile)
     total = len(ys) * len(xs)
 
+    # The accumulator becomes the returned output in place.  The old path
+    # also materialised full-frame lin/gained/clipped/encoded/out_enc/out_lin
+    # arrays, pushing a 61MP denoise several gigabytes above the source image.
     accum = np.zeros((PH, PW, 3), np.float32)
     weight = np.zeros((PH, PW, 1), np.float32)
+    chw = np.empty((3, tile, tile), np.float32)
+    sigma = np.full((1, 1, tile, tile), strength, np.float32)
+    weight_cache = {}
     done = 0
     for y in ys:
         for x in xs:
-            patch = enc[y:y + tile, x:x + tile]
-            chw = np.ascontiguousarray(patch.transpose(2, 0, 1))[np.newaxis]
-            sig = np.full((1, 1, tile, tile), strength, np.float32)
-            pred = session.run(None, {"rgb": chw, "sigma": sig})[0][0].transpose(1, 2, 0)
-            wt = _tile_weight(
-                tile, tile, overlap,
-                at_top=(y == 0), at_bottom=(y + tile >= PH),
-                at_left=(x == 0), at_right=(x + tile >= PW),
-            )[0][..., np.newaxis]
-            accum[y:y + tile, x:x + tile] += pred * wt
+            patch = source[y:min(y + tile, H), x:min(x + tile, W)]
+            ph, pw = patch.shape[:2]
+            if ph < tile or pw < tile:
+                patch = np.pad(
+                    patch,
+                    ((0, tile - ph), (0, tile - pw), (0, 0)),
+                    mode="reflect",
+                )
+            np.copyto(chw, patch.transpose(2, 0, 1))
+            np.clip(chw, np.float32(0.0), np.float32(1.0), out=chw)
+            chw *= np.float32(gain)
+            np.clip(chw, np.float32(0.0), np.float32(1.0), out=chw)
+            np.power(chw, np.float32(1.0 / GAMMA), out=chw)
+
+            pred = session.run(
+                None, {"rgb": chw[np.newaxis], "sigma": sigma}
+            )[0][0].transpose(1, 2, 0)
+            edge_key = (y == 0, y + tile >= PH, x == 0, x + tile >= PW)
+            wt = weight_cache.get(edge_key)
+            if wt is None:
+                wt = _tile_weight(
+                    tile, tile, overlap,
+                    at_top=edge_key[0], at_bottom=edge_key[1],
+                    at_left=edge_key[2], at_right=edge_key[3],
+                )[0][..., np.newaxis]
+                weight_cache[edge_key] = wt
+            # ORT outputs are disposable. Weight in place to avoid another
+            # full tile temporary before overlap-add.
+            pred *= wt
+            accum[y:y + tile, x:x + tile] += pred
             weight[y:y + tile, x:x + tile] += wt
             done += 1
             if progress_callback:
                 progress_callback(done, total)
 
-    out_enc = (accum / np.maximum(weight, 1e-8))[:H, :W]
-    out_lin = np.clip(out_enc, 0.0, 1.0) ** GAMMA / gain
-    out_lin = np.where(clipped, lin, out_lin)
+    np.maximum(weight, np.float32(1e-8), out=weight)
+    np.divide(accum, weight, out=accum)
+    out_lin = accum[:H, :W]
+    if not out_lin.flags["C_CONTIGUOUS"]:
+        out_lin = np.ascontiguousarray(out_lin)
+    np.clip(out_lin, np.float32(0.0), np.float32(1.0), out=out_lin)
+    np.power(out_lin, np.float32(GAMMA), out=out_lin)
+    out_lin /= np.float32(gain)
+
+    # Saturated-after-gain pixels are passthrough, evaluated in bounded
+    # chunks instead of retaining a full-frame boolean mask.
+    out_flat = out_lin.reshape(-1, 3)
+    src_flat = source.reshape(-1, 3)
+    chunk_pixels = 1_000_000
+    scratch = np.empty((min(chunk_pixels, src_flat.shape[0]), 3), np.float32)
+    for start in range(0, src_flat.shape[0], chunk_pixels):
+        stop = min(start + chunk_pixels, src_flat.shape[0])
+        src_chunk = scratch[: stop - start]
+        np.clip(src_flat[start:stop], 0.0, 1.0, out=src_chunk)
+        saturated = src_chunk * np.float32(gain) >= np.float32(1.0)
+        np.copyto(out_flat[start:stop], src_chunk, where=saturated)
+    np.clip(out_lin, np.float32(0.0), np.float32(1.0), out=out_lin)
     logger.info(
         f"FastDenoise v4 (s={strength:.2f}) done in {time.time() - t0:.1f}s "
         f"({total} tiles, gain {gain:.1f}x, {_session_provider})"
     )
-    return np.clip(out_lin, 0.0, 1.0).astype(np.float32)
+    return np.ascontiguousarray(out_lin, dtype=np.float32)
 
 
 def warmup() -> None:

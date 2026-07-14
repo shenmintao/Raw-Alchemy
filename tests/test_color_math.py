@@ -15,12 +15,27 @@ from raw_alchemy.colorspace_matrices import (
 )
 from raw_alchemy.math_ops import (
     log_encode_gpu,
+    pq_encode_inplace,
     white_balance_matrix,
     working_space_adaptation_matrix,
 )
 
 
 GOLDEN = Path(__file__).with_name("golden") / "color_math.npz"
+
+
+def test_pq_encode_inplace_matches_colour_reference():
+    src = np.linspace(0.0, 1.25, 37 * 29 * 3, dtype=np.float32).reshape(37, 29, 3)
+    actual = src.copy()
+
+    pq_encode_inplace(actual, peak_nits=1000.0, mastering_nits=10000.0)
+    expected = colour.cctf_encoding(
+        np.clip(src, 0.0, None).astype(np.float64) * 1000.0,
+        function="ST 2084",
+    ).astype(np.float32)
+    np.clip(expected, 0.0, 1.0, out=expected)
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("log_space", list(config.LOG_TO_WORKING_SPACE))

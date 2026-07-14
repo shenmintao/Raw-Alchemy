@@ -308,11 +308,85 @@ def test_preload_cpu_decodes_full_res_without_gpu(monkeypatch):
     monkeypatch.setattr(processor, "_decode_for_view", _no_gpu)
 
     processor._do_preload(ProcessRequest("neighbor.raw", {"_preload": True}, -1))
-
     cached = processor.cache_manager.get("neighbor.raw")
     assert cached is not None
     assert cached.linear_data is src         # full CPU decode cached, ready to reuse
     assert cached.proxy_linear is not None   # proxy ready for instant fit-view
+
+
+def test_large_lens_map_uses_bounded_tiled_path(monkeypatch):
+    from raw_alchemy import config, lensfun_wrapper
+
+    processor = ImageProcessor()
+    src = np.zeros((32, 48, 3), np.float32)
+    processor._executor_params = {"lens_correct": True, "custom_db_path": None}
+    processor._executor_path = "photo.raw"
+    processor._executor_using_proxy = False
+    processor.exif_data = {
+        "camera_maker": "Maker", "camera_model": "Model",
+        "lens_maker": "Lens", "lens_model": "50mm",
+        "focal_length": 50.0, "aperture": 2.8, "crop_factor": 1.0,
+    }
+    monkeypatch.setattr(config, "DISTORTION_MAP_CACHE_LIMIT_MB", 0)
+    calls = []
+    monkeypatch.setattr(
+        lensfun_wrapper,
+        "apply_lens_correction_tiled",
+        lambda image, **kwargs: calls.append("tiled") or (image + 0.25),
+    )
+    monkeypatch.setattr(
+        lensfun_wrapper,
+        "compute_lens_distortion_map",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("large maps must not use the full-map path")
+        ),
+    )
+
+    corrected = processor._executor_lens_correct(src)
+    assert calls == ["tiled"]
+    np.testing.assert_array_equal(corrected, src + 0.25)
+
+
+def test_one_shot_worker_drops_executor_sources_but_not_shared_decode_cache():
+    shared = processor_module.ImageCacheManager(limit_mb=64)
+    source = np.zeros((8, 8, 3), np.float32)
+    shared.put("photo.raw", CachedImage("photo.raw", source, None, None))
+
+    processor = ImageProcessor(retain_preview_cache=False, warmup_sessions=False)
+    processor.cache_manager = shared
+    executor = PreviewExecutor(source)
+    processor._preview_executors["full"] = executor
+    processor.cpu_linear = source
+    processor.current_path = "photo.raw"
+
+    processor._release_ephemeral_preview_resources()
+
+    assert processor._preview_executors == {}
+    assert processor.cpu_linear is None
+    assert shared.get("photo.raw") is not None
+
+
+def test_cached_lens_result_becomes_direct_roi_and_slider_source():
+    processor = ImageProcessor()
+    corrected = np.full((24, 32, 3), 0.4, np.float32)
+    processor._executor_using_proxy = False
+    processor.cpu_corrected = corrected
+    processor.cached_lens_key = (True, "custom.xml", False)
+    params = {
+        "lens_correct": True,
+        "custom_db_path": "custom.xml",
+        "denoise_enabled": False,
+    }
+    ops = [
+        processor_module.Op("lens_correct", ("custom.xml",)),
+        processor_module.Op("exposure", ("Manual", 0.0, "matrix")),
+    ]
+
+    swapped_ops, source = processor._maybe_swap_corrected_source(ops, params)
+
+    assert source is corrected
+    assert [op.name for op in swapped_ops] == ["exposure"]
+    assert processor._executor_corrected_source is corrected
 
 
 # =====================================================================

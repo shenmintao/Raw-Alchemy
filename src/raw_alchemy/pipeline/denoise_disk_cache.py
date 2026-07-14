@@ -7,6 +7,7 @@
 
 import hashlib
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -55,11 +56,30 @@ def load(raw_path: str, model_tag: str) -> Optional[np.ndarray]:
         return None
     try:
         t0 = time.time()
-        blob = f.read_bytes()
-        assert blob[:6] == _MAGIC
-        h, w = int.from_bytes(blob[6:10], "little"), int.from_bytes(blob[10:14], "little")
-        data = zstandard.ZstdDecompressor().decompress(blob[14:], max_output_size=h * w * 3 * 2)
-        arr = np.frombuffer(data, np.float16).reshape(h, w, 3).astype(np.float32)
+        with f.open("rb") as source:
+            header = source.read(14)
+            if len(header) != 14 or header[:6] != _MAGIC:
+                raise ValueError("invalid cache header")
+            h = int.from_bytes(header[6:10], "little")
+            w = int.from_bytes(header[10:14], "little")
+            if h <= 0 or w <= 0:
+                raise ValueError("invalid cached image dimensions")
+
+            # Stream into the final float16 storage instead of materializing
+            # the compressed file and decompressed payload as two Python bytes
+            # objects. Peak load memory is now float16 + float32 output.
+            packed = np.empty((h, w, 3), dtype=np.float16)
+            target = memoryview(packed).cast("B")
+            offset = 0
+            with zstandard.ZstdDecompressor().stream_reader(
+                source, closefd=False
+            ) as reader:
+                while offset < target.nbytes:
+                    read = reader.readinto(target[offset:])
+                    if not read:
+                        raise ValueError("truncated cache payload")
+                    offset += read
+            arr = packed.astype(np.float32)
         os.utime(f)  # LRU: 命中刷新 atime/mtime
         logger.info(f"[DenoiseCache] hit {os.path.basename(raw_path)} "
                     f"({time.time() - t0:.2f}s load)")
@@ -77,21 +97,36 @@ def save(raw_path: str, model_tag: str, denoised: np.ndarray) -> None:
     k = _key(raw_path, model_tag)
     if k is None:
         return
+    tmp = None
     try:
         t0 = time.time()
         h, w = denoised.shape[:2]
-        payload = zstandard.ZstdCompressor(level=1).compress(
-            np.ascontiguousarray(denoised, np.float32).astype(np.float16).tobytes())
-        blob = _MAGIC + h.to_bytes(4, "little") + w.to_bytes(4, "little") + payload
+        packed = np.ascontiguousarray(denoised, np.float32).astype(np.float16)
         f = _cache_dir() / f"{k}.radc"
-        tmp = f.with_suffix(".tmp")
-        tmp.write_bytes(blob)
+        tmp = f.with_name(
+            f"{f.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        header = _MAGIC + h.to_bytes(4, "little") + w.to_bytes(4, "little")
+        with tmp.open("wb") as output:
+            output.write(header)
+            # Stream compressed bytes directly to disk. This avoids both the
+            # full float16 .tobytes() copy and a second header+payload blob.
+            with zstandard.ZstdCompressor(level=1).stream_writer(
+                output, closefd=False
+            ) as writer:
+                writer.write(memoryview(packed).cast("B"))
         tmp.replace(f)
+        size = f.stat().st_size
         logger.info(f"[DenoiseCache] saved {os.path.basename(raw_path)} "
-                    f"({len(blob) / 1e6:.0f}MB, {time.time() - t0:.2f}s)")
+                    f"({size / 1e6:.0f}MB, {time.time() - t0:.2f}s)")
         _evict()
     except Exception as e:
         logger.warning(f"[DenoiseCache] save failed: {e}")
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _evict() -> None:

@@ -21,6 +21,66 @@ from raw_alchemy.pipeline.ops import build_op_list
 GOLDEN = Path(__file__).with_name("golden") / "pipeline_ops.npz"
 
 
+def test_cached_export_avoids_redundant_source_copy(monkeypatch):
+    source = np.linspace(0.0, 1.0, 9 * 11 * 3, dtype=np.float32).reshape(9, 11, 3)
+    original = source.copy()
+    captured = {}
+
+    def fake_run(src, params, metering_source=None, lens_corrector=None):
+        captured["source"] = src
+        captured["metering_source"] = metering_source
+        return src.copy()
+
+    monkeypatch.setattr(core, "_run_export_executor", fake_run)
+    monkeypatch.setattr(core, "save_image", lambda *args, **kwargs: True)
+
+    core.export_from_cache(
+        cached_img=source,
+        output_path="out.tif",
+        exif_data={},
+        exif_metadata=None,
+        log_space="None",
+        lut_path=None,
+        exposure=0.0,
+    )
+
+    assert captured["source"] is source
+    assert captured["metering_source"] is source
+    np.testing.assert_array_equal(source, original)
+
+
+def test_large_one_shot_lens_correction_uses_striped_path(monkeypatch):
+    from raw_alchemy import config
+
+    source = np.zeros((12, 16, 3), np.float32)
+    exif = {
+        "camera_maker": "Maker",
+        "camera_model": "Model",
+        "lens_maker": "Lens",
+        "lens_model": "Prime",
+        "focal_length": 50.0,
+        "aperture": 2.8,
+    }
+    calls = []
+    monkeypatch.setattr(config, "DISTORTION_MAP_CACHE_LIMIT_MB", 0)
+    monkeypatch.setattr(
+        utils.lf,
+        "apply_lens_correction_tiled",
+        lambda image, **kwargs: calls.append("striped") or (image + 0.5),
+    )
+    monkeypatch.setattr(
+        utils.lf,
+        "apply_lens_correction",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized one-shot correction must not allocate a full map")
+        ),
+    )
+
+    corrected = utils.apply_lens_correction(source, exif)
+    assert calls == ["striped"]
+    np.testing.assert_array_equal(corrected, source + 0.5)
+
+
 def test_subtract_black_level_golden():
     golden = np.load(GOLDEN)
 

@@ -264,6 +264,38 @@ class GpuImage:
         self._allocate(h, w, c)
         np.copyto(self._arr.reshape(np_array.shape), np_array)
 
+    def adopt(self, np_array: np.ndarray):
+        """Take ownership of a newly-created float32 image without copying it.
+
+        This is for operation outputs whose producer has already allocated an
+        independent, contiguous ndarray (for example ONNX Runtime).  Callers
+        must not pass cache-owned/source arrays because subsequent pipeline
+        operations mutate the adopted storage in place.
+        """
+        arr = np.asarray(np_array)
+        if arr.dtype != np.float32:
+            arr = arr.astype(np.float32)
+        if not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        if not arr.flags.writeable:
+            arr = np.array(arr, copy=True, order="C")
+        if arr.ndim not in (2, 3):
+            raise ValueError(f"expected HxW or HxWxC image, got shape {arr.shape}")
+
+        if arr is self._arr:
+            return
+        if self._arr is not None and np.shares_memory(arr, self._arr):
+            # Never return storage to the pool while adopting an alias of it.
+            arr = np.array(arr, copy=True, order="C")
+
+        h, w = arr.shape[:2]
+        c = arr.shape[2] if arr.ndim == 3 else 1
+        self._release_to_pool()
+        self._arr = arr if isinstance(arr, HostNdarray) else arr.view(HostNdarray)
+        self._height = h
+        self._width = w
+        self._channels = c
+
     def to_numpy(self) -> np.ndarray:
         """Independent copy of the buffer contents.
 

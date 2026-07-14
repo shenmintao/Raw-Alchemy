@@ -89,6 +89,22 @@ def test_gpu_image_upload_roundtrip_via_pooled_buffer():
     gpu_pool().clear()
 
 
+def test_gpu_image_adopts_owned_result_without_copying():
+    gpu_pool().clear()
+    owned = np.arange(5 * 7 * 3, dtype=np.float32).reshape(5, 7, 3)
+
+    image = GpuImage()
+    image.adopt(owned)
+
+    assert image.shape == owned.shape
+    assert np.shares_memory(image.arr, owned)
+    np.testing.assert_array_equal(image.to_numpy(), owned)
+
+    image.clear()
+    assert not image.valid
+    gpu_pool().clear()
+
+
 def test_sharpen_scratch_buffers_are_pooled_not_module_resident():
     from raw_alchemy import math_ops
     from raw_alchemy.math_ops import sharpen_gpu
@@ -104,8 +120,9 @@ def test_sharpen_scratch_buffers_are_pooled_not_module_resident():
     image.upload(src)
     sharpen_gpu(image, strength=0.5, sigma=1.0)
 
-    # The four 2D scratch buffers were released back to the pool.
-    scratch = 4 * _f32_bytes((12, 10))
+    # The three 2D scratch buffers were released back to the pool. The ratio
+    # buffer is reused for the final blend instead of retaining a fourth plane.
+    scratch = 3 * _f32_bytes((12, 10))
     assert gpu_pool().free_bytes() >= scratch
 
     # A second run reuses the pooled scratch instead of growing the pool.

@@ -271,7 +271,8 @@ def get_cuda_package_size_mb() -> int:
 
 
 def download_cuda_runtime(
-    progress_callback: Optional[Callable[[int, int], None]] = None
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """
     Download and install the CUDA runtime package.
@@ -314,6 +315,9 @@ def download_cuda_runtime(
             
             with open(temp_file, 'wb') as f:
                 while True:
+                    if cancel_callback and cancel_callback():
+                        logger.info("CUDA runtime download cancelled")
+                        return False
                     chunk = response.read(1024 * 1024)  # 1MB chunks
                     if not chunk:
                         break

@@ -145,6 +145,68 @@ def test_executor_denoise_serves_proxy_scale_in_proxy_mode():
     assert p.cached_denoise_proxy is not None
 
 
+def test_first_proxy_denoise_publishes_current_metering_source(monkeypatch, tmp_path):
+    """The first denoise render must meter the denoised proxy, not raw pixels."""
+    monkeypatch.setenv("RAWALCHEMY_DENOISE_CACHE_DIR", str(tmp_path / "dc"))
+    p = _processor()
+    params = _preview_params(denoise_strength=0.5, custom_db_path=None)
+    p._executor_params = params
+    p._executor_using_proxy = True
+
+    monkeypatch.setattr(
+        processor_module,
+        "denoise_rgb_linear",
+        lambda src, strength=0.25, progress_callback=None: np.ascontiguousarray(src * 0.5),
+    )
+    monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: None)
+
+    class _Sig:
+        def emit(self, *_args):
+            pass
+
+    p.denoise_started = p.denoise_progress = p.denoise_finished = _Sig()
+    p._prepare_executor_source_state(params)
+    p.last_metering_key = ("stale",)
+
+    out = p._executor_denoise(p.cpu_proxy_linear)
+
+    assert p._executor_corrected_source is out
+    assert p.cpu_proxy_corrected is out
+    assert p.cached_proxy_lens_key == (False, None, 0.5)
+    assert p.last_metering_key is None
+
+
+def test_lens_cache_key_includes_denoise_strength():
+    """Changing strength must not reuse lens-corrected pixels from the old denoise."""
+    p = _processor()
+    p.exif_data = None  # lens callback is a passthrough, making identity observable
+
+    class _EmptyCache:
+        @staticmethod
+        def get(_path):
+            return None
+
+    p.cache_manager = _EmptyCache()
+    p._executor_using_proxy = False
+    first = np.full((8, 10, 3), 0.25, np.float32)
+    second = np.full((8, 10, 3), 0.5, np.float32)
+
+    p._executor_params = _preview_params(
+        lens_correct=True, denoise_strength=0.25, custom_db_path=None
+    )
+    out_first = p._executor_lens_correct(first)
+    assert out_first is first
+    assert p.cached_lens_key == (True, None, 0.25)
+
+    p._executor_params = _preview_params(
+        lens_correct=True, denoise_strength=0.5, custom_db_path=None
+    )
+    out_second = p._executor_lens_correct(second)
+
+    assert out_second is second
+    assert p.cached_lens_key == (True, None, 0.5)
+
+
 def test_prepare_source_state_keeps_proxy_resolution():
     p = _processor()
     p.cached_denoise_full = np.full(FULL, 0.1, np.float32)
