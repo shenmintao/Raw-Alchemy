@@ -661,8 +661,17 @@ def _make_session_options(ort, *, enable_mem_pattern: bool = False):
     return options
 
 
+def _coreml_cache_dir() -> str:
+    """Return (and create) a persistent directory for CoreML compiled model cache."""
+    import pathlib
+    cache = pathlib.Path.home() / 'Library' / 'Caches' / 'RawAlchemy' / 'coreml'
+    cache.mkdir(parents=True, exist_ok=True)
+    return str(cache)
+
+
 def _configure_providers(providers: list):
     """Attach bounded arena/workspace options to GPU execution providers."""
+    import platform
     configured = []
     gpu_limit = max(1, int(config.ONNX_GPU_MEMORY_LIMIT_MB)) * 1024 * 1024
     for provider in providers:
@@ -679,6 +688,10 @@ def _configure_providers(providers: list):
             }))
         elif provider in ('DmlExecutionProvider', 'ROCMExecutionProvider'):
             configured.append((provider, {'device_id': 0}))
+        elif provider == 'CoreMLExecutionProvider' and platform.system() == 'Darwin':
+            configured.append((provider, {
+                'ModelCacheDirectory': _coreml_cache_dir(),
+            }))
         else:
             configured.append(provider)
     return configured
