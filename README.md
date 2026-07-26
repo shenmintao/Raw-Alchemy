@@ -75,12 +75,25 @@ For most users, the easiest way to use Raw Alchemy Studio is to download the pre
 
 If you want to install the project from source, you can follow these steps:
 
+**macOS** — install system libraries first:
+
 ```bash
 # Clone the repository
 git clone https://github.com/shenmintao/raw-alchemy.git
 cd raw-alchemy
 
+# Install macOS system dependencies (required by pyexiv2)
+brew bundle
+
 # Install the tool and its dependencies
+pip install .
+```
+
+**Linux / Windows:**
+
+```bash
+git clone https://github.com/shenmintao/raw-alchemy.git
+cd raw-alchemy
 pip install .
 ```
 

@@ -75,12 +75,25 @@
 
 如果您希望从源码安装本项目，可以按照以下步骤操作：
 
+**macOS** — 首先安装系统依赖库：
+
 ```bash
 # 克隆本仓库
 git clone https://github.com/shenmintao/raw-alchemy.git
 cd raw-alchemy
 
+# 安装 macOS 系统依赖（pyexiv2 所需）
+brew bundle
+
 # 安装工具及其依赖
+pip install .
+```
+
+**Linux / Windows：**
+
+```bash
+git clone https://github.com/shenmintao/raw-alchemy.git
+cd raw-alchemy
 pip install .
 ```
 
