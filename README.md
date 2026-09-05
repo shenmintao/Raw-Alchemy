@@ -99,6 +99,25 @@ pip install .
 
 *Note: This project depends on specific versions of `rawpy` and `colour-science`.*
 
+**macOS CoreML cache:** Compiled models are cached under
+`~/Library/Caches/RawAlchemy/coreml/`. Cache namespaces are derived from the ONNX
+model and all referenced external weight file contents, ONNX Runtime and system
+versions, architecture, and session variants (including demosaic tile size).
+Replacing model/weight contents at the same path creates a new namespace on the
+next session initialization. Model and external weight contents are rehashed at
+session initialization; there is no path, file-size, or timestamp shortcut.
+If cache preparation, hashing, or the writability check fails, a warning is
+logged and CoreML continues without caching. Old namespaces are not automatically
+removed; you can delete this cache directory while the app is closed to reclaim
+space (the next launch recompiles the models).
+
+**Demosaic acceleration fallback:** If accelerated RCD or X-Trans session
+initialization (including CoreML compilation) or inference fails, a warning is
+logged and CPU execution is attempted. After a successful initialization fallback,
+that demosaicer stays on CPU for the rest of the process, even across tile-size
+changes. Processing may be slower. CPU errors are still reported, not retried
+indefinitely. Restart the app to retry acceleration.
+
 ## 🛠️ Usage
 
 The executable provides both a Graphical User Interface (GUI) and a Command-Line Interface (CLI).

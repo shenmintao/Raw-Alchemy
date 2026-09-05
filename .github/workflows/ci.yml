@@ -23,6 +23,7 @@ jobs:
           # 钉到稳定镜像;fork 侧的命名自适应(shenmintao/rawpy@eb9ff0b 起)
           # 留作 2022 退役时的过渡保障。
           - windows-2022
+          - macos-14
         python-version:
           - '3.12'
 
@@ -38,6 +39,10 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libegl1 libgl1 libxkbcommon-x11-0
+
+      - name: Install macOS runtime dependencies
+        if: runner.os == 'macOS'
+        run: brew bundle --file=Brewfile
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -69,4 +74,17 @@ jobs:
         run: python -m ruff check
 
       - name: Run tests
+        if: runner.os != 'macOS'
         run: python -m pytest tests/ -x -q -p no:cacheprovider
+
+      # Hosted runners do not guarantee usable Neural Engine hardware.
+      # Keep the full suite on CPU; cache tests explicitly mock CoreML providers.
+      - name: Run tests (macOS CPU baseline)
+        if: runner.os == 'macOS'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: >-
+          python -c "import onnxruntime as ort;
+          ort.get_available_providers = lambda: ['CPUExecutionProvider'];
+          import pytest;
+          raise SystemExit(pytest.main(['tests/', '-x', '-q', '-p', 'no:cacheprovider']))"
