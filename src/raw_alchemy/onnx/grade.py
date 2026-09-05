@@ -69,7 +69,9 @@ def _get_session(model_file: str):
         so = _make_session_options(ort)
         providers = _get_providers()
         sess = ort.InferenceSession(
-            model_path, so, providers=_configure_providers(providers),
+            model_path, so, providers=_configure_providers(
+                providers, model_path, variant="grade"
+            ),
         )
         _sessions[model_file] = sess
         _session_provider = sess.get_providers()[0]

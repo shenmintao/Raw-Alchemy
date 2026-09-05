@@ -69,7 +69,7 @@ def _get_session():
     providers = _get_providers()
     _session = ort.InferenceSession(
         model_path, sess_options,
-        providers=_configure_providers(providers),
+        providers=_configure_providers(providers, model_path, variant="rgb-denoiser"),
     )
     _session_provider = _session.get_providers()[0]
     logger.info(f"FastDenoise session: {_session_provider}")

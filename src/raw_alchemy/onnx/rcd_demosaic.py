@@ -63,7 +63,9 @@ def _get_session():
             providers = _get_providers()
         sess = ort.InferenceSession(
             model_path,
-            so, providers=_configure_providers(providers),
+            so, providers=_configure_providers(
+                providers, model_path, variant=f"rcd:h={TILE},w={TILE}"
+            ),
         )
         _sessions[TILE] = sess
         _session_provider = sess.get_providers()[0]

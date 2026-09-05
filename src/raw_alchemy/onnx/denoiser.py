@@ -661,15 +661,7 @@ def _make_session_options(ort, *, enable_mem_pattern: bool = False):
     return options
 
 
-def _coreml_cache_dir() -> str:
-    """Return (and create) a persistent directory for CoreML compiled model cache."""
-    import pathlib
-    cache = pathlib.Path.home() / 'Library' / 'Caches' / 'RawAlchemy' / 'coreml'
-    cache.mkdir(parents=True, exist_ok=True)
-    return str(cache)
-
-
-def _configure_providers(providers: list):
+def _configure_providers(providers: list, model_path=None, *, variant=""):
     """Attach bounded arena/workspace options to GPU execution providers."""
     import platform
     configured = []
@@ -689,9 +681,11 @@ def _configure_providers(providers: list):
         elif provider in ('DmlExecutionProvider', 'ROCMExecutionProvider'):
             configured.append((provider, {'device_id': 0}))
         elif provider == 'CoreMLExecutionProvider' and platform.system() == 'Darwin':
-            configured.append((provider, {
-                'ModelCacheDirectory': _coreml_cache_dir(),
-            }))
+            from .coreml_cache import coreml_cache_dir
+            cache = coreml_cache_dir(model_path, variant=variant)
+            configured.append(
+                (provider, {'ModelCacheDirectory': cache}) if cache else provider
+            )
         else:
             configured.append(provider)
     return configured
@@ -715,7 +709,7 @@ def _get_session(sensor: str):
     logger.info(f"Loading CANS raw-main v14 ({sensor}) from: {model_path}")
 
     sess_options = _make_session_options(ort)
-    provider_options = _configure_providers(providers)
+    provider_options = _configure_providers(providers, model_path, variant=f"raw:{sensor}")
 
     session = ort.InferenceSession(model_path, sess_options, providers=provider_options)
     _session_provider = session.get_providers()[0]

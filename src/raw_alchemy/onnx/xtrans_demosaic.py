@@ -112,7 +112,9 @@ def _get_session():
         else:
             providers = _get_providers()
         session = ort.InferenceSession(
-            model_path, so, providers=_configure_providers(providers),
+            model_path, so, providers=_configure_providers(
+                providers, model_path, variant=f"xtrans:h={TILE},w={TILE}"
+            ),
         )
         _sessions[TILE] = session
         _session_provider = session.get_providers()[0]
