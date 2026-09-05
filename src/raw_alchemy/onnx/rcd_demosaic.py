@@ -40,7 +40,7 @@ _session_provider = None
 
 
 def _get_session():
-    global _session_provider
+    global _session_provider, _cpu_fallback
     sess = _sessions.get(TILE)
     if sess is not None:
         return sess
@@ -51,22 +51,43 @@ def _get_session():
         import onnxruntime as ort
 
         model_path = _find_model(MODEL_FILE)
-        so = _make_session_options(ort)
         # Freeze the dynamic h/w symbols through ORT itself. This avoids
         # importing/rewriting the model with the optional ``onnx`` package and
         # still gives CUDA/DirectML one fixed compiled tile graph.
-        so.add_free_dimension_override_by_name("h", TILE)
-        so.add_free_dimension_override_by_name("w", TILE)
+        def session_options():
+            so = _make_session_options(ort)
+            so.add_free_dimension_override_by_name("h", TILE)
+            so.add_free_dimension_override_by_name("w", TILE)
+            return so
+
         if _cpu_fallback:
             providers = ["CPUExecutionProvider"]
         else:
             providers = _get_providers()
-        sess = ort.InferenceSession(
-            model_path,
-            so, providers=_configure_providers(
-                providers, model_path, variant=f"rcd:h={TILE},w={TILE}"
-            ),
+        configured = _configure_providers(
+            providers, model_path, variant=f"rcd:h={TILE},w={TILE}"
         )
+        so = session_options()
+        try:
+            sess = ort.InferenceSession(model_path, so, providers=configured)
+        except Exception as exc:
+            if not any(
+                (p[0] if isinstance(p, tuple) else p) != "CPUExecutionProvider"
+                for p in providers
+            ):
+                raise
+            logger.warning(
+                f"RCD session initialization failed on {providers} "
+                f"({type(exc).__name__}: {str(exc)[:200]}); retrying on CPU EP"
+            )
+            # CoreML can fail while compiling, before session.run(). CPU in
+            # the provider list does not guarantee constructor-time recovery.
+            # Do not recurse/clear_session(): we already hold the session lock.
+            sess = ort.InferenceSession(
+                model_path, session_options(), providers=["CPUExecutionProvider"]
+            )
+            _cpu_fallback = True
+            _sessions.clear()  # Drop accelerated sessions for other tile sizes.
         _sessions[TILE] = sess
         _session_provider = sess.get_providers()[0]
         logger.info(f"RCD demosaic session (tile {TILE}): {_session_provider}")
@@ -111,6 +132,8 @@ def _run_tile(session, patch: np.ndarray, m2: np.ndarray,
     try:
         return session.run(None, feeds)[0]
     except Exception as e:
+        if not any(p != "CPUExecutionProvider" for p in session.get_providers()):
+            raise
         # DML 运行时故障(常见:显存耗尽;Windows 本地化错误文本还会被
         # pybind 以 utf-8 解码炸成 UnicodeDecodeError,掩盖真实原因)。
         # 重建 CPU-EP 会话兜底:慢,但绝不让解码整体失败。

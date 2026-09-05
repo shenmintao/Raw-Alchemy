@@ -93,7 +93,7 @@ def _build_masks(xt: np.ndarray) -> np.ndarray:
 
 
 def _get_session():
-    global _session_provider, _masks
+    global _session_provider, _masks, _cpu_fallback
     session = _sessions.get(TILE)
     if session is not None:
         return session
@@ -104,18 +104,39 @@ def _get_session():
         import onnxruntime as ort
 
         model_path = _find_model(MODEL_FILE)
-        so = _make_session_options(ort)
-        so.add_free_dimension_override_by_name("h", TILE)
-        so.add_free_dimension_override_by_name("w", TILE)
+        def session_options():
+            so = _make_session_options(ort)
+            so.add_free_dimension_override_by_name("h", TILE)
+            so.add_free_dimension_override_by_name("w", TILE)
+            return so
+
         if _cpu_fallback:
             providers = ["CPUExecutionProvider"]
         else:
             providers = _get_providers()
-        session = ort.InferenceSession(
-            model_path, so, providers=_configure_providers(
-                providers, model_path, variant=f"xtrans:h={TILE},w={TILE}"
-            ),
+        configured = _configure_providers(
+            providers, model_path, variant=f"xtrans:h={TILE},w={TILE}"
         )
+        so = session_options()
+        try:
+            session = ort.InferenceSession(model_path, so, providers=configured)
+        except Exception as exc:
+            if not any(
+                (p[0] if isinstance(p, tuple) else p) != "CPUExecutionProvider"
+                for p in providers
+            ):
+                raise
+            logger.warning(
+                f"X-Trans session initialization failed on {providers} "
+                f"({type(exc).__name__}: {str(exc)[:200]}); retrying on CPU EP"
+            )
+            # CoreML compilation errors can escape ORT's provider fallback.
+            # Construct directly: this non-reentrant lock is already held.
+            session = ort.InferenceSession(
+                model_path, session_options(), providers=["CPUExecutionProvider"]
+            )
+            _cpu_fallback = True
+            _sessions.clear()
         _sessions[TILE] = session
         _session_provider = session.get_providers()[0]
         _masks = _build_masks(CANONICAL_PATTERN)
@@ -144,6 +165,8 @@ def _run_graph(session, feeds):
     try:
         return session.run(None, feeds)[0]
     except Exception as e:
+        if not any(p != "CPUExecutionProvider" for p in session.get_providers()):
+            raise
         logger.warning(
             f"X-Trans tile failed on {_session_provider} "
             f"({type(e).__name__}: {str(e)[:80]}); rebuilding on CPU EP")
