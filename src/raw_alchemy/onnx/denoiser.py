@@ -33,19 +33,33 @@ Supports:
 import os
 import sys
 import platform
+import threading
 import numpy as np
 from typing import Optional, Callable
 from loguru import logger
 
 from raw_alchemy import config
+from .session_policy import configuration_token, create_session, registered_provider_names
 
 
 # ---------------------------------------------------------------------------
-# CUDA setup (must run before importing onnxruntime)
+# CUDA dependencies (before creating an ONNX Runtime session)
 # ---------------------------------------------------------------------------
 
 def _setup_cuda_paths():
-    """Setup CUDA library paths for onnxruntime-gpu."""
+    """Prepare CUDA dependencies only when this ORT build can use CUDA."""
+    if platform.system() not in ("Windows", "Linux"):
+        return
+    if os.environ.get("RAW_ALCHEMY_CPU_ONLY", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    if os.environ.get("RAW_ALCHEMY_DISABLE_CUDA_PRELOAD", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            return
+    except ImportError:
+        return
     try:
         from . import gpu_runtime
         if gpu_runtime.setup_cuda_dll_paths():
@@ -56,6 +70,16 @@ def _setup_cuda_paths():
     except Exception as e:
         logger.debug(f"Failed to setup local CUDA runtime: {e}")
 
+    if platform.system() == 'Linux':
+        # pip's NVIDIA packages live outside the system loader paths. ORT's
+        # official preload API also runs in every isolated session child.
+        preload = getattr(ort, "preload_dlls", None)
+        if preload is not None:
+            try:
+                preload(cuda=True, cudnn=True, msvc=False, directory="")
+            except Exception as exc:
+                logger.debug(f"Failed to preload packaged CUDA libraries: {exc}")
+        return
     if platform.system() != 'Windows':
         return
 
@@ -103,6 +127,8 @@ _setup_cuda_paths()
 _session_bayer = None
 _session_xtrans = None
 _session_provider = None
+_session_tokens = {}
+_session_lock = threading.Lock()
 
 BAYER_MODEL = "cans_raw_v11_v14_ep10_bayer_fp16.onnx"
 XTRANS_MODEL = "cans_raw_v11_v14_ep10_xtrans_fp16.onnx"
@@ -625,25 +651,30 @@ def _get_providers() -> list:
     except ImportError:
         raise ImportError("onnxruntime is required. Install with: pip install onnxruntime")
 
+    if os.environ.get("RAW_ALCHEMY_CPU_ONLY", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return ["CPUExecutionProvider"]
     available = ort.get_available_providers()
     providers = []
 
     if 'CUDAExecutionProvider' in available:
         providers.append('CUDAExecutionProvider')
-        logger.info("Using CUDA execution provider")
+        logger.debug("Available preferred EP: CUDA (not a placement measurement)")
+    elif 'MIGraphXExecutionProvider' in available:
+        providers.append('MIGraphXExecutionProvider')
+        logger.debug("Available preferred EP: MIGraphX (not a placement measurement)")
     elif 'ROCMExecutionProvider' in available:
         providers.append('ROCMExecutionProvider')
-        logger.info("Using ROCm execution provider")
+        logger.debug("Available preferred EP: ROCm (not a placement measurement)")
     elif 'DmlExecutionProvider' in available:
         providers.append('DmlExecutionProvider')
-        logger.info("Using DirectML execution provider")
+        logger.debug("Available preferred EP: DirectML (not a placement measurement)")
     elif 'CoreMLExecutionProvider' in available and platform.system() == 'Darwin':
         providers.append('CoreMLExecutionProvider')
-        logger.info("Using CoreML execution provider (macOS)")
+        logger.debug("Available preferred EP: CoreML (stage policy applies)")
 
     providers.append('CPUExecutionProvider')
     if len(providers) == 1:
-        logger.info("Using CPU execution provider (no GPU acceleration)")
+        logger.debug("Available preferred EP: CPU")
     return providers
 
 
@@ -662,11 +693,20 @@ def _make_session_options(ort, *, enable_mem_pattern: bool = False):
 
 
 def _configure_providers(providers: list, model_path=None, *, variant=""):
-    """Attach bounded arena/workspace options to GPU execution providers."""
-    import platform
+    """Apply stage policy and attach bounded workspace/content cache options."""
+    from .session_policy import stage_providers
+
+    policy_variant = variant
+    if (variant == "rgb-denoiser" and model_path is not None
+            and os.path.basename(model_path) != "fastdenoise_v4_512_fp16.onnx"):
+        # The measured MLProgram policy is specific to FastDenoise, not SCUNet.
+        policy_variant = "rgb-other"
+    providers = stage_providers(providers, policy_variant)
     configured = []
     gpu_limit = max(1, int(config.ONNX_GPU_MEMORY_LIMIT_MB)) * 1024 * 1024
-    for provider in providers:
+    for entry in providers:
+        provider = entry[0] if isinstance(entry, tuple) else entry
+        explicit = dict(entry[1]) if isinstance(entry, tuple) else {}
         if provider == 'CUDAExecutionProvider':
             configured.append((provider, {
                 'device_id': 0,
@@ -677,49 +717,52 @@ def _configure_providers(providers: list, model_path=None, *, variant=""):
                 # Max-workspace search can reserve hundreds of MiB per
                 # session; tiled fixed-shape inference does not need it.
                 'cudnn_conv_use_max_workspace': False,
+                **explicit,
             }))
-        elif provider in ('DmlExecutionProvider', 'ROCMExecutionProvider'):
-            configured.append((provider, {'device_id': 0}))
+        elif provider in ('DmlExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider'):
+            configured.append((provider, {'device_id': 0, **explicit}))
         elif provider == 'CoreMLExecutionProvider' and platform.system() == 'Darwin':
             from .coreml_cache import coreml_cache_dir
-            cache = coreml_cache_dir(model_path, variant=variant)
-            configured.append(
-                (provider, {'ModelCacheDirectory': cache}) if cache else provider
+            explicit.pop('ModelCacheDirectory', None)
+            cache = coreml_cache_dir(
+                model_path, variant=variant, provider_options=explicit
             )
+            if cache:
+                explicit['ModelCacheDirectory'] = cache
+            configured.append((provider, explicit) if explicit else provider)
         else:
-            configured.append(provider)
+            configured.append(entry)
     return configured
 
 
 def _get_session(sensor: str):
     """Get or create ONNX session for the given sensor type."""
     global _session_bayer, _session_xtrans, _session_provider
-
-    if sensor == 'bayer' and _session_bayer is not None:
-        return _session_bayer
-    if sensor == 'xtrans' and _session_xtrans is not None:
-        return _session_xtrans
-
-    import onnxruntime as ort
-
     model_file = BAYER_MODEL if sensor == 'bayer' else XTRANS_MODEL
-    model_path = _find_model(model_file)
-    providers = _get_providers()
-
-    logger.info(f"Loading CANS raw-main v14 ({sensor}) from: {model_path}")
-
-    sess_options = _make_session_options(ort)
-    provider_options = _configure_providers(providers, model_path, variant=f"raw:{sensor}")
-
-    session = ort.InferenceSession(model_path, sess_options, providers=provider_options)
-    _session_provider = session.get_providers()[0]
-    logger.info(f"CANS session ({sensor}): {_session_provider}")
-
-    if sensor == 'bayer':
-        _session_bayer = session
-    else:
-        _session_xtrans = session
-    return session
+    token = (model_file, configuration_token(f"raw:{sensor}"))
+    session = _session_xtrans if sensor == 'xtrans' else _session_bayer
+    if session is not None and _session_tokens.get(sensor) == token:
+        return session
+    with _session_lock:
+        session = _session_xtrans if sensor == 'xtrans' else _session_bayer
+        if session is not None and _session_tokens.get(sensor) == token:
+            return session
+        import onnxruntime as ort
+        model_path = _find_model(model_file)
+        providers = _configure_providers(
+            _get_providers(), model_path, variant=f"raw:{sensor}"
+        )
+        session = create_session(
+            ort, model_path, lambda: _make_session_options(ort), providers,
+            variant=f"raw:{sensor}",
+        )
+        _session_provider = session.get_providers()[0]
+        _session_tokens[sensor] = token
+        if sensor == 'xtrans':
+            _session_xtrans = session
+        else:
+            _session_bayer = session
+        return session
 
 
 # ---------------------------------------------------------------------------
@@ -1144,7 +1187,10 @@ def denoise_raw_packed(
         if progress_callback:
             progress_callback(1, 1)
         elapsed = time.time() - t0
-        logger.info(f"CANS raw-main v14 done in {elapsed:.1f}s (1 tile, {_session_provider})")
+        logger.info(
+            f"CANS raw-main v14 done in {elapsed:.1f}s "
+            f"(1 tile, registered={registered_provider_names(session)})"
+        )
         packed_out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32)
         packed_out = _apply_output_guards(packed_out, packed_input, guard_cfg)
         packed_out = _apply_highlight_guard(packed_out, packed_input, highlight_cfg)
@@ -1219,7 +1265,8 @@ def denoise_raw_packed(
     n_batches = (total_tiles + batch_size - 1) // batch_size
     logger.info(
         f"CANS raw-main v14 done in {elapsed:.1f}s "
-        f"({total_tiles} tiles, {n_batches} batches of {batch_size}, {_session_provider})"
+        f"({total_tiles} tiles, {n_batches} batches of {batch_size}, "
+        f"registered={registered_provider_names(session)})"
     )
 
     packed_out = np.clip(result.transpose(1, 2, 0), 0.0, 1.0).astype(np.float32)
@@ -1275,13 +1322,15 @@ def is_available() -> bool:
 
 
 def get_provider_info() -> dict:
-    """Get information about the current execution provider."""
+    """Get registered providers, not actual graph placement or GPU hardware."""
     try:
         session = _get_session('bayer')
         return {
             "available": True,
             "provider": session.get_providers()[0],
             "all_providers": session.get_providers(),
+            "registered_providers": session.get_providers(),
+            "placement": "unknown (requires ORT profiling)",
         }
     except Exception as e:
         return {"available": False, "error": str(e)}
@@ -1290,12 +1339,10 @@ def get_provider_info() -> dict:
 def clear_session():
     """Clear cached sessions and release GPU memory."""
     global _session_bayer, _session_xtrans, _session_provider
-    for name, sess in [('bayer', _session_bayer), ('xtrans', _session_xtrans)]:
-        if sess is not None:
-            del sess
-            logger.info(f"CANS session ({name}) cleared")
-    _session_bayer = None
-    _session_xtrans = None
-    _session_provider = None
+    with _session_lock:
+        _session_bayer = None
+        _session_xtrans = None
+        _session_provider = None
+        _session_tokens.clear()
     import gc
     gc.collect()

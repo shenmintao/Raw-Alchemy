@@ -65,10 +65,10 @@ Comparison with Panasonic Lumix Real-time LUT.
 
 ## 🚀 Getting Started (Recommended)
 
-For most users, the easiest way to use Raw Alchemy Studio is to download the pre-compiled executable. This does not require installing Python or any dependencies.
+For most users, the easiest way to use Raw Alchemy Studio is to download the pre-compiled executable. Python is bundled. Linux still requires the desktop OpenGL/XCB runtime libraries listed below.
 
 1.  Go to the [**Releases**](https://github.com/shenmintao/raw-alchemy/releases) page.
-2.  Download the latest executable for your system (e.g., `RawAlchemy-vX.Y.Z-windows.exe` or `RawAlchemy-vX.Y.Z-linux`).
+2.  Download the latest executable for your system (Windows portable ZIP, macOS DMG, or Linux portable tarball).
 3.  Run the tool. See the [Usage](#usage) section for details.
 
 ## 💻 Installation from Source (For Developers)
@@ -89,7 +89,15 @@ brew bundle
 pip install .
 ```
 
-**Linux / Windows:**
+**Linux (Debian / Ubuntu x86-64)** — install build and desktop dependencies first:
+
+```bash
+sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+```
+
+Linux builds compile the checksum-pinned Lensfun source against the build machine's libc. Build release packages on the oldest distribution you intend to support; a wheel built on a newer distribution is not automatically portable to older glibc versions. Windows x86-64 and macOS arm64 use pinned platform binaries. Other architectures need corresponding native dependency validation.
+
+**Linux / Windows** — then install the project:
 
 ```bash
 git clone https://github.com/shenmintao/raw-alchemy.git

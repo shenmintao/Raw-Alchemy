@@ -85,6 +85,8 @@ class ExportControllerMixin:
                     cached_img=cached_data["corrected"],
                     cached_exif_data=cached_data.get("exif_data"),
                     cached_exif_metadata=cached_data.get("exif_metadata"),
+                    cached_source_token=cached_data.get("source_token"),
+                    cached_policy_token=cached_data.get("policy_token"),
                 )
             else:
                 self.run_export(self.current_raw_path, path, is_single_export=True)
@@ -177,6 +179,8 @@ class ExportControllerMixin:
         cached_img=None,
         cached_exif_data=None,
         cached_exif_metadata=None,
+        cached_source_token=None,
+        cached_policy_token=None,
     ):
         p = params if params else self.right_panel.get_params()
 
@@ -212,19 +216,35 @@ class ExportControllerMixin:
                     callback()
             else:
                 InfoBar.error(tr("export_failed"), msg, parent=self)
+                if callback:
+                    self.btn_export_all.setEnabled(True)
+                    self.export_progress.setVisible(False)
+                    if getattr(self, "saving_infobar", None):
+                        self.saving_infobar.close()
+                        self.saving_infobar = None
 
-        previous_handler = getattr(self, "_processor_export_finished_handler", None)
-        if previous_handler is not None:
+        request_id = [None]
+
+        def on_completed(completed_id, success, msg):
+            if completed_id != request_id[0]:
+                return
+            self.processor.export_completed.disconnect(on_completed)
+            on_finish(success, msg)
+
+        self.processor.export_completed.connect(on_completed)
+
+        def enqueue(method, payload):
             try:
-                self.processor.export_finished.disconnect(previous_handler)
-            except (TypeError, RuntimeError):
-                pass
-        self._processor_export_finished_handler = on_finish
-        self.processor.export_finished.connect(on_finish)
+                request_id[0] = method(input_path, payload)
+            except Exception as exc:
+                self.processor.export_completed.disconnect(on_completed)
+                on_finish(False, str(exc))
 
         if cached_img is not None:
             export_payload = {
                 "cached_img": cached_img,
+                "_source_token": cached_source_token,
+                "_policy_token": cached_policy_token,
                 "output_path": output_path,
                 "exif_data": cached_exif_data,
                 "exif_metadata": cached_exif_metadata,
@@ -246,7 +266,7 @@ class ExportControllerMixin:
                 "sharpen_strength": p.get("sharpen_strength", 0.0),
                 "hdr_output": hdr_output,
             }
-            self.processor.export_from_cache(input_path, export_payload)
+            enqueue(self.processor.export_from_cache, export_payload)
             return
 
         export_payload = {
@@ -276,4 +296,4 @@ class ExportControllerMixin:
             "denoise_strength": p.get("denoise_strength", 0.25),
             "sharpen_strength": p.get("sharpen_strength", 0.0),
         }
-        self.processor.export_path(input_path, export_payload)
+        enqueue(self.processor.export_path, export_payload)

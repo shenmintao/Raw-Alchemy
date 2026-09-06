@@ -1,4 +1,8 @@
-"""Manual macOS OpenGL smoke test. Run from an active desktop, not offscreen.
+"""Native OpenGL smoke test for macOS, Windows and Linux.
+
+The filename is retained for compatibility. Run from an active desktop (or
+Linux Xvfb with Mesa), not Qt's offscreen plugin. A software renderer validates
+the rendering path but is not evidence of hardware GPU performance.
 
     python tools/check_macos_opengl.py
 
@@ -16,8 +20,6 @@ from raw_alchemy.ui.viewport_gl import ImageViewportGL
 
 
 def main():
-    if sys.platform != "darwin":
-        raise SystemExit("This smoke test requires macOS and an active desktop.")
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
@@ -43,7 +45,7 @@ def main():
             assert not image.isNull(), "Empty framebuffer"
             rgb = image.pixelColor(image.width() // 2, image.height() // 2).getRgb()[:3]
             assert max(abs(int(a) - int(b)) for a, b in zip(rgb, (220, 40, 80))) <= 3, rgb
-            print(f"PASS: OpenGL {context_format.majorVersion()}.{context_format.minorVersion()} "
+            print(f"PASS: {sys.platform} OpenGL {context_format.majorVersion()}.{context_format.minorVersion()} "
                   f"Core Profile, shaders linked, rendered center pixel={rgb}", flush=True)
             result = 0
         except Exception as exc:

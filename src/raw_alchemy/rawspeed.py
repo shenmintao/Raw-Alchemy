@@ -32,7 +32,13 @@ _binding_patched = False
 
 
 def _vendor_dir() -> Path:
-    return Path(__file__).resolve().parent / "vendor"
+    package_vendor = Path(__file__).resolve().parent / "vendor"
+    # PyInstaller specs collect native assets at _MEIPASS/vendor.
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        bundled_vendor = Path(sys._MEIPASS) / "vendor"
+        if (bundled_vendor / _dll_name()).is_file():
+            return bundled_vendor
+    return package_vendor
 
 
 def _dll_name() -> str:

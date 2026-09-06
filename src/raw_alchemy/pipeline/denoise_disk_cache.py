@@ -1,11 +1,13 @@
-"""降噪结果磁盘缓存:全图降噪一次付费、跨会话免费。
+"""Lossless float32 stage cache shared by preview and full export.
 
-键:RAW 路径 + 文件大小 + mtime + 降噪模型文件名(模型升级自动失效)。
-存储:线性工作空间 float16 + zstd(≈150MB/42MP 张),LRU 按 atime 逐出。
-配置:RAWALCHEMY_DENOISE_CACHE_DIR / RAWALCHEMY_DENOISE_CACHE_GB(默认 20)。
+RADC1 float16 entries are deliberately not promoted to export-quality data.
+Keys include RAW content and a caller-supplied complete stage identity.
+Storage is bounded by RAWALCHEMY_DENOISE_CACHE_GB (default 20 GB).
+All filesystem failures are cache misses, never processing failures.
 """
 
 import hashlib
+import math
 import os
 import threading
 import time
@@ -16,7 +18,10 @@ import numpy as np
 import zstandard
 from loguru import logger
 
-_MAGIC = b"RADC1\n"
+from .resources import checkpoint
+from .executor import PipelineAborted
+
+_MAGIC = b"RADC2\n"
 
 
 def _cache_dir() -> Path:
@@ -31,30 +36,36 @@ def _limit_bytes() -> int:
         gb = float(os.environ.get("RAWALCHEMY_DENOISE_CACHE_GB", "20"))
     except ValueError:
         gb = 20.0
-    return int(gb * (1 << 30))
+    if not math.isfinite(gb):
+        gb = 20.0
+    return max(0, int(gb * (1 << 30)))
 
 
-def _key(raw_path: str, model_tag: str) -> Optional[str]:
+def _key(raw_path: str, model_tag: str, source_token=None) -> Optional[str]:
+    if model_tag is None:
+        return None
     try:
-        st = os.stat(raw_path)
+        from .stage_identity import file_digest
+        source_digest = source_token if source_token is not None else file_digest(raw_path)
     except OSError:
         return None
-    h = hashlib.sha1(
-        f"{os.path.abspath(raw_path)}|{st.st_size}|{int(st.st_mtime)}|{model_tag}"
+    h = hashlib.sha256(
+        f"RADC2|{os.path.abspath(raw_path)}|{source_digest}|{model_tag}"
         .encode("utf-8", "replace")
     ).hexdigest()
     return h
 
 
-def load(raw_path: str, model_tag: str) -> Optional[np.ndarray]:
+def load(raw_path: str, model_tag: str, *, source_token=None) -> Optional[np.ndarray]:
     """命中返回 (H, W, 3) float32 线性工作空间;未命中返回 None。"""
-    k = _key(raw_path, model_tag)
-    if k is None:
+    k = _key(raw_path, model_tag, source_token)
+    if k is None or _limit_bytes() == 0:
         return None
-    f = _cache_dir() / f"{k}.radc"
-    if not f.exists():
-        return None
+    f = None
     try:
+        f = _cache_dir() / f"{k}.radc"
+        if not f.exists():
+            return None
         t0 = time.time()
         with f.open("rb") as source:
             header = source.read(14)
@@ -62,46 +73,60 @@ def load(raw_path: str, model_tag: str) -> Optional[np.ndarray]:
                 raise ValueError("invalid cache header")
             h = int.from_bytes(header[6:10], "little")
             w = int.from_bytes(header[10:14], "little")
-            if h <= 0 or w <= 0:
+            if h <= 0 or w <= 0 or h * w > 200_000_000:
                 raise ValueError("invalid cached image dimensions")
 
-            # Stream into the final float16 storage instead of materializing
-            # the compressed file and decompressed payload as two Python bytes
-            # objects. Peak load memory is now float16 + float32 output.
-            packed = np.empty((h, w, 3), dtype=np.float16)
+            if h * w * 12 > _limit_bytes():
+                return None
+
+            # Decompress directly into the final export-quality array.
+            packed = np.empty((h, w, 3), dtype="<f4")
             target = memoryview(packed).cast("B")
             offset = 0
             with zstandard.ZstdDecompressor().stream_reader(
                 source, closefd=False
             ) as reader:
                 while offset < target.nbytes:
-                    read = reader.readinto(target[offset:])
+                    checkpoint()
+                    read = reader.readinto(target[offset:offset + 4 * 1024 * 1024])
                     if not read:
                         raise ValueError("truncated cache payload")
                     offset += read
-            arr = packed.astype(np.float32)
-        os.utime(f)  # LRU: 命中刷新 atime/mtime
+                if reader.read(1):
+                    raise ValueError("oversized cache payload")
+            arr = packed.astype(np.float32, copy=False)
+        try:
+            os.utime(f)
+        except OSError:
+            pass
         logger.info(f"[DenoiseCache] hit {os.path.basename(raw_path)} "
                     f"({time.time() - t0:.2f}s load)")
         return arr
+    except (PipelineAborted, MemoryError):
+        raise
     except Exception as e:
         logger.warning(f"[DenoiseCache] corrupt entry dropped: {e}")
         try:
-            f.unlink()
+            if f is not None:
+                f.unlink()
         except OSError:
             pass
         return None
 
 
-def save(raw_path: str, model_tag: str, denoised: np.ndarray) -> None:
-    k = _key(raw_path, model_tag)
+def save(raw_path: str, model_tag: str, denoised: np.ndarray, *, source_token=None) -> None:
+    k = _key(raw_path, model_tag, source_token)
     if k is None:
         return
     tmp = None
     try:
         t0 = time.time()
+        if denoised.ndim != 3 or denoised.shape[-1] != 3:
+            raise ValueError("expected HWC RGB cache data")
         h, w = denoised.shape[:2]
-        packed = np.ascontiguousarray(denoised, np.float32).astype(np.float16)
+        if denoised.nbytes > _limit_bytes():
+            return
+        packed = np.ascontiguousarray(denoised, dtype="<f4")
         f = _cache_dir() / f"{k}.radc"
         tmp = f.with_name(
             f"{f.name}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -109,17 +134,33 @@ def save(raw_path: str, model_tag: str, denoised: np.ndarray) -> None:
         header = _MAGIC + h.to_bytes(4, "little") + w.to_bytes(4, "little")
         with tmp.open("wb") as output:
             output.write(header)
-            # Stream compressed bytes directly to disk. This avoids both the
-            # full float16 .tobytes() copy and a second header+payload blob.
+            # No full-frame bytes copy or precision reduction.
             with zstandard.ZstdCompressor(level=1).stream_writer(
                 output, closefd=False
             ) as writer:
-                writer.write(memoryview(packed).cast("B"))
+                data = memoryview(packed).cast("B")
+                for offset in range(0, len(data), 4 * 1024 * 1024):
+                    checkpoint()
+                    writer.write(data[offset:offset + 4 * 1024 * 1024])
+        # Publication uses the identity captured BEFORE computation. A file
+        # replacement during compression cannot bind old pixels to the new RAW.
+        if source_token is not None:
+            from .stage_identity import source_identity
+            if source_identity(raw_path) != source_token:
+                tmp.unlink()
+                return
         tmp.replace(f)
         size = f.stat().st_size
         logger.info(f"[DenoiseCache] saved {os.path.basename(raw_path)} "
                     f"({size / 1e6:.0f}MB, {time.time() - t0:.2f}s)")
         _evict()
+    except (PipelineAborted, MemoryError):
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
     except Exception as e:
         logger.warning(f"[DenoiseCache] save failed: {e}")
         if tmp is not None:

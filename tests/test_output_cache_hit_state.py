@@ -64,6 +64,7 @@ def _make_processor(path, source, proxy=None):
     processor.cpu_linear = source
     processor.cpu_proxy_linear = proxy
     processor.current_path = path
+    processor._decode_variant = processor_module.DECODE_CANONICAL
     processor.exif_data = None
     processor.cache_manager.put(
         path, CachedImage(path, source, None, None, proxy_linear=proxy)

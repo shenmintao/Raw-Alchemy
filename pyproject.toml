@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "numpy"]
+requires = ["setuptools>=61.0", "wheel", "numpy", "cmake>=3.12; sys_platform == 'linux'"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -66,6 +66,8 @@ raw-alchemy-gui = "raw_alchemy.main:main"
 raw_alchemy = [
     "locales/*.json",
     "vendor/*.dll",
+    "vendor/*.so",
+    "vendor/*.dylib",
     "vendor/cameras.xml",
     "vendor/*.onnx",
     "vendor/*.onnx.data",

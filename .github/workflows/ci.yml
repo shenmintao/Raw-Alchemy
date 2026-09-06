@@ -31,14 +31,14 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      - name: Install Qt headless runtime libs (Linux)
+      - name: Install build and Qt runtime libraries (Linux)
         if: runner.os == 'Linux'
         # PySide6 的 import 需要 EGL/GL 动态库,无头 runner 不带
         # (test_gui_workflow 在 import export_controller 时即
         # ImportError: libEGL.so.1)。
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q libegl1 libgl1 libxkbcommon-x11-0
+          sudo apt-get install -y -q build-essential cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 xvfb
 
       - name: Install macOS runtime dependencies
         if: runner.os == 'macOS'
@@ -70,21 +70,34 @@ jobs:
           python -m pip uninstall -y onnxruntime-gpu
           python -m pip install onnxruntime
 
+      - name: Build platform wheel
+        run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir wheelhouse
+
+      - name: Check installed wheel runtime
+        shell: bash
+        run: python tools/check_installed_wheel.py wheelhouse/*.whl
+
       - name: Run Ruff
         run: python -m ruff check
 
-      - name: Run tests
-        if: runner.os != 'macOS'
-        run: python -m pytest tests/ -x -q -p no:cacheprovider
+      - name: Check Linux OpenGL viewport
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a python tools/check_macos_opengl.py
 
-      # Hosted runners do not guarantee usable Neural Engine hardware.
-      # Keep the full suite on CPU; cache tests explicitly mock CoreML providers.
-      - name: Run tests (macOS CPU baseline)
-        if: runner.os == 'macOS'
+      - name: Run tests
+        # Hosted runners do not guarantee accelerator hardware. Native GPU
+        # acceptance is recorded separately from this portable CPU baseline.
         env:
           QT_QPA_PLATFORM: offscreen
-        run: >-
-          python -c "import onnxruntime as ort;
-          ort.get_available_providers = lambda: ['CPUExecutionProvider'];
-          import pytest;
-          raise SystemExit(pytest.main(['tests/', '-x', '-q', '-p', 'no:cacheprovider']))"
+          RAW_ALCHEMY_CPU_ONLY: "1"
+        run: python -m pytest tests/ -q -p no:cacheprovider --junitxml=test-results.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: test-results.xml
+          if-no-files-found: warn

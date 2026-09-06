@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import os
 import math
 import time
@@ -865,15 +865,28 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         )
 
     def on_process_result(self, img_uint8, image_path, request_id, applied_ev, source_size=None):
+        if getattr(self, "_shutdown_started", False):
+            return
         """Handle processing result"""
+        # Queued Qt results can arrive after a newer request was submitted.
+        # Validate before *any* UI side effect, including progress/thumbnail
+        # updates; edit modes track their own request IDs.
+        if image_path != self.current_raw_path:
+            return
+        mode = getattr(self, 'processor_connection_mode', None)
+        expected_id = self.current_request_id
+        if mode == 'crop':
+            expected_id = self.crop_request_id
+        elif mode == 'perspective':
+            expected_id = self.perspective_request_id
+        if request_id != expected_id:
+            return
+
         # Close denoise/processing progress dialog
         if self.denoise_progress_dialog:
             self.denoise_progress_dialog.setContent(tr('done'))
             self.denoise_progress_dialog.setState(True)
             self.denoise_progress_dialog = None
-
-        if image_path != self.current_raw_path:
-            return
 
         # Check connection mode
         if hasattr(self, 'processor_connection_mode') and self.processor_connection_mode == 'crop':
@@ -1033,7 +1046,63 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             self.denoise_progress_dialog.setTitle(tr('processing'))
             self.denoise_progress_dialog.setContent(tr('denoise_done_processing'))
 
+    def _poll_shutdown(self):
+        # Qt keeps delivering paint, timer and finished events during shutdown.
+        # Never join a running worker on the GUI thread.
+        for worker in self._shutdown_workers:
+            try:
+                if worker.isRunning():
+                    return
+            except RuntimeError:
+                pass  # QObject already deleted by its normal finished handler.
+        for thread in self._shutdown_threads:
+            if thread is not None and thread.is_alive():
+                return
+        self._shutdown_timer.stop()
+        self._shutdown_ready = True
+        self.close()
+
     def closeEvent(self, event):
+        if not getattr(self, '_shutdown_ready', False):
+            event.ignore()
+            if getattr(self, '_shutdown_started', False):
+                return
+            self._shutdown_started = True
+            self.setEnabled(False)
+            for name in ('update_timer', '_sidecar_write_timer', '_preload_neighbors_timer',
+                         '_zoom_update_timer', '_thumb_priority_timer'):
+                timer = getattr(self, name, None)
+                if timer is not None:
+                    timer.stop()
+            self._shutdown_workers = list(getattr(self, '_retired_thumb_workers', []))
+            if self.thumb_worker:
+                self._shutdown_workers.append(self.thumb_worker)
+            for worker in self._shutdown_workers:
+                worker.stop()
+            for processor in (self.processor, self.baseline_processor):
+                processor.request_stop()
+                self._shutdown_workers.append(processor)
+            for scope in (self.right_panel.hist_widget, self.right_panel.waveform_widget):
+                scope.reset_data()
+                if scope._worker is not None:
+                    self._shutdown_workers.append(scope._worker)
+            download = self.settings_widget._download_worker
+            if download is not None:
+                download.cancel()
+            download_thread = self.settings_widget._download_thread
+            if download_thread is not None:
+                download_thread.quit()
+                self._shutdown_workers.append(download_thread)
+            if self.about_widget.version_worker is not None:
+                self._shutdown_workers.append(self.about_widget.version_worker)
+            self._shutdown_threads = [getattr(self, '_lensfun_preload_thread', None),
+                                      getattr(self.thumb_cache, '_prune_thread', None)]
+            self._shutdown_timer = QTimer(self)
+            self._shutdown_timer.setInterval(50)
+            self._shutdown_timer.timeout.connect(self._poll_shutdown)
+            self._shutdown_timer.start()
+            self._poll_shutdown()
+            return
         if hasattr(self, '_sidecar_write_timer'):
             self._sidecar_write_timer.stop()
         self._persist_current_sidecar_now()

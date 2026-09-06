@@ -86,6 +86,7 @@ class _FakeProcessor:
     def __init__(self):
         self.last_applied_ev = 0.75
         self.export_finished = _FakeSignal()
+        self.export_completed = _FakeSignal()
         self.cache_exports = []
         self.path_exports = []
         self.preview_requests = []
@@ -248,7 +249,7 @@ def test_gui_single_export_builds_cached_and_full_worker_payloads(monkeypatch):
 
     cached_window.btn_export_curr.setEnabled(False)
     cached_window.saving_infobar = _FakeInfoBarInstance()
-    cached_window.processor.export_finished.emit(True, "")
+    cached_window.processor.export_completed.emit(1, True, "")
     assert cached_window.btn_export_curr.enabled is True
     assert any(call[0] == "success" for call in _FakeInfoBar.calls)
 

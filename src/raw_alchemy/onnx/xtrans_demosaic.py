@@ -16,12 +16,17 @@ Input:  (H, W) float32 mosaic, black-subtracted, normalized [0, 1]
 Output: (H, W, 3) float32 RGB
 """
 
+from raw_alchemy.pipeline.resources import checkpoint
 import threading
 import time
 
 import numpy as np
 from loguru import logger
 
+from .demosaic_coreml import xtrans_providers as demosaic_providers
+from .session_policy import configuration_token, construct_session
+from raw_alchemy.pipeline.cancellation import check_cancelled
+from raw_alchemy.pipeline.executor import PipelineAborted
 from .denoiser import (
     _configure_providers,
     _find_model,
@@ -30,6 +35,8 @@ from .denoiser import (
 )
 
 MODEL_FILE = "xtrans_markesteijn_dyn.onnx"
+COREML_MODEL_FILE = "xtrans_markesteijn_coreml.onnx"
+MIGRAPHX_MODEL_FILE = "xtrans_markesteijn_migraphx.onnx"
 TILE = 1560  # multiple of 6
 OVERLAP = 24  # multiple of 6, > max neighbourhood influence (12px) + border (8px)
 
@@ -45,6 +52,7 @@ CANONICAL_PATTERN = np.array([
 _sessions = {}
 _session_lock = threading.Lock()
 _session_provider = None
+_session_token = None
 _masks = None
 
 
@@ -92,8 +100,24 @@ def _build_masks(xt: np.ndarray) -> np.ndarray:
     return np.stack([np.asarray(m, np.float32) for m in ms], axis=0)
 
 
+
+def model_file_for_providers(providers):
+    """Select the validated precision variant only for its own backend."""
+    first = providers[0] if providers else None
+    name = first[0] if isinstance(first, tuple) else first
+    return {"CoreMLExecutionProvider": COREML_MODEL_FILE,
+            "MIGraphXExecutionProvider": MIGRAPHX_MODEL_FILE}.get(name, MODEL_FILE)
+
+
 def _get_session():
-    global _session_provider, _masks, _cpu_fallback
+    global _session_provider, _masks, _cpu_fallback, _session_token
+    check_cancelled()
+    token = configuration_token("xtrans")
+    if _session_token is not None and _session_token != token:
+        with _session_lock:
+            _sessions.clear()
+            _cpu_fallback = False
+    _session_token = token
     session = _sessions.get(TILE)
     if session is not None:
         return session
@@ -103,7 +127,6 @@ def _get_session():
             return session
         import onnxruntime as ort
 
-        model_path = _find_model(MODEL_FILE)
         def session_options():
             so = _make_session_options(ort)
             so.add_free_dimension_override_by_name("h", TILE)
@@ -113,13 +136,16 @@ def _get_session():
         if _cpu_fallback:
             providers = ["CPUExecutionProvider"]
         else:
-            providers = _get_providers()
+            providers = demosaic_providers(_get_providers())
+        model_path = _find_model(model_file_for_providers(providers))
         configured = _configure_providers(
             providers, model_path, variant=f"xtrans:h={TILE},w={TILE}"
         )
         so = session_options()
         try:
-            session = ort.InferenceSession(model_path, so, providers=configured)
+            session = construct_session(ort, model_path, so, configured, variant=f"xtrans:h={TILE},w={TILE}")
+        except (PipelineAborted, MemoryError):
+            raise
         except Exception as exc:
             if not any(
                 (p[0] if isinstance(p, tuple) else p) != "CPUExecutionProvider"
@@ -132,15 +158,16 @@ def _get_session():
             )
             # CoreML compilation errors can escape ORT's provider fallback.
             # Construct directly: this non-reentrant lock is already held.
-            session = ort.InferenceSession(
-                model_path, session_options(), providers=["CPUExecutionProvider"]
+            session = construct_session(
+                ort, _find_model(MODEL_FILE), session_options(), ["CPUExecutionProvider"],
+                variant=f"xtrans:h={TILE},w={TILE}",
             )
             _cpu_fallback = True
             _sessions.clear()
         _sessions[TILE] = session
         _session_provider = session.get_providers()[0]
         _masks = _build_masks(CANONICAL_PATTERN)
-        logger.info(f"X-Trans demosaic session (tile {TILE}): {_session_provider}")
+        logger.info(f"X-Trans demosaic session (tile {TILE}): preferred EP {_session_provider} (not placement)")
     return session
 
 
@@ -161,9 +188,12 @@ def _run_graph(session, feeds):
     # A previous tile may have rebuilt the process-global session on CPU.
     # Always adopt the current session instead of retrying a stale GPU object
     # for every remaining tile.
+    checkpoint()
     session = _get_session()
     try:
         return session.run(None, feeds)[0]
+    except (PipelineAborted, MemoryError):
+        raise
     except Exception as e:
         if not any(p != "CPUExecutionProvider" for p in session.get_providers()):
             raise
@@ -198,6 +228,7 @@ def xtrans_markesteijn_demosaic(raw_norm: np.ndarray, xtrans_pattern: np.ndarray
     if raw_norm.ndim != 2:
         raise ValueError(f"expected (H, W) mosaic, got {raw_norm.shape}")
     t0 = time.time()
+    checkpoint()
     session = _get_session()
     H, W = raw_norm.shape
 

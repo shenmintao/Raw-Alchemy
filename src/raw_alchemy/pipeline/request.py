@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TypedDict, Optional, Tuple, Literal
 
 class ProcessorParams(TypedDict, total=False):
@@ -50,7 +50,7 @@ class ProcessorParams(TypedDict, total=False):
     _detail_preview: bool
     perspective_corners: Optional[list]
 
-@dataclass
+@dataclass(frozen=True)
 class ProcessRequest:
     """Immutable processing request. Eliminates race conditions."""
     path: str
@@ -58,6 +58,24 @@ class ProcessRequest:
     request_id: int
     
     def __post_init__(self):
-        # Defensive copy of mutable dict
-        self.params = self.params.copy()
+        object.__setattr__(self, 'params', _snapshot(self.params))
 
+
+class FrozenParams(dict):
+    """Read-only metadata. copy() returns a private mutable working dict."""
+    def _readonly(self, *args, **kwargs):
+        raise TypeError("request metadata is immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _readonly
+
+
+def _snapshot(value):
+    if isinstance(value, dict):
+        return FrozenParams({key: _snapshot(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_snapshot(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_snapshot(item) for item in value)
+    # Full-resolution arrays are borrowed, pinned references: workers must never
+    # mutate published arrays. Deep-copying these would defeat memory admission.
+    return value

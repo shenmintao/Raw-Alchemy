@@ -56,12 +56,16 @@ class CachedImage:
         proxy_linear: Optional[np.ndarray] = None,
         proxy_corrected_data: Optional[np.ndarray] = None,
         proxy_lens_key: Any = None,
+        decode_variant: Optional[str] = None,
+        source_token: Optional[str] = None,
     ):
         # Entry-level lock (see class docstring). Reentrant because
         # drop_stage() re-accounts via update_size() while already holding it.
         self.lock = threading.RLock()
 
         self.path = path
+        self.decode_variant = decode_variant
+        self.source_token = source_token
         self.linear_data = linear_data
         self.proxy_linear = proxy_linear
         self.exif_data = exif_data

@@ -65,6 +65,7 @@ def fake_session(providers, error=None):
 def harness(request, monkeypatch):
     module = importlib.import_module(f"raw_alchemy.onnx.{request.param}")
     monkeypatch.setattr(module, "_sessions", {})
+    monkeypatch.setattr(module, "_session_token", None)
     monkeypatch.setattr(module, "_session_lock", GuardedLock())
     monkeypatch.setattr(module, "_cpu_fallback", False)
     monkeypatch.setattr(module, "_session_provider", None)
@@ -90,6 +91,8 @@ def harness(request, monkeypatch):
     monkeypatch.setattr(module, "_find_model", find_model)
     monkeypatch.setattr(module, "_get_providers", get_providers)
     monkeypatch.setattr(module, "_configure_providers", configure_providers)
+    # Dedicated tests cover graph-format adaptation, independently of recovery.
+    monkeypatch.setattr(module, "demosaic_providers", lambda providers: providers)
     monkeypatch.setattr(module, "_make_session_options", make_options)
     return SimpleNamespace(
         module=module,

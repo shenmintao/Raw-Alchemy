@@ -44,7 +44,7 @@ def _file_digest(path):
     return digest.hexdigest()
 
 
-def coreml_cache_dir(model_path=None, *, variant="") -> str | None:
+def coreml_cache_dir(model_path=None, *, variant="", provider_options=None) -> str | None:
     """Return a writable namespace, or None without preventing CoreML use.
 
     Never memoize by path/mtime: replacement weights at the same path must
@@ -67,13 +67,17 @@ def coreml_cache_dir(model_path=None, *, variant="") -> str | None:
             for location in sorted(set(_external_locations(model, onnx.TensorProto)))
         ]
         identity = {
-            "schema": 1,
+            "schema": 2,
             "model": hashlib.sha256(model_bytes).hexdigest(),
             "external": external,
             "ort": ort.__version__,
             "system": [platform.system(), platform.release(), platform.version(),
                        platform.mac_ver()[0], platform.machine()],
             "variant": variant,
+            "provider_options": {
+                str(key): str(value) for key, value in (provider_options or {}).items()
+                if key != "ModelCacheDirectory"
+            },
         }
         namespace = hashlib.sha256(
             json.dumps(identity, sort_keys=True).encode("utf-8")

@@ -413,3 +413,28 @@ def _write_exif_from_dict(output_path: str, exif_dict: dict, logger: Logger):
         
     except Exception as e:
         logger.warning(f"    ⚠️  Failed to write EXIF from dict: {e}")
+
+
+def save_image_atomic(img, output_path, logger=None, **kwargs):
+    """Publish a completed export atomically; retain any existing destination."""
+    import tempfile
+    from pathlib import Path
+    from .pipeline.cancellation import check_cancelled
+    destination = Path(output_path)
+    check_cancelled()
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.stem}-", suffix=destination.suffix,
+        dir=str(destination.parent),
+    )
+    os.close(fd)
+    try:
+        if not save_image(img, temporary, logger, **kwargs):
+            raise OSError(f"Failed to encode export: {output_path}")
+        check_cancelled()
+        os.replace(temporary, destination)
+        return True
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass

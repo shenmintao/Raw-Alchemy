@@ -36,14 +36,19 @@ def _get_base_path():
     # Nuitka 会修正 __file__ 指向正确的运行时位置（无论是临时目录还是 dist 目录）
     return os.path.dirname(os.path.abspath(__file__))
 
+def _get_lensfun_dir():
+    # Source checkouts can use a separately verified build directory. Installed
+    # wheels and frozen apps use their bundled runtime without a network lookup.
+    return os.environ.get('RAWALCHEMY_LENSFUN_DIR') or os.path.join(
+        _get_base_path(), 'vendor', 'lensfun',
+    )
+
+
 # _load_lensfun_library 不需要大幅修改，但要注意 bin 目录处理
 def _load_lensfun_library():
     """加载lensfun动态库"""
     system = platform.system()
-    base_path = _get_base_path()
-    
-    # 确保路径拼接正确
-    lensfun_dir = os.path.join(base_path, "vendor", "lensfun")
+    lensfun_dir = _get_lensfun_dir()
     lib_dir = os.path.join(lensfun_dir, "lib")
     bin_dir = os.path.join(lensfun_dir, "bin")
 
@@ -376,8 +381,7 @@ class LensfunDatabase:
             raise RuntimeError("Could not create lensfun database")
         
         # 检查本地数据库路径
-        base_path = _get_base_path()
-        db_path = os.path.join(base_path, "vendor", "lensfun", "share", "lensfun", "version_2")
+        db_path = os.path.join(_get_lensfun_dir(), "share", "lensfun", "version_2")
         
         result = -1
         if os.path.isdir(db_path):
@@ -1172,4 +1176,3 @@ def get_lens_info(
     except Exception as e:
         logger.error(f"  ❌ [Lensfun] Error getting lens info: {e}")
         return None
-

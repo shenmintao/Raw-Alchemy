@@ -2,16 +2,22 @@
 import sys
 
 
-# --- Platform-specific settings ---
-# Enable strip on Linux and macOS for a smaller executable.
-# On Windows, stripping can sometimes cause issues with antivirus software
-# or runtime behavior, so it's safer to leave it disabled.
-strip_executable = True if sys.platform.startswith('linux') else False
+# Preserve the vendor library layout. Linux strip can corrupt NumPy/SciPy
+# OpenBLAS ELF LOAD alignment, producing a bundle that builds but cannot start.
+# Windows and macOS also retain their native runtime symbols.
+strip_executable = False
 
 # --- Platform-specific binaries ---
 import os
 import glob
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.config import CONF
+sys.path.insert(0, SPECPATH)
+from build_support import pyinstaller_vendor_datas
+
+native_vendor_datas = pyinstaller_vendor_datas(
+    'src/raw_alchemy/vendor', os.path.join(CONF['workpath'], 'verified-native'),
+)
 
 binaries_list = []
 
@@ -77,6 +83,13 @@ if sys.platform == 'darwin':
             print(f"⚠️ WARNING: Library not found: {lib_path}")
             print("Please run: brew install brotli gettext inih")
 
+rawspeedpy_datas = collect_data_files('rawspeedpy')
+# Persistent artifact identities hash these sources in frozen builds too.
+identity_source_datas = collect_data_files(
+    'raw_alchemy', include_py_files=True,
+    includes=['*.py', 'onnx/*.py', 'pipeline/*.py'],
+)
+
 pyexiv2_ret = collect_all('pyexiv2')
 pyexiv2_datas = pyexiv2_ret[0]
 pyexiv2_binaries = pyexiv2_ret[1]
@@ -99,12 +112,11 @@ a = Analysis(
     pathex=[],
     binaries=binaries_list,
     datas=[
-        ('src/raw_alchemy/vendor', 'vendor'),
         ('src/raw_alchemy/locales', 'locales'),
         ('icon.ico', '.'), ('icon.png', '.'),
         ('src/raw_alchemy/math_ops.py', 'raw_alchemy'),
         ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
-    ],
+    ] + native_vendor_datas + rawspeedpy_datas + identity_source_datas,
     hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'onnx', 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'],
     hookspath=[],
     hooksconfig={},
@@ -154,7 +166,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.icns' if sys.platform == 'darwin' else 'icon.ico',
+    icon=('icon.icns' if os.path.isfile('icon.icns') else 'icon.png') if sys.platform == 'darwin' else 'icon.ico',
 )
 
 coll = COLLECT(
@@ -171,6 +183,6 @@ if sys.platform == 'darwin':
     app = BUNDLE(
         coll,
         name='RawAlchemy.app',
-        icon='icon.icns',
+        icon='icon.icns' if os.path.isfile('icon.icns') else 'icon.png',
         bundle_identifier='com.rawalchemy.studio',
     )

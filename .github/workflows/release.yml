@@ -80,6 +80,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install Linux build and desktop libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel

@@ -1,0 +1,36 @@
+{
+  "release": "nightly-2026-03-25",
+  "platforms": {
+    "windows": {
+      "architectures": [
+        "amd64",
+        "x86_64"
+      ],
+      "archive": "lensfun-windows.zip",
+      "sha256": "39edce23865ac65d597694404a74cecd13099869cd87dc67c8b2999bea930baf",
+      "tree_sha256": "125aff6dc1f019389d5f9e1ae7fcf86fbbf0cd4a72bb488d24e4a9ce34f5f654"
+    },
+    "darwin": {
+      "architectures": [
+        "arm64",
+        "aarch64"
+      ],
+      "archive": "lensfun-macos.tar.gz",
+      "sha256": "8d0ef8de5f65f8b562b09539e3a7f48e4abaab516303ee911a4090a744fe884c",
+      "tree_sha256": "b5d7b472fef84bb930d1dd1d2d72877cb29ba5a3b8b1fb6f1af59d9471d8d2df"
+    },
+    "linux": {
+      "architectures": [
+        "x86_64",
+        "amd64"
+      ],
+      "build": "cmake",
+      "commit": "731add851fd62ca5a211a87086c38ef19f78a288",
+      "archive": "lensfun-source.tar.gz",
+      "url": "https://codeload.github.com/shenmintao/lensfun/tar.gz/731add851fd62ca5a211a87086c38ef19f78a288",
+      "source_root": "lensfun-731add851fd62ca5a211a87086c38ef19f78a288",
+      "sha256": "17fe611bfb8baf7eaee27d1d900867ccd3f7af84eb6f971aae301e6e91b7e3a6",
+      "tree_sha256": "8439241f06daa937303834dd5fa6e4417ac851fd04f7ad36e3b03cee657891f7"
+    }
+  }
+}

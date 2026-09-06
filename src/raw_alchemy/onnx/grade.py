@@ -1,8 +1,8 @@
-"""Fused colour-grade graph on ONNX Runtime (GPU via DirectML/CUDA).
+"""Fused colour-grade graph on ONNX Runtime (stage-selected GPU or CPU).
 
 One 5KB dynamic-shape graph applies the whole interactive colour tail —
 gain -> WB matrix -> highlight/shadow -> saturation/contrast -> output
-matrix -> sRGB OETF -> clip — in a single GPU call with the parameters fed
+matrix -> sRGB OETF -> clip — in a single ORT call with the parameters fed
 as graph inputs, so slider changes never rebuild anything. The math is a
 line-by-line port of the math_ops kernels (max |delta| ~8e-7).
 
@@ -12,6 +12,8 @@ Elementwise-only graphs do not exhibit DirectML's dynamic-shape pathology
 (verified across sizes), so no dimension freezing is needed here.
 
 Disable with RAWALCHEMY_GRADE_GPU=0 (falls back to the per-op numpy path).
+The affected Apple configuration uses fused CPU ORT instead of fragmented
+CoreML partitions; RAWALCHEMY_COREML_GRADE=coreml explicitly retries CoreML.
 """
 
 import os
@@ -27,6 +29,9 @@ from .denoiser import (
     _make_session_options,
 )
 
+from .session_policy import configuration_token, create_session
+from raw_alchemy.pipeline.resources import checkpoint
+
 MODEL_FILE = "grade_dyn.onnx"
 MODEL_FILE_LOG = "grade_log_dyn.onnx"   # ...→log 矩阵→max→1D LUT→[3D LUT]
 MODEL_FILE_LUT = "grade_lut_dyn.onnx"   # ...→3D LUT→sRGB 矩阵→OETF
@@ -34,6 +39,7 @@ MODEL_FILE_LUT = "grade_lut_dyn.onnx"   # ...→3D LUT→sRGB 矩阵→OETF
 _sessions: dict = {}
 _session_lock = threading.Lock()
 _session_provider = None
+_session_token = None
 
 # 3D-LUT 直通用的最小恒等表(S=2):四面体插值在恒等格点上重建输入本身。
 _IDENTITY_LUT3 = np.array(
@@ -55,35 +61,37 @@ def is_enabled() -> bool:
 
 
 def _get_session(model_file: str):
-    global _session_provider
+    global _session_provider, _session_token
+    token = configuration_token("grade")
     sess = _sessions.get(model_file)
-    if sess is not None:
+    if sess is not None and _session_token == token:
         return sess
     with _session_lock:
+        if _session_token != token:
+            _sessions.clear()
+            _session_token = token
         sess = _sessions.get(model_file)
         if sess is not None:
             return sess
         import onnxruntime as ort
 
         model_path = _find_model(model_file)
-        so = _make_session_options(ort)
-        providers = _get_providers()
-        sess = ort.InferenceSession(
-            model_path, so, providers=_configure_providers(
-                providers, model_path, variant="grade"
-            ),
+        providers = _configure_providers(_get_providers(), model_path, variant="grade")
+        sess = create_session(
+            ort, model_path, lambda: _make_session_options(ort), providers,
+            variant="grade",
         )
         _sessions[model_file] = sess
         _session_provider = sess.get_providers()[0]
-        logger.info(f"Grade session ({model_file}): {_session_provider}")
     return sess
 
 
 def clear_session() -> None:
-    global _session_provider
+    global _session_provider, _session_token
     with _session_lock:
         _sessions.clear()
         _session_provider = None
+        _session_token = None
     import gc
     gc.collect()
 
@@ -95,10 +103,12 @@ def _run_strips(session, feeds, img_key="img"):
     img = feeds[img_key]
     h, w = img.shape[:2]
     if h * w <= _STRIP_PIXELS:
+        checkpoint()
         return session.run(None, feeds)[0]
     rows = max(1, _STRIP_PIXELS // max(w, 1))
     out = np.empty((h, w, 3), np.float32)
     for y in range(0, h, rows):
+        checkpoint()
         part = dict(feeds)
         part[img_key] = np.ascontiguousarray(img[y:y + rows])
         out[y:y + rows] = session.run(None, part)[0]

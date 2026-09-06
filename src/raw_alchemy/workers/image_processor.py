@@ -1,4 +1,4 @@
-﻿"""
+"""
 Image processing pipeline worker (numpy/cv2 compute, pooled buffers).
 
 Pipeline buffers are pooled numpy arrays (see gpu_buffer — the historical
@@ -24,10 +24,15 @@ from raw_alchemy.math_ops import (
     float_to_uint8_gpu,
     resize_float_to_uint8_gpu,
 )
+from raw_alchemy.pipeline.cancellation import cancellation_scope
+from raw_alchemy.pipeline.resources import governor, estimate_job
 from raw_alchemy.pipeline.request import ProcessRequest, ProcessorParams
 from raw_alchemy.pipeline.cache_manager import ImageCacheManager, CachedImage
 from raw_alchemy.pipeline.executor import PipelineAborted, PreviewExecutor
 from raw_alchemy.pipeline.ops import Op, _as_hashable, build_op_list
+from raw_alchemy.pipeline.stage_identity import (
+    DECODE_CANONICAL, DECODE_PRELOAD, DECODE_FALLBACK, source_identity, denoise_tag,
+)
 from raw_alchemy.gpu_buffer import GpuImage, acquire_ndarray, gpu_pool, release_ndarray
 from raw_alchemy.onnx.rgb_denoiser import denoise_rgb_linear, clear_session as denoise_clear_session
 
@@ -61,6 +66,8 @@ NATIVE_PREVIEW_MAX_SIDE = QUALITY_BASE_MAX_SIDE
 NATIVE_PREVIEW_MAX_PIXELS = QUALITY_BASE_MAX_PIXELS
 
 DECODE_SESSION_IDLE_SECONDS = 15.0
+MAX_PENDING_EXPORTS = 2
+MAX_PENDING_PRELOADS = 2
 
 
 class RoiSourceSize(tuple):
@@ -98,19 +105,26 @@ class ImageProcessor(QThread):
     denoise_started = Signal()
     denoise_finished = Signal()
     export_finished = Signal(bool, str)
+    export_completed = Signal(int, bool, str)
     preview_source_changed = Signal(str)
 
     def __init__(self, *, retain_preview_cache: bool = True, warmup_sessions: bool = True):
         super().__init__()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.retain_preview_cache = bool(retain_preview_cache)
         self.warmup_sessions = bool(warmup_sessions)
 
         # Request management
         self.pending_request: Optional[ProcessRequest] = None
         self.current_request_id = 0
+        self._export_request_id = 0
         self._preload_queue: list = []
         self._export_queue: list = []
+        self._export_dispatcher = None
+        self._last_dispatch_was_preview = False
+        self._decode_variant = None
+        self._loaded_source_token = None
+        self._denoise_policy_token = None
 
         # LRU Cache (CPU-side, for RAW decode results)
         self.cache_manager = ImageCacheManager()
@@ -145,6 +159,7 @@ class ImageProcessor(QThread):
         self.last_denoise_key = None
 
         self._should_stop = False
+        self._busy = False
         self._gpu_uint8 = None      # Pre-allocated pooled uint8 output buffer
         # Proxy and full previews each keep their own executor (T7.4), so a
         # zoom across 1.0 or an idle full refine never evicts the other
@@ -164,8 +179,8 @@ class ImageProcessor(QThread):
         self._last_decode_activity = 0.0
         self.last_preview_source = "full"
 
-    def stop_and_cleanup(self):
-        """Signal the worker to stop and wait until every resource is released."""
+    def request_stop(self):
+        """Cancel work without blocking the Qt event loop."""
         with self.lock:
             self._should_stop = True
             # Queued work can retain decoded frames or export payloads. None of
@@ -174,6 +189,10 @@ class ImageProcessor(QThread):
             self._preload_queue.clear()
             self._export_queue.clear()
             self._full_refine_request = None
+
+    def stop_and_cleanup(self):
+        """Synchronous cleanup for non-GUI callers; UI polls before joining."""
+        self.request_stop()
         if self.isRunning():
             self.wait(5000)
             if self.isRunning():
@@ -187,6 +206,8 @@ class ImageProcessor(QThread):
 
     def load_image(self, path: str):
         with self.lock:
+            if self._should_stop:
+                return None
             self.current_request_id += 1
             request_id = self.current_request_id
             self._full_refine_request = None
@@ -198,6 +219,8 @@ class ImageProcessor(QThread):
 
     def preload_image(self, path: str):
         with self.lock:
+            if self._should_stop or len(self._preload_queue) >= MAX_PENDING_PRELOADS:
+                return
             if not any(p.path == path for p in self._preload_queue):
                 self._preload_queue.append(ProcessRequest(path, {'_preload': True}, -1))
         if not self.isRunning():
@@ -205,6 +228,8 @@ class ImageProcessor(QThread):
 
     def update_preview(self, path: str, params: ProcessorParams):
         with self.lock:
+            if self._should_stop:
+                return None
             self.current_request_id += 1
             request_id = self.current_request_id
             self._full_refine_request = None
@@ -216,22 +241,28 @@ class ImageProcessor(QThread):
 
     def export_from_cache(self, path: str, export_params: dict):
         with self.lock:
-            self.current_request_id += 1
-            request_id = self.current_request_id
-            self._full_refine_request = None
+            if self._should_stop or len(self._export_queue) >= MAX_PENDING_EXPORTS:
+                raise RuntimeError("Export queue is full or shutting down; retry after completion")
+            self._export_request_id += 1
+            request_id = self._export_request_id
             params = {'_export': True, 'export_kind': 'cache', 'export': export_params}
             self._export_queue.append(ProcessRequest(path, params, request_id))
+            if self._export_dispatcher is not None:
+                self._export_dispatcher.wake.set()
         if not self.isRunning():
             self.start()
         return request_id
 
     def export_path(self, path: str, export_params: dict):
         with self.lock:
-            self.current_request_id += 1
-            request_id = self.current_request_id
-            self._full_refine_request = None
+            if self._should_stop or len(self._export_queue) >= MAX_PENDING_EXPORTS:
+                raise RuntimeError("Export queue is full or shutting down; retry after completion")
+            self._export_request_id += 1
+            request_id = self._export_request_id
             params = {'_export': True, 'export_kind': 'path', 'export': export_params}
             self._export_queue.append(ProcessRequest(path, params, request_id))
+            if self._export_dispatcher is not None:
+                self._export_dispatcher.wake.set()
         if not self.isRunning():
             self.start()
         return request_id
@@ -245,48 +276,73 @@ class ImageProcessor(QThread):
             self._warm_onnx_sessions()
             self._warmed_up = True
 
+        from .export_dispatcher import ExportDispatcher
+        self._export_dispatcher = ExportDispatcher(self)
+        self._export_dispatcher.start()
+
         # Permanent worker loop 鈥?thread stays alive until app closes
         while not self._should_stop:
-            request = self._take_next_request()
+            # Dequeue and mark busy atomically relative to GUI snapshots.
+            with self.lock:
+                request = self._take_next_request()
+                self._busy = request is not None
 
             if not request:
                 time.sleep(0.05)
                 # 空闲定时卸载(T-VRAM):>120s 无请求则释放全部 ONNX 会话
                 # (RCD/X-Trans/grade/SCUNet)。分块+冻结后重建仅 ~1s,
                 # 换来空闲时显存归零。
-                if (
-                    not self._onnx_sessions_released
-                    and time.perf_counter() - self._last_interaction > 120.0
-                ):
-                    self._release_onnx_sessions()
-                elif (
-                    not self._decode_sessions_released
-                    and self._last_decode_activity > 0.0
-                    and time.perf_counter() - self._last_decode_activity
-                    > DECODE_SESSION_IDLE_SECONDS
-                ):
-                    self._release_decode_sessions()
+                with governor.maintenance() as idle:
+                    if not idle:
+                        continue
+                    if (
+                        not self._onnx_sessions_released
+                        and time.perf_counter() - self._last_interaction > 120.0
+                    ):
+                        self._release_onnx_sessions()
+                    elif (
+                        not self._decode_sessions_released
+                        and self._last_decode_activity > 0.0
+                        and time.perf_counter() - self._last_decode_activity
+                        > DECODE_SESSION_IDLE_SECONDS
+                    ):
+                        self._release_decode_sessions()
                 continue
 
             self._onnx_sessions_released = False
             try:
-                if '_export' in request.params:
-                    self._do_export(request)
-                elif '_preload' in request.params:
-                    if self._interactive_abort_requested():
-                        continue
-                    self._do_preload(request)
-                elif '_load' in request.params:
-                    self._do_load(request)
-                else:
-                    self._do_process(request)
+                abort = (lambda: self._should_stop) if '_export' in request.params else self._interactive_abort_requested
+                with cancellation_scope(abort):
+                    frame = self.cpu_linear if request.path == self.current_path else None
+                    priority = 2 if '_preload' in request.params else 0
+                    with governor.job(estimate_job(request.path, frame), priority=priority):
+                        self._dispatch_request(request)
+            except PipelineAborted:
+                pass
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 self.error_occurred.emit(str(e))
+            finally:
+                with self.lock:
+                    self._busy = False
 
+        self._export_dispatcher.wake.set()
+        self._export_dispatcher.join()
         # Release pipeline buffers and ONNX sessions before thread shutdown.
         self._release_gpu_buffers()
+
+    def _dispatch_request(self, request):
+        if '_export' in request.params:
+            self._do_export(request)
+        elif '_preload' in request.params:
+            if self._interactive_abort_requested():
+                return
+            self._do_preload(request)
+        elif '_load' in request.params:
+            self._do_load(request)
+        else:
+            self._do_process(request)
 
     def _take_next_request(self) -> Optional[ProcessRequest]:
         """Pick the next request: user > export > preload > idle full refine.
@@ -298,8 +354,16 @@ class ImageProcessor(QThread):
         """
         with self.lock:
             now = time.perf_counter()
+            if self._should_stop:
+                return None
+            # At most one interactive request between queued exports. Keep
+            # one worker: parallel native frames exceed the memory budget.
+            if self._export_dispatcher is None and self._export_queue and self._last_dispatch_was_preview:
+                self._last_dispatch_was_preview = False
+                return self._export_queue.pop(0)
             request = self.pending_request
             if request:
+                self._last_dispatch_was_preview = True
                 self.pending_request = None
                 self._preload_queue.clear()
                 return request
@@ -311,7 +375,8 @@ class ImageProcessor(QThread):
                 self._full_refine_due = max(
                     self._full_refine_due, now + FULL_REFINE_IDLE_SECONDS
                 )
-            if self._export_queue:
+            if self._export_dispatcher is None and self._export_queue:
+                self._last_dispatch_was_preview = False
                 return self._export_queue.pop(0)
             if self._preload_queue:
                 return self._preload_queue.pop(0)
@@ -354,51 +419,8 @@ class ImageProcessor(QThread):
             return 0
 
     def _cpu_decode_to_prophoto(self, path: str):
-        """Full-res, GPU-FREE decode whose colour matches _rawpy_to_prophoto.
-
-        Background neighbour preloads use this so a fast scroll never touches
-        the GPU demosaic (whose many large, varied-size intermediates exhaust
-        the Taichi/Vulkan device allocator -> "Failed to allocate ext arr
-        buffer"). libraw's CPU demosaic (same Markesteijn/RCD-class algorithm as
-        the GPU port) produces the mosaic; we then apply THIS app's white
-        balance + cam->working matrix on the CPU, so the result is colour-
-        identical to the GPU path (~0.16% mean delta, verified) — a preloaded
-        image and a GPU-decoded one look the same.
-        """
-        import rawpy
-        from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
-        from raw_alchemy.onnx.denoiser import _apply_flip
-        from raw_alchemy.exif import extract_lens_exif
-
-        with rawpy.imread(path) as raw:
-            wb = np.array(raw.camera_whitebalance, dtype=np.float32)
-            flip = raw.sizes.flip
-            xyz = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
-            # Camera-native demosaic only: unit WB, no auto-bright, linear,
-            # unflipped — this app owns white balance, colour and orientation.
-            cam = raw.postprocess(
-                gamma=(1, 1), no_auto_bright=True,
-                user_wb=[1.0, 1.0, 1.0, 1.0], output_bps=16,
-                output_color=rawpy.ColorSpace.raw,
-                user_flip=0, half_size=False, highlight_mode=2,
-            )
-        rgb = cam.astype(np.float32) / 65535.0
-        del cam
-        if rgb.ndim == 2:
-            rgb = np.repeat(rgb[:, :, None], 3, axis=2)
-        elif rgb.shape[2] > 3:
-            rgb = np.ascontiguousarray(rgb[:, :, :3])
-
-        g = wb[1] if wb[1] > 0 else 1.0
-        rgb[:, :, 0] *= wb[0] / g
-        rgb[:, :, 2] *= wb[2] / g
-        # cam->working matrix, per-pixel (M @ [r,g,b]); numpy keeps it GPU-free.
-        m = cam_to_working_space_matrix(xyz).astype(np.float32)
-        apply_matrix_inplace(rgb, m)
-        rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
-        np.clip(rgb, 0.0, 1.0, out=rgb)
-        exif_data, exif_metadata = extract_lens_exif(path, None)
-        return rgb, exif_data, exif_metadata
+        from raw_alchemy.native_decode import decode_raw
+        return decode_raw(path, mode="preload")
 
     def _decode_for_view(self, path: str):
         """On-demand full decode with a CPU fallback (crash safety net).
@@ -411,10 +433,11 @@ class ImageProcessor(QThread):
         self._last_decode_activity = time.perf_counter()
         self._decode_sessions_released = False
         try:
-            from raw_alchemy.core import _rawpy_decode_to_prophoto
+            from raw_alchemy.native_decode import decode_raw
             from raw_alchemy.exif import extract_lens_exif
 
-            rgb = _rawpy_decode_to_prophoto(path)
+            rgb = decode_raw(path)
+            self._decode_variant = DECODE_CANONICAL
             try:
                 exif_data, exif_metadata = extract_lens_exif(path, None)
             except Exception as e:
@@ -422,11 +445,14 @@ class ImageProcessor(QThread):
                     f"[Worker] EXIF extract failed ({str(e)[:60]}); continuing without")
                 exif_data, exif_metadata = {}, None
             return rgb, exif_data, exif_metadata
+        except (PipelineAborted, MemoryError):
+            raise
         except Exception as e:
             logger.warning(
                 f"[Worker] decode failed ({str(e)[:80]}); falling back to "
                 f"CPU libraw decode for {os.path.basename(path)}"
             )
+            self._decode_variant = DECODE_FALLBACK
             return self._cpu_decode_to_prophoto(path)
 
     @staticmethod
@@ -447,6 +473,10 @@ class ImageProcessor(QThread):
             import cv2
 
             proxy = cv2.resize(linear_data, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        except MemoryError:
+            # Rendering the full frame after a failed proxy allocation would
+            # increase memory pressure. Let the job boundary report it.
+            raise
         except Exception as e:
             logger.debug(f"[Worker] Proxy generation skipped: {e}")
             return None
@@ -487,9 +517,10 @@ class ImageProcessor(QThread):
             # The GPU demosaic is never run for neighbours, so a fast scroll
             # cannot exhaust the Taichi/Vulkan device allocator. When this image
             # is later opened it is already decoded -> used directly, no GPU.
+            token = source_identity(path)
             img, exif_data, _exif_meta = self._cpu_decode_to_prophoto(path)
 
-            proxy_img = self._make_proxy(img)
+            proxy_img = None if self._interactive_abort_requested() else self._make_proxy(img)
 
             new_cache_item = CachedImage(
                 path=path,
@@ -498,13 +529,21 @@ class ImageProcessor(QThread):
                 exif_data=exif_data,
                 lens_key=None,
                 exif_metadata=_exif_meta,
+                decode_variant=DECODE_PRELOAD,
+                source_token=token,
             )
-            self.cache_manager.put(path, new_cache_item)
+            current_token = source_identity(path)
+            with self.lock:
+                if self._should_stop or token != current_token:
+                    return
+                self.cache_manager.put(path, new_cache_item)
             logger.info(
                 f"[Worker] Preloaded (CPU full decode): {os.path.basename(path)} "
                 f"({img.shape[1]}x{img.shape[0]})"
             )
 
+        except (PipelineAborted, MemoryError):
+            raise
         except Exception as e:
             logger.warning(f"Preload failed for {path}: {e}")
 
@@ -513,7 +552,11 @@ class ImageProcessor(QThread):
         path = request.path
 
         # Check CPU cache first
+        token = source_identity(path)
         cached_item = self.cache_manager.get(path)
+        if cached_item and cached_item.source_token != token:
+            cached_item = None
+        self._loaded_source_token = token
 
         if cached_item:
             logger.info(f"[Worker] Cache Hit: {os.path.basename(path)}")
@@ -521,6 +564,7 @@ class ImageProcessor(QThread):
             # pairs stay consistent against a concurrent field-level eviction
             # (GUI-thread cap change) or the baseline processor's write-backs.
             with cached_item.lock:
+                self._decode_variant = cached_item.decode_variant
                 self.cpu_linear = cached_item.linear_data
                 self.cpu_proxy_linear = cached_item.proxy_linear
                 self.exif_data = cached_item.exif_data
@@ -549,6 +593,7 @@ class ImageProcessor(QThread):
                         self.cpu_proxy_linear = proxy_np
                     with cached_item.lock:
                         cached_item.linear_data = img_np
+                        cached_item.decode_variant = self._decode_variant
                         if proxy_np is not None:
                             cached_item.proxy_linear = proxy_np
                     self.cache_manager.notify_entry_updated(path)
@@ -556,8 +601,12 @@ class ImageProcessor(QThread):
                         f"[Worker] Full-res backfill (approach B): "
                         f"{os.path.basename(path)} ({img_np.shape[1]}x{img_np.shape[0]})"
                     )
+                except (PipelineAborted, MemoryError):
+                    raise
                 except Exception as e:
                     logger.error(f"[Worker] Full-res backfill failed for {path}: {e}")
+                    self.error_occurred.emit(f"Failed to load image: {e}")
+                    return
 
             # Aborted-preload backfill (T7.3/M6): a neighbor preload that was
             # superseded mid-decode caches the entry with proxy_linear=None.
@@ -595,11 +644,15 @@ class ImageProcessor(QThread):
                     exif_data=self.exif_data,
                     lens_key=None,
                     exif_metadata=self.exif_metadata,
+                    decode_variant=self._decode_variant,
+                    source_token=token,
                 )
                 self.cache_manager.put(path, new_cache_item)
 
                 logger.info(f"[Worker] Loaded: {img_np.shape[1]}x{img_np.shape[0]}")
 
+            except (PipelineAborted, MemoryError):
+                raise
             except Exception as e:
                 logger.error(f"Error loading image {path}: {e}")
                 self.error_occurred.emit(f"Failed to load image: {e}")
@@ -620,7 +673,9 @@ class ImageProcessor(QThread):
                 self._invalidate_pipeline_caches()
             self.current_path = path
 
-        self.load_complete.emit(path, request.request_id)
+        with self.lock:
+            if not self._interactive_abort_requested():
+                self.load_complete.emit(path, request.request_id)
 
     def _release_gpu_uint8(self):
         """Return the uint8 output buffer to the buffer pool (T7.2)."""
@@ -647,33 +702,13 @@ class ImageProcessor(QThread):
         self.last_metering_key = None
 
     def _warm_onnx_sessions(self):
-        """启动预热:预建 ONNX 会话并各跑一次假数据,把 DirectML 的
-        JIT 编译成本(RCD ~1s、grade 首跑、SCUNet ~4s 加载)藏进应用
-        启动期,首次出图不再现场付费。任何一步失败都不阻塞启动。"""
-        import numpy as np
-        t0 = time.time()
-        try:
-            from raw_alchemy.onnx import rcd_demosaic
-            dummy = np.full((64, 64), 0.25, np.float32)
-            rcd_demosaic.rcd_demosaic(dummy, np.array([[0, 1], [3, 2]]))
-            self._last_decode_activity = time.perf_counter()
-            self._decode_sessions_released = False
-        except Exception as e:
-            logger.debug(f"[Warmup] RCD skipped: {e}")
-        try:
-            from raw_alchemy.onnx import grade
-            if grade.is_enabled():
-                grade.apply_grade(
-                    np.full((64, 64, 3), 0.25, np.float32),
-                    gain=1.0, mat_a=np.eye(3, dtype=np.float32),
-                    highlight=0.0, shadow=0.0, saturation=1.0, contrast=1.0,
-                    pivot=0.18,
-                    luma=np.array([0.2126, 0.7152, 0.0722], np.float32),
-                    mat_b=np.eye(3, dtype=np.float32), srgb_encode=True,
-                )
-        except Exception as e:
-            logger.debug(f"[Warmup] grade skipped: {e}")
-        logger.info(f"[Warmup] ONNX sessions ready in {time.time() - t0:.1f}s")
+        """Models initialize lazily on the first request that needs them.
+
+        The former 64x64 Bayer dummy became a 1536x1536 production tile,
+        delaying X-Trans opens with unrelated compilation and inference.
+        Keep the startup compatibility hook without speculative work.
+        """
+        logger.debug("[Warmup] Deferred ONNX initialization to sensor/stage demand")
 
     def _release_decode_sessions(self):
         """Release demosaic-only arenas once editing no longer needs them."""
@@ -789,6 +824,17 @@ class ImageProcessor(QThread):
         )
 
     def get_cached_for_export(self, params: Optional[ProcessorParams] = None) -> Optional[dict]:
+        # Take the complete source/key snapshot under the publication mutex.
+        with self.lock:
+            if self._should_stop or self._busy or self.pending_request is not None:
+                return None
+            if self._decode_variant in (DECODE_PRELOAD, DECODE_FALLBACK):
+                return None
+            # No stat/hash/model imports on the GUI thread. The export lane
+            # validates these captured identities before consuming the pixels.
+            return self._get_cached_for_export_locked(params)
+
+    def _get_cached_for_export_locked(self, params):
         """Return cached data for the current image, for use by single-image export.
 
         Called from the main thread. The numpy arrays are read-only references
@@ -828,6 +874,8 @@ class ImageProcessor(QThread):
                 return None
         return {
             'corrected': corrected,
+            'source_token': self._loaded_source_token,
+            'policy_token': self._denoise_policy_token,
             'denoise_original': self.cached_denoise_original,
             'denoise_full': self.cached_denoise_full,
             'exif_data': self.exif_data,
@@ -835,9 +883,16 @@ class ImageProcessor(QThread):
         }
 
     def _do_export(self, request: ProcessRequest):
-        payload = request.params.get('export', {})
+        payload = request.params.get('export', {}).copy()
+        source_token = payload.pop('_source_token', None)
+        policy_token = payload.pop('_policy_token', None)
         export_kind = request.params.get('export_kind', 'cache')
         try:
+            if export_kind == 'cache':
+                if source_token is not None and source_token != source_identity(request.path):
+                    raise RuntimeError('Source changed after preview; refresh the image before exporting')
+                if policy_token is not None and policy_token != denoise_tag(0.25):
+                    raise RuntimeError('Processing model changed after preview; refresh before exporting')
             if export_kind == 'path':
                 from raw_alchemy import orchestrator
 
@@ -846,9 +901,11 @@ class ImageProcessor(QThread):
                 from raw_alchemy.core import export_from_cache
 
                 export_from_cache(**payload)
+            self.export_completed.emit(request.request_id, True, "")
             self.export_finished.emit(True, "")
         except Exception as e:
             logger.error(f"[Worker] Export failed: {e}")
+            self.export_completed.emit(request.request_id, False, str(e))
             self.export_finished.emit(False, str(e))
 
     # =================================================================
@@ -1180,7 +1237,7 @@ class ImageProcessor(QThread):
     def _executor_denoise(self, src: np.ndarray) -> np.ndarray:
         """降噪 = 解码链的一环(去马赛克后):原生分辨率只算一次,
         内存+磁盘双缓存;所有视图(代理/任意缩放 ROI/导出)从结果派生,
-        缩放拖动永不触发重算。计算期间仅当切换到其他照片时让路。"""
+        缩放拖动复用结果。新请求或停止在安全的 tile 边界取消。"""
         path = self._executor_path
         if path is None:
             return src
@@ -1190,53 +1247,41 @@ class ImageProcessor(QThread):
         missing = (denoise_cache_key != self.last_denoise_key
                    or self.cached_denoise_full is None)
         if missing:
-            from raw_alchemy.pipeline import denoise_disk_cache
-            from raw_alchemy.onnx.rgb_denoiser import MODEL_FILE as _DN_TAG
-            _dn_tag = f"{_DN_TAG}|s{strength:.3f}"
-            cached = denoise_disk_cache.load(path, _dn_tag)
-            if cached is not None:
-                self.cached_denoise_original = self.cpu_linear
-                self.cached_denoise_full = cached
-                self.cached_denoise_proxy = None
-                self.last_denoise_key = denoise_cache_key
-                missing = False
-
-        if missing:
-            # 无论当前视图是代理还是 ROI,都对原生全分辨率源计算
+            from raw_alchemy.pipeline.source_artifacts import resolve_denoised_source
             source = self.cpu_linear if self.cpu_linear is not None else src
             try:
                 self.denoise_started.emit()
-                logger.info(f"[Worker] FastDenoise v4 (native, once, s={strength:.2f})...")
-
-                def progress_cb(cur, total):
-                    self.denoise_progress.emit(cur, total)
-                    with self.lock:
-                        pr = self.pending_request
-                    if pr is not None and pr.path != path:
-                        raise PipelineAborted(
-                            f"denoise superseded by another photo at {cur}/{total}")
-
-                denoised = denoise_rgb_linear(source, strength=strength,
-                                              progress_callback=progress_cb)
-                self.cached_denoise_original = self.cpu_linear
-                self.cached_denoise_full = denoised
-                self.cached_denoise_proxy = None
-                self.last_denoise_key = denoise_cache_key
-                denoise_disk_cache.save(path, _dn_tag, denoised)
-                self.denoise_finished.emit()
+                denoised = resolve_denoised_source(
+                    path, strength, source=source, denoise=denoise_rgb_linear,
+                    decode_variant=self._decode_variant or 'unknown-preview-decode',
+                    should_abort=self._interactive_abort_requested,
+                    progress_callback=self.denoise_progress.emit,
+                )
+                # Invalidation and publication share the request mutex. A
+                # request arriving after the final tile still cannot commit
+                # stale denoise/export state.
+                with self.lock:
+                    if self._interactive_abort_requested():
+                        raise PipelineAborted('denoise superseded before commit')
+                    self.cached_denoise_original = self.cpu_linear
+                    self.cached_denoise_full = denoised
+                    self.cached_denoise_proxy = None
+                    self.last_denoise_key = denoise_cache_key
             except PipelineAborted:
-                self.denoise_finished.emit()
                 raise
             except Exception as e:
                 logger.error(f"[Worker] Denoising failed: {type(e).__name__}: {e}")
-                self.denoise_finished.emit()
-                self.cached_denoise_original = None
-                self.cached_denoise_full = None
-                self.cached_denoise_proxy = None
-                self.last_denoise_key = None
-                return src
-            finally:
                 denoise_clear_session()
+                with self.lock:
+                    self.cached_denoise_original = None
+                    self.cached_denoise_full = None
+                    self.cached_denoise_proxy = None
+                    self.last_denoise_key = None
+                raise
+            finally:
+                self.denoise_finished.emit()
+                # Keep the session until the existing idle-release policy
+                # runs: slider changes should not recompile the same model.
 
         if self._executor_using_proxy:
             if self.cached_denoise_proxy is None:
@@ -1617,10 +1662,24 @@ class ImageProcessor(QThread):
         logger.debug(f"[Worker] _do_process: {os.path.basename(request.path)}, id={request.request_id}")
 
         try:
-            if self.cpu_linear is None or self.current_path != request.path:
+            policy_token = denoise_tag(0.25)
+            if self._denoise_policy_token not in (None, policy_token):
+                self.cache_manager.clear()
+                self.cpu_linear = None
+                self.cpu_proxy_linear = None
+                self.cached_denoise_original = None
+                self.cached_denoise_full = None
+                self.cached_denoise_proxy = None
+                self.last_denoise_key = None
+                self._invalidate_pipeline_caches()
+            self._denoise_policy_token = policy_token
+            if (self.cpu_linear is None or self.current_path != request.path
+                    or self._loaded_source_token != source_identity(request.path)):
                 self._do_load(ProcessRequest(request.path, {'_load': True}, request.request_id))
                 if self.cpu_linear is None:
                     return
+            if self._interactive_abort_requested():
+                raise PipelineAborted('request superseded after load')
 
             params = request.params.copy()
             use_proxy = self._should_use_proxy_preview(params)
@@ -1665,13 +1724,13 @@ class ImageProcessor(QThread):
                 )
                 if not params.get('_force_full_preview') and needs_quality_base:
                     self._schedule_full_refinement(request, params)
-                self.result_ready.emit(
-                    cached_uint8,
-                    request.path,
-                    request.request_id,
-                    cached_ev,
-                    cached_source_size,
-                )
+                with self.lock:
+                    if self._interactive_abort_requested():
+                        raise PipelineAborted('cached result superseded before commit')
+                    self.result_ready.emit(
+                        cached_uint8, request.path, request.request_id,
+                        cached_ev, cached_source_size,
+                    )
                 return
 
             self._executor_path = request.path
@@ -1724,7 +1783,10 @@ class ImageProcessor(QThread):
                 source=executor_source,
                 should_abort=self._interactive_abort_requested,
             )
-            self._sync_executor_export_source(params)
+            with self.lock:
+                if self._interactive_abort_requested():
+                    raise PipelineAborted('request superseded before stage commit')
+                self._sync_executor_export_source(params)
             # Prefix-cache host-byte budget shared by proxy/full executors.
             # Even if trim evicts `result` from the final cache, the local
             # reference keeps its working buffer
@@ -1809,25 +1871,25 @@ class ImageProcessor(QThread):
                 f"({source_w}x{source_h} -> {target_w}x{target_h}, ops={len(ops)})"
             )
 
-            cached_item = self.cache_manager.get(request.path)
-            if cached_item and not params.get('_force_full_preview'):
+            with self.lock:
+                if self._interactive_abort_requested():
+                    raise PipelineAborted('output superseded before commit')
+                cached_item = self.cache_manager.get(request.path)
                 # Multi-slot output cache (T7.4): keeps a few recent outputs
                 # keyed by (pipeline key, view key), so e.g. fit and the
                 # current zoom level survive side by side. Native-size refine
                 # results (T7.10) are display pushes, not cache material —
                 # ten ~130MB slots would be pure host-RAM bloat.
-                cached_item.store_output(
-                    output_key, img_uint8, applied_ev, output_source_size
-                )
-                self.cache_manager.notify_entry_updated(request.path)
+                if cached_item and not params.get('_force_full_preview'):
+                    cached_item.store_output(
+                        output_key, img_uint8, applied_ev, output_source_size
+                    )
+                    self.cache_manager.notify_entry_updated(request.path)
 
-            self.result_ready.emit(
-                img_uint8,
-                request.path,
-                request.request_id,
-                applied_ev,
-                output_source_size,
-            )
+                self.result_ready.emit(
+                    img_uint8, request.path, request.request_id,
+                    applied_ev, output_source_size,
+                )
             # Proxy/fit results chase the quality base after interaction stops.
             # Native ROIs do not: they must remain on top while zoomed instead
             # of being replaced by a lower-density full-frame texture.
@@ -1843,6 +1905,8 @@ class ImageProcessor(QThread):
             if not self.retain_preview_cache:
                 self._release_ephemeral_preview_resources(result)
 
+        except PipelineAborted:
+            return
         except Exception as e:
             logger.error(f"[Worker] Error in unified output: {e}")
             import traceback

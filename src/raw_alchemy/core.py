@@ -1,4 +1,6 @@
-﻿import gc
+from raw_alchemy.pipeline.resources import checkpoint
+from raw_alchemy.pipeline.cancellation import check_cancelled
+import gc
 import numpy as np
 import colour
 import os
@@ -6,7 +8,7 @@ from typing import Optional
 
 from raw_alchemy import utils
 from raw_alchemy.logger import create_logger
-from raw_alchemy.file_io import save_image
+from raw_alchemy.file_io import save_image_atomic as save_image
 from raw_alchemy import config, metering
 from raw_alchemy.onnx.rgb_denoiser import denoise_rgb_linear
 from raw_alchemy.math_ops import apply_matrix_inplace, compute_hl_refavg, init_taichi
@@ -213,7 +215,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     rs = None
     XTRANS_PATTERN = None
     try:
-        from rawspeedpy import try_decode, XTRANS_PATTERN
+        from raw_alchemy.rawspeed import try_decode, XTRANS_PATTERN
         rs = try_decode(raw_path)
     except Exception:
         # rawspeedpy 在损坏 makernote(如 Sony 转制 DNG 的 Sony2 目录)上
@@ -445,12 +447,14 @@ def process_image(
     # HDR output
     hdr_output: bool = False,
 ):
+    from raw_alchemy.native_decode import decode_raw
     filename = os.path.basename(raw_path)
     
     # 鍒涘缓缁熶竴鐨勬棩蹇楀鐞嗗櫒
     logger = create_logger(log_queue, filename)
     
     logger.info(f"馃И [Raw Alchemy] Processing: {raw_path}")
+    checkpoint()
     init_taichi()
 
     from raw_alchemy.exif import extract_lens_exif
@@ -458,14 +462,17 @@ def process_image(
     exif_data, exif_metadata = extract_lens_exif(raw_path, None)
 
     logger.info("  [Step 1] Decoding RAW (rawpy + RCD)...")
-    img = _rawpy_decode_to_prophoto(raw_path)
     if denoise_enabled:
         logger.info(f"  [Step 1b] FastDenoise v4 (s={denoise_strength:.2f})...")
-        try:
-            img = denoise_rgb_linear(img, strength=denoise_strength)
-        except Exception as e:
-            logger.error(f"  FastDenoise failed, continuing without denoise: {e}")
+        from raw_alchemy.pipeline.source_artifacts import resolve_denoised_source
+        img = resolve_denoised_source(
+            raw_path, denoise_strength, decode=decode_raw,
+            denoise=denoise_rgb_linear,
+        )
+    else:
+        img = decode_raw(raw_path)
 
+    checkpoint()
     lens_state = {"corrected": img}
 
     def lens_corrector(src: np.ndarray) -> np.ndarray:
@@ -510,6 +517,7 @@ def process_image(
     img, color_matrix = _linearize_for_dng(img, output_path, log_space, lut_path, logger)
 
     logger.info(f"  Saving to {os.path.basename(output_path)}...")
+    checkpoint()
     save_image(
         img,
         output_path,
@@ -558,6 +566,7 @@ def export_from_cache(
     filename = os.path.basename(output_path)
     logger = create_logger(log_queue, filename)
     logger.info(f"馃И [Raw Alchemy] Export from cache -> {output_path}")
+    checkpoint()
     init_taichi()
 
     params = _build_export_params(
@@ -589,6 +598,7 @@ def export_from_cache(
     img, color_matrix = _linearize_for_dng(img, output_path, log_space, lut_path, logger)
 
     logger.info(f"  Saving to {filename}...")
+    checkpoint()
     save_image(
         img,
         output_path,

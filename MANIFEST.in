@@ -1,3 +1,4 @@
 recursive-include src/raw_alchemy/vendor *
 recursive-include src/raw_alchemy/locales *
 recursive-include src/raw_alchemy/onnx *.onnx
+include native-dependencies.json build_support.py

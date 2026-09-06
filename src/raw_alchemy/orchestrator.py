@@ -130,6 +130,7 @@ def process_path(
                 "to protect RAM/VRAM."
             )
 
+        failures = []
         with concurrent.futures.ProcessPoolExecutor(max_workers=effective_jobs) as executor:
             futures = {
                 executor.submit(
@@ -166,6 +167,7 @@ def process_path(
                 try:
                     future.result()  # Check for exceptions
                 except Exception as exc:
+                    failures.append(filename)
                     log_msg = f"❌ Generated an exception: {exc}"
                     if hasattr(logger_func, 'put'):
                         logger_func.put({'id': filename, 'msg': log_msg})
@@ -175,6 +177,8 @@ def process_path(
                     # 【关键修改 2】无论成功还是失败，都发送完成信号，让进度条往前走
                     send_signal({'status': 'done'})
         
+        if failures:
+            raise RuntimeError(f"{len(failures)} of {count} exports failed: {', '.join(failures)}")
         log_message("\n🎉 Batch processing complete.")
 
     # ============================

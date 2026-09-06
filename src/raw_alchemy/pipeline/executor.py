@@ -1,3 +1,5 @@
+from raw_alchemy.pipeline.resources import checkpoint
+from .cancellation import check_cancelled
 import sys
 from collections.abc import Callable, Sequence
 from functools import lru_cache
@@ -184,6 +186,7 @@ class _BaseExecutor:
         buf.upload(src)
         i = 0
         while i < len(ops):
+            checkpoint()
             j = self._grade_fuse_end(ops, i)
             if j is not None:
                 buf = self._apply_op(buf, Op("grade_fused", tuple(ops[i:j + 1])))
@@ -191,6 +194,7 @@ class _BaseExecutor:
             else:
                 buf = self._apply_op(buf, ops[i])
                 i += 1
+        checkpoint()
         clip_inplace(buf.arr)
         image = buf.to_numpy()
         buf.clear()  # recycle the working buffer (export path materializes to host)
@@ -539,6 +543,8 @@ class _BaseExecutor:
             dst.adopt(out)
             buf.clear()
             return dst
+        except (PipelineAborted, MemoryError):
+            raise
         except Exception as e:
             logger.warning(f"grade GPU path failed ({type(e).__name__}: {e}); per-op replay")
 
@@ -813,6 +819,7 @@ class PreviewExecutor(_BaseExecutor):
 
         pos = start_index
         while pos < len(ops):
+            checkpoint()
             op = ops[pos]
             # Cooperative cancellation (T7.3): checked at every op boundary.
             # Prefixes snapshotted so far stay cached; only the working

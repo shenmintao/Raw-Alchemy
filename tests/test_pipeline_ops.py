@@ -235,7 +235,7 @@ def test_process_image_entry_uses_export_executor(monkeypatch):
     captured = {}
     src = np.linspace(0.02, 0.6, 8 * 8 * 3, dtype=np.float32).reshape(8, 8, 3)
 
-    monkeypatch.setattr(core, "_rawpy_decode_to_prophoto", lambda raw_path: src.copy())
+    monkeypatch.setattr("raw_alchemy.native_decode.decode_raw", lambda raw_path: src.copy())
     monkeypatch.setattr("raw_alchemy.exif.extract_lens_exif", lambda raw_path, raw: ({}, None))
     monkeypatch.setattr(core, "save_image", lambda img, *args, **kwargs: captured.setdefault("img", img.copy()))
 

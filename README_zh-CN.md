@@ -65,10 +65,10 @@
 
 ## 🚀 快速入门 (推荐)
 
-对于大多数用户，使用 Raw Alchemy Studio 最简单的方式是下载为您操作系统预编译的可执行文件。这无需安装 Python 或任何依赖。
+对于大多数用户，使用 Raw Alchemy Studio 最简单的方式是下载为您操作系统预编译的可执行文件。程序已包含 Python；Linux 仍需要下文列出的桌面 OpenGL/XCB 运行库。
 
-1.  前往 [**Releases**](https://gitee.com/MinQ/Raw-Alchemy/releases) 页面。
-2.  下载适用于您系统的最新可执行文件 (例如 `RawAlchemy-vX.Y.Z-windows.exe` 或 `RawAlchemy-vX.Y.Z-linux`)。
+1.  前往 [**Releases**](https://github.com/shenmintao/Raw-Alchemy/releases) 页面。
+2.  下载适用于您系统的最新可执行文件 ——Windows 使用 portable.zip，macOS 使用 DMG，Linux 使用 portable.tar.gz。
 3.  运行工具。详情请参阅 [使用方法](#使用方法) 部分。
 
 ## 💻 从源码安装 (开发者选项)
@@ -89,7 +89,15 @@ brew bundle
 pip install .
 ```
 
-**Linux / Windows：**
+**Linux（Debian / Ubuntu x86-64）** — 首先安装编译和桌面依赖：
+
+```bash
+sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+```
+
+Linux 构建会校验固定版本的 Lensfun 源码，并针对构建机器的 libc 编译。发布包应在计划支持的最旧发行版上构建，较新发行版生成的 wheel 不保证兼容旧版 glibc。Windows x86-64 和 macOS arm64 使用固定的平台二进制文件，其他架构需要补充原生依赖验证。
+
+**Linux / Windows** — 随后安装项目：
 
 ```bash
 git clone https://github.com/shenmintao/raw-alchemy.git

@@ -22,8 +22,10 @@ Model: vendor/scunet_real_512_fp16.onnx — 3ch in/out, fixed 512x512 tiles,
 overlap feathered with the same raised-cosine window as the old raw engine.
 """
 
+from raw_alchemy.pipeline.resources import checkpoint
 import os
 import time
+import threading
 from typing import Callable, Optional
 
 import numpy as np
@@ -37,6 +39,8 @@ from .denoiser import (
     _tile_weight,
 )
 
+from .session_policy import configuration_token, create_session, registered_provider_names
+
 MODEL_FILE = "fastdenoise_v4_512_fp16.onnx"
 MODEL_TILE = 512
 DEFAULT_OVERLAP = 64
@@ -48,6 +52,8 @@ GAIN_MAX = 64.0
 
 _session = None
 _session_provider = None
+_session_token = None
+_session_lock = threading.Lock()
 
 
 def _env_float(name: str, default: float) -> float:
@@ -58,22 +64,26 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _get_session():
-    global _session, _session_provider
-    if _session is not None:
+    global _session, _session_provider, _session_token
+    token = (MODEL_FILE, configuration_token("rgb-denoiser"))
+    if _session is not None and _session_token == token:
         return _session
-    import onnxruntime as ort
-
-    model_path = _find_model(MODEL_FILE)
-    logger.info(f"Loading FastDenoise v4 from: {model_path}")
-    sess_options = _make_session_options(ort)
-    providers = _get_providers()
-    _session = ort.InferenceSession(
-        model_path, sess_options,
-        providers=_configure_providers(providers, model_path, variant="rgb-denoiser"),
-    )
-    _session_provider = _session.get_providers()[0]
-    logger.info(f"FastDenoise session: {_session_provider}")
-    return _session
+    with _session_lock:
+        if _session is not None and _session_token == token:
+            return _session
+        import onnxruntime as ort
+        model_path = _find_model(MODEL_FILE)
+        providers = _configure_providers(
+            _get_providers(), model_path, variant="rgb-denoiser"
+        )
+        session = create_session(
+            ort, model_path, lambda: _make_session_options(ort), providers,
+            variant="rgb-denoiser",
+        )
+        _session = session
+        _session_token = token
+        _session_provider = session.get_providers()[0]
+        return session
 
 
 def is_available() -> bool:
@@ -138,6 +148,7 @@ def denoise_rgb_linear(
     done = 0
     for y in ys:
         for x in xs:
+            checkpoint()
             patch = source[y:min(y + tile, H), x:min(x + tile, W)]
             ph, pw = patch.shape[:2]
             if ph < tile or pw < tile:
@@ -197,7 +208,7 @@ def denoise_rgb_linear(
     np.clip(out_lin, np.float32(0.0), np.float32(1.0), out=out_lin)
     logger.info(
         f"FastDenoise v4 (s={strength:.2f}) done in {time.time() - t0:.1f}s "
-        f"({total} tiles, gain {gain:.1f}x, {_session_provider})"
+        f"({total} tiles, gain {gain:.1f}x, registered={registered_provider_names(session)})"
     )
     return np.ascontiguousarray(out_lin, dtype=np.float32)
 
@@ -217,8 +228,10 @@ def clear_session() -> None:
     object is actually destroyed, so collect immediately — pybind objects
     routinely sit in reference cycles that plain refcounting won't clear.
     """
-    global _session, _session_provider
-    _session = None
-    _session_provider = None
+    global _session, _session_provider, _session_token
+    with _session_lock:
+        _session = None
+        _session_provider = None
+        _session_token = None
     import gc
     gc.collect()

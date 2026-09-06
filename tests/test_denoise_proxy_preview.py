@@ -32,7 +32,9 @@ def _processor(path="img.raw"):
     p._executor_params = {}
     p.pending_request = None
     import threading
-    p.lock = threading.Lock()
+    p.lock = threading.RLock()
+    p._should_stop = False
+    p._decode_variant = 'test-canonical-decode'
     p._executor_using_proxy = False
     p._executor_path = path
     p._executor_corrected_source = None
@@ -229,7 +231,7 @@ def test_session_cleared_even_when_denoise_fails(monkeypatch):
     cleared = []
     monkeypatch.setattr(processor_module, "denoise_clear_session", lambda: cleared.append(1))
 
-    def boom(src, progress_callback=None):
+    def boom(src, progress_callback=None, **kwargs):
         raise RuntimeError("DML exploded")
 
     monkeypatch.setattr(processor_module, "denoise_rgb_linear", boom)
@@ -241,8 +243,9 @@ def test_session_cleared_even_when_denoise_fails(monkeypatch):
     p.denoise_started = _Sig()
     p.denoise_progress = _Sig()
     p.denoise_finished = _Sig()
-    out = p._executor_denoise(p.cpu_linear)
-    np.testing.assert_array_equal(out, p.cpu_linear)  # graceful fallback
+    import pytest
+    with pytest.raises(RuntimeError, match="DML exploded"):
+        p._executor_denoise(p.cpu_linear)
     assert cleared, "session must be released on the failure path too"
 
 
@@ -255,7 +258,7 @@ def test_denoise_disk_cache_roundtrip(tmp_path, monkeypatch):
     assert DC.load(str(raw), "m1") is None
     DC.save(str(raw), "m1", img)
     back = DC.load(str(raw), "m1")
-    np.testing.assert_allclose(back, img, atol=1e-3)  # fp16 存储
+    np.testing.assert_array_equal(back, img)  # lossless float32 export artifact
     assert DC.load(str(raw), "m2") is None            # 模型版本失效
     raw.write_bytes(b"changed content!!")             # 文件变更失效
     assert DC.load(str(raw), "m1") is None

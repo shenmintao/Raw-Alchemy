@@ -1,4 +1,10 @@
 import sys
+from multiprocessing import freeze_support
+
+# Frozen worker processes must exit into multiprocessing before importing Qt.
+if __name__ == "__main__":
+    freeze_support()
+
 import os
 import platform
 from PySide6.QtWidgets import QApplication
@@ -21,6 +27,8 @@ def _configure_opengl():
 
 
 def main():
+    from multiprocessing import freeze_support
+    freeze_support()
     # --- Taichi is initialized on import of math_ops ---
     # No separate cache directory needed (Taichi manages its own cache)
 
