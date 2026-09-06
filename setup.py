@@ -28,6 +28,10 @@ class PlatformWheel(bdist_wheel):
 
     def get_tag(self):
         python, abi, plat = super().get_tag()
+        # Preserve wheel's minimum-OS scan of bundled Mach-O libraries.
+        # Lensfun is arm64-only even if the interpreter is universal2.
+        if sys.platform == "darwin" and plat.endswith("_universal2"):
+            plat = plat.removesuffix("_universal2") + "_arm64"
         # Optional AOT extensions require their interpreter ABI. Otherwise
         # Python code loads the platform-specific runtime through ctypes.
         if self.distribution.has_ext_modules():

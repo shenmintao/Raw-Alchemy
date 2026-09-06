@@ -92,10 +92,10 @@ pip install .
 **Linux (Debian / Ubuntu x86-64)** — install build and desktop dependencies first:
 
 ```bash
-sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 libxcb-randr0 libxcb-render-util0 libxcb-xfixes0 libxcb-sync1 libxrender1 libxi6 libsm6 libice6
 ```
 
-Linux builds compile the checksum-pinned Lensfun source against the build machine's libc. Build release packages on the oldest distribution you intend to support; a wheel built on a newer distribution is not automatically portable to older glibc versions. Windows x86-64 and macOS arm64 use pinned platform binaries. Other architectures need corresponding native dependency validation.
+Linux builds compile the checksum-pinned Lensfun source against the build machine's libc. Build release packages on the oldest distribution you intend to support; a wheel built on a newer distribution is not automatically portable to older glibc versions. Windows x86-64 and macOS arm64 use pinned platform binaries. The pinned macOS native library requires macOS 15 or newer; a particular downloadable build may have a newer minimum due to its bundled Python/Qt. Other architectures need corresponding native dependency validation.
 
 **Linux / Windows** — then install the project:
 

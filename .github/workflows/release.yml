@@ -83,7 +83,7 @@ jobs:
       - name: Install Linux build and desktop libraries
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q build-essential cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+          sudo apt-get install -y -q build-essential cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 libxcb-randr0 libxcb-render-util0 libxcb-xfixes0 libxcb-sync1 libxrender1 libxi6 libsm6 libice6
 
       - name: Install Python dependencies
         run: |

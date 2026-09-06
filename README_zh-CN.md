@@ -92,10 +92,10 @@ pip install .
 **Linux（Debian / Ubuntu x86-64）** — 首先安装编译和桌面依赖：
 
 ```bash
-sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev libegl1 libgl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 libxcb-randr0 libxcb-render-util0 libxcb-xfixes0 libxcb-sync1 libxrender1 libxi6 libsm6 libice6
 ```
 
-Linux 构建会校验固定版本的 Lensfun 源码，并针对构建机器的 libc 编译。发布包应在计划支持的最旧发行版上构建，较新发行版生成的 wheel 不保证兼容旧版 glibc。Windows x86-64 和 macOS arm64 使用固定的平台二进制文件，其他架构需要补充原生依赖验证。
+Linux 构建会校验固定版本的 Lensfun 源码，并针对构建机器的 libc 编译。发布包应在计划支持的最旧发行版上构建，较新发行版生成的 wheel 不保证兼容旧版 glibc。Windows x86-64 和 macOS arm64 使用固定的平台二进制文件；macOS 原生库至少需要 macOS 15，具体下载包可能因内置 Python/Qt 而要求更新版本。其他架构需要补充原生依赖验证。
 
 **Linux / Windows** — 随后安装项目：
 
