@@ -227,6 +227,10 @@ jobs:
           # need one, since the template below describes a prerelease.
           if [ -f "source/docs/release-notes/${TAG}.md" ]; then
             cp "source/docs/release-notes/${TAG}.md" release-notes.md
+            if grep -q "VALIDATION_PENDING" release-notes.md; then
+              echo "::error::docs/release-notes/${TAG}.md still has VALIDATION_PENDING"
+              exit 1
+            fi
             exit 0
           fi
           cat > release-notes.md <<EOF
