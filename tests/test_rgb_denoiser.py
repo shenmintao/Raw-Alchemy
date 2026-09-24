@@ -72,6 +72,40 @@ def test_denoising_effect_survives_decoding(monkeypatch):
     assert float(out[8:-8, 8:-8].std()) < float(img[8:-8, 8:-8].std()) * 0.7
 
 
+def _biased_model(x):
+    """Level-dependent colour shift like FastDenoise v4's (dark G up, B down)."""
+    return np.power(x, np.array([0.9, 0.8, 1.3], np.float32)[None, :, None, None])
+
+
+def _sky_and_building():
+    rng = np.random.default_rng(3)
+    img = np.full((512, 1024, 3), [0.0020, 0.0025, 0.0030], np.float32)  # night sky
+    img[:, 512:] = [0.06, 0.05, 0.03]  # lit building
+    img += rng.normal(0, 0.0004, img.shape).astype(np.float32)
+    return img
+
+
+def test_model_level_shift_is_reanchored_without_halo(monkeypatch):
+    monkeypatch.setattr(R, "_get_session", lambda: _StubSession(_biased_model))
+    img = _sky_and_building()
+    out = R.denoise_rgb_linear(img)
+    for region in (np.s_[:, 32:480], np.s_[:, 544:992]):
+        np.testing.assert_allclose(out[region].mean((0, 1)), img[region].mean((0, 1)), rtol=0.02)
+    # the sky right next to the building keeps the sky's own correction
+    rim = np.s_[:, 480:508]
+    np.testing.assert_allclose(out[rim].mean((0, 1)), img[rim].mean((0, 1)), rtol=0.03)
+
+
+def test_level_test_scene_really_is_biased_without_reanchoring(monkeypatch):
+    monkeypatch.setattr(R, "_get_session", lambda: _StubSession(_biased_model))
+    monkeypatch.setattr(R, "LEVEL_MIN_SIDE", 10**9)
+    img = _sky_and_building()
+    out = R.denoise_rgb_linear(img)
+    sky = np.s_[:, 32:480]
+    ratio = out[sky].mean((0, 1)) / img[sky].mean((0, 1))
+    assert ratio[1] > 1.5 and ratio[2] < 0.5  # green sky: what the fix removes
+
+
 def test_compute_gain_bounds():
     dark = np.full((8, 8, 3), 1e-5, np.float32)
     assert R.compute_gain(dark) == R.GAIN_MAX
