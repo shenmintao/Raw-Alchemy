@@ -187,6 +187,14 @@ jobs:
     permissions:
       contents: write # Required to create a release
     steps:
+      # Only for docs/release-notes; kept in its own directory so it cannot
+      # disturb the downloaded artifacts.
+      - name: Check out release notes
+        uses: actions/checkout@v4
+        with:
+          path: source
+          sparse-checkout: docs/release-notes
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -199,6 +207,7 @@ jobs:
           mv artifacts/RawAlchemyStudio-linux-portable/*.tar.gz .
           # The macOS artifact is now a DMG and already named correctly
           mv artifacts/RawAlchemyStudio-macos-dmg/*.dmg .
+          sha256sum RawAlchemyStudio-* > SHA256SUMS.txt
         shell: bash
 
       - name: Remove stale legacy assets
@@ -214,6 +223,12 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
+          # A hand-written docs/release-notes/<tag>.md wins; final releases
+          # need one, since the template below describes a prerelease.
+          if [ -f "source/docs/release-notes/${TAG}.md" ]; then
+            cp "source/docs/release-notes/${TAG}.md" release-notes.md
+            exit 0
+          fi
           cat > release-notes.md <<EOF
           ## Raw Alchemy Studio $TAG
 
@@ -253,3 +268,4 @@ jobs:
             RawAlchemyStudio-*-windows-x64-portable.zip
             RawAlchemyStudio-*-linux-x64-portable.tar.gz
             RawAlchemyStudio-*-macos.dmg
+            SHA256SUMS.txt
