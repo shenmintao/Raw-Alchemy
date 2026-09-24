@@ -210,24 +210,38 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray,
                  if (ph or pw) else bayer)
         rgb = _run_tile(session, patch, m2, wb3, cam_mat)[:H, :W]
     else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def copy_interior(out, y0, x0, iy0, ix0, iy1, ix1):
+            rgb[iy0:iy1, ix0:ix1] = out[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0]
+
         rgb = np.zeros((H, W, 3), np.float32)
         step = TILE - 2 * OVERLAP
-        for y in range(0, H, step):
-            for x in range(0, W, step):
-                y0 = max(0, min(y - OVERLAP, H - TILE))
-                x0 = max(0, min(x - OVERLAP, W - TILE))
-                y0 -= y0 % 2  # keep CFA phase
-                x0 -= x0 % 2
-                y1, x1 = min(H, y0 + TILE), min(W, x0 + TILE)
-                patch = bayer[y0:y1, x0:x1]
-                th, tw = patch.shape
-                if th < TILE or tw < TILE:
-                    patch = np.pad(patch, ((0, TILE - th), (0, TILE - tw)),
-                                   mode="reflect")
-                out = _run_tile(session, patch, m2, wb3, cam_mat)
-                iy0, ix0 = y, x
-                iy1, ix1 = min(H, y + step), min(W, x + step)
-                rgb[iy0:iy1, ix0:ix1] = out[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0]
+        # Each tile's interior is copied out on a helper thread while the
+        # next tile runs (ORT and numpy copies both release the GIL); run
+        # serially, the copies were ~20% of the demosaic. One copy in flight
+        # at most, so memory stays at one extra tile.
+        pending = None
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="rcd-copy") as pool:
+            for y in range(0, H, step):
+                for x in range(0, W, step):
+                    y0 = max(0, min(y - OVERLAP, H - TILE))
+                    x0 = max(0, min(x - OVERLAP, W - TILE))
+                    y0 -= y0 % 2  # keep CFA phase
+                    x0 -= x0 % 2
+                    y1, x1 = min(H, y0 + TILE), min(W, x0 + TILE)
+                    patch = bayer[y0:y1, x0:x1]
+                    th, tw = patch.shape
+                    if th < TILE or tw < TILE:
+                        patch = np.pad(patch, ((0, TILE - th), (0, TILE - tw)),
+                                       mode="reflect")
+                    out = _run_tile(session, patch, m2, wb3, cam_mat)
+                    if pending is not None:
+                        pending.result()
+                    pending = pool.submit(copy_interior, out, y0, x0, y, x,
+                                          min(H, y + step), min(W, x + step))
+            if pending is not None:
+                pending.result()
 
     logger.info(
         f"RCD demosaic: {W}x{H} in {(time.time() - t0) * 1000:.0f}ms "

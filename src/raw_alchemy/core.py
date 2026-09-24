@@ -58,15 +58,28 @@ def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
     """Detect and replace hot/dead pixels using per-channel median comparison."""
     import cv2
     pat_size = cfa_pattern.shape[0]
+    # uint16 量化后中值(cv2 直方图法,较 fp32 快 ~5x);
+    # 检测在量化域,替换值用 fp32 中值邻域近似(量化步长 1/65535,
+    # 远小于热像素阈值,无观感差异)
+    # Quantise the whole mosaic once, in contiguous row blocks: CFA sites are
+    # disjoint, so fixing one plane never changes another plane's samples.
+    # Same arithmetic as per-plane quantisation, so results are bit-identical.
+    height, width = raw_norm.shape[:2]
+    q_full = np.empty((height, width), np.uint16)
+    rows = max(1, (1 << 20) // max(1, width))
+    scratch = np.empty((rows, width), raw_norm.dtype)
+    for y in range(0, height, rows):
+        block = scratch[:min(rows, height - y)]
+        np.multiply(raw_norm[y:y + rows], 65535.0, out=block)
+        np.clip(block, 0, 65535, out=block)
+        q_full[y:y + rows] = block  # truncating cast, as astype(uint16)
+    del scratch
     for r in range(pat_size):
         for c in range(pat_size):
             plane = raw_norm[r::pat_size, c::pat_size]
-            # uint16 量化后中值(cv2 直方图法,较 fp32 快 ~5x);
-            # 检测在量化域,替换值用 fp32 中值邻域近似(量化步长 1/65535,
-            # 远小于热像素阈值,无观感差异)
-            q = np.clip(plane * 65535.0, 0, 65535).astype(np.uint16)
-            med_q = cv2.medianBlur(np.ascontiguousarray(q), 3)
-            diff = np.abs(q.astype(np.int32) - med_q.astype(np.int32)).astype(np.float32)
+            q = np.ascontiguousarray(q_full[r::pat_size, c::pat_size])
+            med_q = cv2.medianBlur(q, 3)
+            diff = cv2.absdiff(q, med_q).astype(np.float32)
             std = max(float(diff.std()), 1e-3)
             hot = diff > threshold * std
             if hot.any():

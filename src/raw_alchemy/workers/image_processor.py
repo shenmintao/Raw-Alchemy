@@ -85,7 +85,10 @@ def _native_base_allowed(src_w: int, src_h: int, params) -> bool:
     except Exception:
         return False
 
-DECODE_SESSION_IDLE_SECONDS = 15.0
+# Idle time before the persistent decode processes (and their demosaic
+# sessions, ~0.5-1 GB VRAM) are shut down. Short pauses while browsing keep
+# them warm; a respawn costs ~1-1.7 s on the next open.
+DECODE_SESSION_IDLE_SECONDS = 60.0
 MAX_PENDING_EXPORTS = 2
 MAX_PENDING_PRELOADS = 2
 
@@ -731,20 +734,29 @@ class ImageProcessor(QThread):
         logger.debug("[Warmup] Deferred ONNX initialization to sensor/stage demand")
 
     def _release_decode_sessions(self):
-        """Release demosaic-only arenas once editing no longer needs them."""
+        """Release demosaic-only arenas once editing no longer needs them.
+
+        The demosaic sessions live in the persistent decode processes, so
+        idling shuts those down; the in-process sessions are cleared too for
+        callers that decode in this process.
+        """
         try:
+            from raw_alchemy.native_decode import release_idle_decoders
             from raw_alchemy.onnx import rcd_demosaic, xtrans_demosaic
+            release_idle_decoders()
             rcd_demosaic.clear_session()
             xtrans_demosaic.clear_session()
             self._decode_sessions_released = True
-            logger.info("[Worker] Decode idle: demosaic ONNX sessions released.")
+            logger.info("[Worker] Decode idle: decode processes and demosaic sessions released.")
         except Exception as e:
             logger.debug(f"[Worker] decode-session release skipped: {e}")
 
     def _release_onnx_sessions(self):
         """Drop every cached ONNX session (demosaic/grade/denoise) → VRAM 归零."""
         try:
+            from raw_alchemy.native_decode import release_idle_decoders
             from raw_alchemy.onnx import grade, rcd_demosaic, xtrans_demosaic
+            release_idle_decoders()
             rcd_demosaic.clear_session()
             xtrans_demosaic.clear_session()
             grade.clear_session()
