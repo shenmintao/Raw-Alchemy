@@ -206,15 +206,18 @@ def get_working_colourspace():
     return colour.RGB_COLOURSPACES[config.WORKING_SPACE]
 
 def get_subsampled_view(img, target_size=1024):
-    """
-    鑾峰彇鍥惧儚鐨勪笅閲囨牱瑙嗗浘銆?
-    瀵逛簬娴嬪厜鏉ヨ锛屽垎鏋?1000px 瀹界殑缂╃暐鍥惧拰鍒嗘瀽 8000px 鐨勫師鍥撅紝缁撴灉宸紓鍙拷鐣ヤ笉璁°€?
+    """Small metering view of the frame, long side about ``target_size``.
+
+    Area-averaged, not strided: decoded frames keep sub-black noise, and a
+    strided sample would feed raw per-pixel noise (much of it negative in deep
+    shadows) into the log-average meters.
     """
     h, w, _ = img.shape
-    # 璁＄畻姝ラ暱锛屼娇寰楅暱杈瑰ぇ绾︿负 target_size
-    step = max(1, max(h, w) // target_size)
-    # Numpy鍒囩墖鏄鍥?View)锛屼笉鍗犵敤鏂板唴瀛?
-    return img[::step, ::step, :]
+    scale = target_size / float(max(h, w))
+    if scale >= 1.0:
+        return img
+    size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    return cv2.resize(np.ascontiguousarray(img), size, interpolation=cv2.INTER_AREA)
 
 # =========================================================
 # 涓氬姟閫昏緫鍑芥暟 (浼樺寲鐗?

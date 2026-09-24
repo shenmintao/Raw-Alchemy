@@ -11,7 +11,7 @@ from raw_alchemy.logger import create_logger
 from raw_alchemy.file_io import save_image_atomic as save_image
 from raw_alchemy import config, metering
 from raw_alchemy.onnx.rgb_denoiser import denoise_rgb_linear
-from raw_alchemy.math_ops import apply_matrix_inplace, compute_hl_refavg, init_taichi
+from raw_alchemy.math_ops import apply_matrix_inplace, init_taichi
 from raw_alchemy.pipeline.executor import ExportExecutor
 from raw_alchemy.pipeline.ops import build_op_list
 
@@ -20,8 +20,13 @@ from raw_alchemy.pipeline.ops import build_op_list
 #          RAW 棰勫鐞?
 # ==========================================
 
-def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
-    """Per-channel black subtraction, normalising the fresh decode in-place."""
+def subtract_black_level(sensor_raw, bl, wl, cfa_pattern, clip_negative=True):
+    """Per-channel black subtraction, normalising the fresh decode in-place.
+
+    ``clip_negative=False`` keeps readings below black. Clipping them turns
+    zero-mean read noise into a positive bias, and white balance then scales
+    that bias per channel: deep shadows of high-ISO frames turn magenta.
+    """
     sensor_raw = np.asarray(sensor_raw, dtype=np.float32)
     pat_size = cfa_pattern.shape[0]
     bl = np.asarray(bl, np.float32)
@@ -29,7 +34,8 @@ def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
     if np.all(bl == bl.flat[0]):
         b = float(bl.flat[0])
         sensor_raw -= np.float32(b)
-        np.maximum(sensor_raw, np.float32(0.0), out=sensor_raw)
+        if clip_negative:
+            np.maximum(sensor_raw, np.float32(0.0), out=sensor_raw)
         sensor_raw /= np.float32(wl - b)
         return sensor_raw
     # 通用:黑电平图按 CFA 铺开,单次运算
@@ -41,7 +47,8 @@ def subtract_black_level(sensor_raw, bl, wl, cfa_pattern):
     bl_map = np.tile(blk, ((H + pat_size - 1) // pat_size,
                            (W + pat_size - 1) // pat_size))[:H, :W]
     sensor_raw -= bl_map
-    np.maximum(sensor_raw, np.float32(0.0), out=sensor_raw)
+    if clip_negative:
+        np.maximum(sensor_raw, np.float32(0.0), out=sensor_raw)
     np.subtract(np.float32(wl), bl_map, out=bl_map)
     np.divide(sensor_raw, bl_map, out=sensor_raw)
     return sensor_raw
@@ -77,21 +84,15 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     per-pixel opposing-channel reference average + per-segment chroma
     correction.
 
-    Implementation: numpy/cv2 throughout — ``math_ops.compute_hl_refavg`` for
-    the per-pixel opposing-channel reference (SIMD box filters), morphology /
-    CCL / max-filter via OpenCV.
+    Implementation: numpy/cv2 throughout — morphology / CCL / max-filter via
+    OpenCV on the tile clusters around clipped pixels, and the per-pixel
+    opposing-channel reference (:func:`_reference_average_at`) only where it
+    is consumed: clipped pixels and segment borders.
     """
     import cv2
 
-    H, W = raw_data.shape
-    pat_size = cfa_pattern.shape[0]
+    pattern = np.where(np.asarray(cfa_pattern) >= 3, 1, cfa_pattern).astype(np.uint8)
     g = max(float(wb[1]), 1e-6)
-
-    color_map = np.tile(cfa_pattern,
-                        ((H + pat_size - 1) // pat_size,
-                         (W + pat_size - 1) // pat_size))[:H, :W]
-    color_map = np.where(color_map >= 3, 1, color_map).astype(np.uint8)
-
     wb_gains = np.array([wb[0] / g, 1.0, wb[2] / g], dtype=np.float32)
     CLIP = 0.987
     raw_clips = np.array([CLIP / max(wg, 1e-6) for wg in wb_gains],
@@ -100,67 +101,242 @@ def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     # 快速门控:无任何接近饱和的像素时整段跳过(夜景/正常曝光常见)
     if float(raw_data.max()) < float(raw_clips.min()):
         return
-    refavg, clipped = compute_hl_refavg(raw_data, color_map, wb_gains, raw_clips)
+    clipped = _phase_threshold_mask(raw_data, pattern, raw_clips)
     if not np.any(clipped):
         return
 
-    diff = raw_data - refavg
-    del refavg
-    # 7x7 square SE 鈥?closes gaps up to 6 px wide.
+    # Every quantity below reaches at most 7 px from a clipped pixel, so only
+    # the tile clusters around clipped pixels are segmented, and the
+    # reference average is evaluated only at the pixels that use it (the
+    # full-frame version spent seconds on pixels it never touched).
     closing_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    regions = [_HighlightRegion(raw_data, pattern, clipped, box, own, wb_gains, raw_clips)
+               for box, own in _highlight_regions(clipped)]
 
+    # Gather all channels from the unmodified frame first: the single pass
+    # took its reference average before rewriting any channel.
+    per_channel = []
     for c in range(3):
-        clipped_c = clipped & (color_map == c)
+        stats = [region.segment_stats(c, closing_kernel) for region in regions]
+        # Fallback chroma for small segments pools every segment of this
+        # colour in the frame, exactly like the single full-frame pass.
+        seg_total = sum(float(s[0][1:].sum()) for s in stats if s is not None)
+        cnt_total = sum(int(s[1][1:].sum()) for s in stats if s is not None)
+        global_chroma = seg_total / cnt_total if cnt_total > 100 else 0.0
+        per_channel.append((stats, global_chroma))
+    for c, (stats, global_chroma) in enumerate(per_channel):
+        for region, s in zip(regions, stats):
+            if s is not None:
+                region.apply(c, s, global_chroma)
+
+
+# Tile size for highlight reconstruction; must exceed the 7 px reach of the
+# 7x7 closing + 7x7 label dilation + 3x3 reference mean.
+_HL_TILE = 128
+
+
+def _phase_threshold_mask(raw_data, pattern, thresholds):
+    """``raw >= thresholds[colour]`` without a full-frame colour map."""
+    p = pattern.shape[0]
+    out = np.empty(raw_data.shape, dtype=bool)
+    for r in range(p):
+        for c in range(p):
+            np.greater_equal(raw_data[r::p, c::p], thresholds[pattern[r, c]],
+                             out=out[r::p, c::p])
+    return out
+
+
+def _highlight_regions(clipped, tile=_HL_TILE, max_area_fraction=0.6):
+    """Yield ``((y0, y1, x0, x1), own_mask)`` covering all clipped pixels.
+
+    Tiles holding clipped pixels, grown by one tile, are grouped into
+    8-connected clusters. Distinct clusters are at least a tile apart, so a
+    segment and its border never span two clusters. ``own_mask`` limits a
+    cluster to its own tiles inside a bounding box that may overlap others.
+    Dense clipping falls back to one full-frame region.
+    """
+    import cv2
+
+    h, w = clipped.shape
+    ty, tx = -(-h // tile), -(-w // tile)
+    padded = np.zeros((ty * tile, tx * tile), dtype=bool)
+    padded[:h, :w] = clipped
+    grid = padded.reshape(ty, tile, tx, tile).any(axis=(1, 3)).astype(np.uint8)
+    grid = cv2.dilate(grid, np.ones((3, 3), np.uint8))
+    count, labels = cv2.connectedComponents(grid, connectivity=8)
+
+    boxes = []
+    for k in range(1, count):
+        ys, xs = np.nonzero(labels == k)
+        boxes.append((k, ys.min(), ys.max() + 1, xs.min(), xs.max() + 1))
+    area = sum((y1 - y0) * (x1 - x0) for _k, y0, y1, x0, x1 in boxes) * tile * tile
+    if area > max_area_fraction * h * w:
+        yield (0, h, 0, w), None
+        return
+    for k, gy0, gy1, gx0, gx1 in boxes:
+        own_tiles = labels[gy0:gy1, gx0:gx1] == k
+        own = np.repeat(np.repeat(own_tiles, tile, axis=0), tile, axis=1)
+        y0, y1 = gy0 * tile, min(h, gy1 * tile)
+        x0, x1 = gx0 * tile, min(w, gx1 * tile)
+        yield (y0, y1, x0, x1), own[:y1 - y0, :x1 - x0]
+
+
+class _HighlightRegion:
+    """One cluster of :func:`highlight_inpaint_opposed`, on a view of the frame."""
+
+    def __init__(self, raw_data, pattern, clipped, box, own, wb_gains, raw_clips):
+        y0, y1, x0, x1 = box
+        self.frame = raw_data
+        self.origin = (y0, x0)
+        self.pattern = pattern
+        self.wb_gains = wb_gains
+        self.raw = raw_data[y0:y1, x0:x1]  # view: updates land in the frame
+        self.raw_clips = raw_clips
+        self.clipped = clipped[y0:y1, x0:x1]
+        if own is not None:
+            self.clipped = self.clipped & own
+        self.own = own
+        self.colour = _colour_block(pattern, pattern.shape[0], y0, y1, x0, x1)
+        self._pending = {}
+
+    def _diff_at(self, ys, xs):
+        """``raw - reference average`` at region pixels, from the whole frame."""
+        y0, x0 = self.origin
+        ref = _reference_average_at(self.frame, ys + y0, xs + x0, self.pattern, self.wb_gains)
+        return self.raw[ys, xs] - ref
+
+    def segment_stats(self, c, closing_kernel):
+        import cv2
+
+        clipped_c = self.clipped & (self.colour == c)
         if not np.any(clipped_c):
-            continue
-
-        # Morphological closing (SIMD-accelerated).
-        cc_u8 = clipped_c.astype(np.uint8)
-        closed = cv2.morphologyEx(cc_u8, cv2.MORPH_CLOSE, closing_kernel)
-
-        # Connected components, 8-connectivity. Matches darktable's
-        # segmentation choice; closing has already merged any 4-connected
-        # clusters so the connectivity choice is near-equivalent here.
+            return None
+        closed = cv2.morphologyEx(clipped_c.astype(np.uint8), cv2.MORPH_CLOSE, closing_kernel)
         num_seg_plus_one, labels = cv2.connectedComponents(closed, connectivity=8)
         num_seg = num_seg_plus_one - 1
         if num_seg == 0:
-            continue
-
-        # 7x7 max-filter on labels via cv2.dilate(float32) 鈥?used to
-        # identify the segment-border zone for chroma estimation.
+            return None
         expanded = cv2.dilate(labels.astype(np.float32), closing_kernel).astype(np.int32)
 
-        lo = raw_clips[c] * 0.2
-        unclipped_valid = (color_map == c) & ~clipped & (raw_data > lo)
-
+        lo = self.raw_clips[c] * 0.2
+        unclipped_valid = (self.colour == c) & ~self.clipped & (self.raw > lo)
+        if self.own is not None:
+            unclipped_valid &= self.own
         border = (expanded > 0) & (labels == 0) & unclipped_valid
-        border_labels = expanded[border]
-        border_diffs = diff[border]
-
-        seg_sum = np.bincount(border_labels, weights=border_diffs,
+        by, bx = np.nonzero(border)  # raster order, as boolean indexing
+        border_labels = expanded[by, bx]
+        seg_sum = np.bincount(border_labels, weights=self._diff_at(by, bx),
                               minlength=num_seg + 1)
         seg_cnt = np.bincount(border_labels, minlength=num_seg + 1)
 
-        global_chroma = 0.0
-        total_cnt = seg_cnt[1:].sum()
-        if total_cnt > 100:
-            global_chroma = seg_sum[1:].sum() / total_cnt
+        ty, tx = np.nonzero(clipped_c & (labels > 0))
+        self._pending[c] = (ty, tx, labels[ty, tx], self._diff_at(ty, tx))
+        return seg_sum, seg_cnt
 
+    def apply(self, c, stats, global_chroma):
+        seg_sum, seg_cnt = stats
+        ty, tx, target_labels, target_diff = self._pending.pop(c)
         seg_chroma = np.where(seg_cnt > 10,
                               seg_sum / np.maximum(seg_cnt, 1),
                               global_chroma).astype(np.float32)
-
-        target = clipped_c & (labels > 0)
-        target_labels = labels[target]
-        raw_data[target] = np.maximum(
-            raw_data[target],
-            raw_data[target] - diff[target] + seg_chroma[target_labels]
+        values = self.raw[ty, tx]
+        self.raw[ty, tx] = np.maximum(
+            values, values - target_diff + seg_chroma[target_labels]
         )
+
+
+_NEIGHBOUR_DY = np.array([-1, -1, -1, 0, 0, 0, 1, 1, 1])
+_NEIGHBOUR_DX = np.array([-1, 0, 1, -1, 0, 1, -1, 0, 1])
+
+
+def _reference_average_at(raw, ys, xs, pattern, wb_gains, batch=1 << 20):
+    """Opposing-channel cube-root reference average at pixels ``(ys, xs)``.
+
+    Same maths as the former full-frame pass (a port of the retired Taichi
+    kernel): per colour, the mean of the non-negative samples in the 3x3
+    neighbourhood (clamped at the frame edge, i.e. replicated), scaled by the
+    WB gain and cube-rooted; the pixel's own colour is left out, the other two
+    are averaged, cubed and scaled back by the own colour's gain.
+    """
+    h, w = raw.shape
+    p = pattern.shape[0]
+    gains = np.asarray(wb_gains, dtype=np.float32)
+    out = np.empty(len(ys), dtype=np.float32)
+    for start in range(0, len(ys), batch):
+        y = ys[start:start + batch]
+        x = xs[start:start + batch]
+        ny = np.clip(y[:, None] + _NEIGHBOUR_DY, 0, h - 1)
+        nx = np.clip(x[:, None] + _NEIGHBOUR_DX, 0, w - 1)
+        values = np.maximum(raw[ny, nx], np.float32(0.0))
+        colours = pattern[ny % p, nx % p]
+        own_colour = pattern[y % p, x % p]
+        total = np.zeros(len(y), dtype=np.float32)
+        own = np.zeros(len(y), dtype=np.float32)
+        for c in range(3):
+            in_colour = colours == c
+            count = in_colour.sum(axis=1).astype(np.float32)
+            mean = np.where(in_colour, values, np.float32(0.0)).sum(axis=1, dtype=np.float32)
+            np.divide(mean, count, out=mean, where=count > 0)
+            mean *= gains[c]
+            np.cbrt(mean, out=mean)
+            total += mean
+            np.copyto(own, mean, where=own_colour == c)
+        ref = (total - own) * np.float32(0.5)
+        np.power(ref, np.float32(3.0), out=ref)
+        ref /= gains[own_colour]
+        out[start:start + batch] = ref
+    return out
+
+
+def _colour_block(pattern, p, y0, y1, x0, x1):
+    """CFA colour indices of ``[y0:y1, x0:x1]`` with the frame's phase."""
+    phased = np.roll(np.roll(pattern, -(y0 % p), axis=0), -(x0 % p), axis=1)
+    reps = (-(-(y1 - y0) // p), -(-(x1 - x0) // p))
+    return np.tile(phased, reps)[:y1 - y0, :x1 - x0]
 
 
 # ==========================================
 #              鏍稿績澶勭悊鍑芥暟
 # ==========================================
+
+def _lift_for_demosaic(raw_norm):
+    """Map the mosaic affinely into [0, 1] for the demosaic, in place.
+
+    The demosaic graphs are validated on non-negative input, yet sub-black
+    noise has to survive to avoid the clipping bias. Lift by the noise floor
+    (0.1th percentile of a sparse sample) and scale so reconstructed
+    highlights above 1 are not cut. Returns ``(lift, scale)``;
+    :func:`_unlift_to_working_space` inverts the mapping exactly.
+    """
+    lift = float(max(0.0, -np.percentile(raw_norm[::7, ::7], 0.1)))
+    scale = max(1.0, float(raw_norm.max())) + lift
+    if lift > 0.0:
+        raw_norm += np.float32(lift)
+    if scale != 1.0:
+        raw_norm /= np.float32(scale)
+    np.maximum(raw_norm, np.float32(0.0), out=raw_norm)  # rare deeper outliers
+    return lift, scale
+
+
+def _unlift_to_working_space(rgb, lift, scale, wb3, cam_to_working, rows_per_chunk=512):
+    """Undo :func:`_lift_for_demosaic`, then apply WB and the camera matrix.
+
+    One affine per pixel, in place and in row chunks (no second full-frame
+    buffer). Values below zero are kept, since the preview downscale and the
+    grading ops clip later, after averaging. The top is clipped at 1 as before.
+    """
+    import cv2
+
+    affine = np.empty((3, 4), np.float32)
+    affine[:, :3] = cam_to_working * (wb3 * np.float32(scale))[None, :]
+    affine[:, 3] = -(cam_to_working @ (wb3 * np.float32(lift)))
+    rgb = np.ascontiguousarray(rgb, dtype=np.float32)
+    for start in range(0, rgb.shape[0], rows_per_chunk):
+        block = rgb[start:start + rows_per_chunk]
+        cv2.transform(block, affine, dst=block)
+    np.minimum(rgb, np.float32(1.0), out=rgb)
+    return rgb
+
 
 _ORIENT_TO_FLIP = {1: 0, 3: 3, 6: 6, 8: 5}  # EXIF orientation -> libraw flip
 
@@ -213,16 +389,34 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     # ---- CFA fast path: rawspeed/rawpy decode + ONNX demosaic (GPU) ----
     cfa_data = None
     rs = None
-    XTRANS_PATTERN = None
+    xtrans_cfa = None
     try:
-        from raw_alchemy.rawspeed import try_decode, XTRANS_PATTERN
-        rs = try_decode(raw_path)
+        from raw_alchemy import rawspeed
+        rs = rawspeed.try_decode(raw_path)
     except Exception:
         # rawspeedpy 在损坏 makernote(如 Sony 转制 DNG 的 Sony2 目录)上
         # 可能抛 UnicodeDecodeError 等——回退 rawpy 解码,仍走 GPU 去马赛克
         rs = None
     try:
-        rs_ok = bool(rs and (rs.is_bayer or rs.is_xtrans) and rs.color_matrix is not None)
+        if rs is not None and rs.is_xtrans:
+            # The X-Trans phase must match this camera's frame: a fixed
+            # pattern fitted X-Trans IV but was one row off on the X-T10
+            # (magenta with stripes). Unknown or inconsistent layouts go to
+            # LibRaw, whose pixels and pattern share one source.
+            xtrans_cfa = rawspeed.xtrans_pattern(rs)
+            if xtrans_cfa is not None and not rawspeed.xtrans_greens_consistent(
+                rs.bayer, xtrans_cfa
+            ):
+                from loguru import logger
+                logger.warning(
+                    f"X-Trans layout for {rs.make} {rs.model} does not fit the "
+                    f"mosaic; decoding {os.path.basename(raw_path)} with LibRaw"
+                )
+                xtrans_cfa = None
+        rs_ok = bool(
+            rs and rs.color_matrix is not None
+            and (rs.is_bayer or xtrans_cfa is not None)
+        )
     except Exception:
         rs_ok = False
     if rs_ok:
@@ -235,7 +429,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
             except Exception:
                 flip = 0
         pattern = (get_cfa_pattern_from_filters(rs.filters) if rs.is_bayer
-                   else np.asarray(XTRANS_PATTERN))
+                   else xtrans_cfa)
         cfa_data = (
             rs.bayer.astype(np.float32),
             np.array(rs.black_levels, dtype=np.float32),
@@ -261,23 +455,24 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
 
     if cfa_data is not None:
         sensor_raw, bl, wl, wb, xyz_to_cam, cfa_pattern, flip = cfa_data
-        raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern)
+        # Keep sub-black noise (see subtract_black_level): clipped here, white
+        # balance turned it into magenta night skies.
+        raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern, clip_negative=False)
         fix_hot_pixels(raw_norm, cfa_pattern)
         highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
         g = wb[1] if wb[1] > 0 else 1.0
         wb3 = np.array([wb[0] / g, 1.0, wb[2] / g], np.float32)
         m = cam_to_working_space_matrix(xyz_to_cam).astype(np.float32)
+        lift, scale = _lift_for_demosaic(raw_norm)
         if cfa_pattern.shape == (2, 2):
-            # WB+矩阵+clip 折叠在 RCD 图输出端(GPU),省 42MP CPU einsum
+            # Plain demosaic on the GPU: the graph's fused WB+matrix output
+            # clip would cut the lift out of highlights before it is undone.
             from raw_alchemy.onnx.rcd_demosaic import rcd_demosaic as onnx_rcd
-            rgb = onnx_rcd(raw_norm, cfa_pattern, wb3=wb3, cam_mat=m)
+            rgb = onnx_rcd(raw_norm, cfa_pattern)
         else:
             from raw_alchemy.onnx.xtrans_demosaic import xtrans_markesteijn_demosaic
             rgb = xtrans_markesteijn_demosaic(raw_norm, cfa_pattern)
-            rgb *= wb3
-            from raw_alchemy.math_ops import apply_matrix_inplace
-            apply_matrix_inplace(rgb, m)
-            np.clip(rgb, 0.0, 1.0, out=rgb)
+        rgb = _unlift_to_working_space(rgb, lift, scale, wb3, m)
         return np.ascontiguousarray(_apply_flip(rgb, flip))
 
     # ---- 罕见传感器(Foveon 等):libraw 兜底 ----
