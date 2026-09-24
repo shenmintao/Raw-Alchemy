@@ -13,7 +13,8 @@ loguru==0.7.3
 markdown-it-py==4.0.0
 mdurl==0.1.2
 numpy==2.4.4
-onnxruntime-gpu==1.25.1 ; sys_platform != "darwin"
+onnxruntime-directml==1.24.4 ; sys_platform == "win32"
+onnxruntime-gpu==1.25.1 ; sys_platform == "linux"
 onnxruntime==1.25.1 ; sys_platform == "darwin"
 opencv-python-headless==4.13.0.92
 ordered-set==4.1.0
