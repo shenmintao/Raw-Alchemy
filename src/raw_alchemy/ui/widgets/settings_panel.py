@@ -43,6 +43,7 @@ class SettingsPanel(QWidget):
     cache_limit_changed = Signal(int)
     thumb_cache_changed = Signal(bool)
     thumb_cache_clear_requested = Signal()
+    native_base_changed = Signal(bool)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -122,6 +123,15 @@ class SettingsPanel(QWidget):
         cache_hint = CaptionLabel(tr('cache_limit_hint'))
         cache_hint.setStyleSheet("color: gray;")
         perf_layout.addWidget(cache_hint)
+
+        self.native_base_switch = SwitchButton(text=tr('native_base_enable'))
+        self.native_base_switch.setChecked(True)
+        self.native_base_switch.checkedChanged.connect(self.native_base_changed.emit)
+        perf_layout.addWidget(self.native_base_switch)
+        native_hint = CaptionLabel(tr('native_base_hint'))
+        native_hint.setStyleSheet("color: gray;")
+        native_hint.setWordWrap(True)
+        perf_layout.addWidget(native_hint)
         settings_layout.addWidget(perf_card)
 
         # Thumbnail cache Settings Card (T7.8)
@@ -217,6 +227,11 @@ class SettingsPanel(QWidget):
         self.thumb_cache_switch.blockSignals(True)
         self.thumb_cache_switch.setChecked(bool(enabled))
         self.thumb_cache_switch.blockSignals(False)
+
+    def set_native_base_enabled(self, enabled: bool):
+        self.native_base_switch.blockSignals(True)
+        self.native_base_switch.setChecked(bool(enabled))
+        self.native_base_switch.blockSignals(False)
     
     def _update_cuda_status(self):
         """Update CUDA status display based on current state."""
@@ -225,7 +240,13 @@ class SettingsPanel(QWidget):
             
             # Detect GPU
             gpu_info = gpu_runtime.detect_gpu_vendor()
-            if gpu_info['cuda_compatible']:
+            if gpu_info['cuda_compatible'] and gpu_runtime.cuda_provider_bundled() is False:
+                # A DirectML/CPU build cannot use a downloaded CUDA runtime.
+                self.gpu_info_label.setText(
+                    f"ℹ️ {tr('nvidia_gpu')}: {gpu_info['name']} - {tr('cuda_provider_missing')}"
+                )
+                self.cuda_download_btn.setEnabled(False)
+            elif gpu_info['cuda_compatible']:
                 self.gpu_info_label.setText(f"✅ {tr('nvidia_gpu')}: {gpu_info['name']}")
                 self.cuda_download_btn.setEnabled(True)
             elif gpu_info['vendor'] == 'amd':
@@ -275,6 +296,14 @@ class SettingsPanel(QWidget):
                 InfoBar.warning(
                     title=tr('cuda_not_supported'),
                     content=tr('amd_gpu') if gpu_info['vendor'] == 'amd' else tr('intel_gpu'),
+                    parent=self,
+                    position=InfoBarPosition.TOP
+                )
+                return
+            if gpu_runtime.cuda_provider_bundled() is False:
+                InfoBar.warning(
+                    title=tr('cuda_not_supported'),
+                    content=tr('cuda_provider_missing'),
                     parent=self,
                     position=InfoBarPosition.TOP
                 )

@@ -14,6 +14,7 @@ import os
 import gc
 import numpy as np
 import colour
+import psutil
 from typing import Optional
 from PySide6.QtCore import QThread, Signal
 from loguru import logger
@@ -64,6 +65,25 @@ QUALITY_BASE_MAX_PIXELS = int(config.QUALITY_BASE_MAX_PIXELS)
 # Compatibility aliases for older integrations importing these names.
 NATIVE_PREVIEW_MAX_SIDE = QUALITY_BASE_MAX_SIDE
 NATIVE_PREVIEW_MAX_PIXELS = QUALITY_BASE_MAX_PIXELS
+def _native_base_allowed(src_w: int, src_h: int, params) -> bool:
+    """Whether the idle refine may keep the full frame (see config).
+
+    No pixel cap: the frame must fit the GPU texture limit, the free VRAM when
+    the driver reports it (RGBA texture plus mip chain, with headroom) and the
+    free RAM for the full-resolution float render (~3x the RGB float frame).
+    """
+    if not params.get('native_base'):
+        return False
+    if max(src_w, src_h) > int(params.get('max_texture_size') or 0):
+        return False
+    free_vram_mb = params.get('free_vram_mb')
+    texture_mb = src_w * src_h * 4 * 4 / 3 / 2**20
+    if free_vram_mb is not None and free_vram_mb < 2 * texture_mb:
+        return False
+    try:
+        return psutil.virtual_memory().available >= 3 * src_w * src_h * 3 * 4
+    except Exception:
+        return False
 
 DECODE_SESSION_IDLE_SECONDS = 15.0
 MAX_PENDING_EXPORTS = 2
@@ -320,8 +340,8 @@ class ImageProcessor(QThread):
             except PipelineAborted:
                 pass
             except Exception as e:
-                import traceback
-                traceback.print_exc()
+                # logger, not print_exc: a windowed build has no stderr.
+                logger.exception(f"[Worker] Request failed for {request.path}: {e}")
                 self.error_occurred.emit(str(e))
             finally:
                 with self.lock:
@@ -972,6 +992,8 @@ class ImageProcessor(QThread):
     @staticmethod
     def _make_preview_target_size(src_w: int, src_h: int, params: ProcessorParams):
         if params.get('_force_full_preview'):
+            if _native_base_allowed(src_w, src_h, params):
+                return src_w, src_h
             # Quality-base tier: bounded full-frame presentation. Native
             # detail is supplied by the ROI tier when the user zooms in.
             scale = min(
@@ -1805,9 +1827,7 @@ class ImageProcessor(QThread):
             )
             return
         except Exception as e:
-            logger.error(f"[Worker] Error in unified pipeline: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"[Worker] Error in unified pipeline: {e}")
             self.error_occurred.emit(f"Processing error: {str(e)}")
             return
 
@@ -1908,9 +1928,7 @@ class ImageProcessor(QThread):
         except PipelineAborted:
             return
         except Exception as e:
-            logger.error(f"[Worker] Error in unified output: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"[Worker] Error in unified output: {e}")
             self.error_occurred.emit(f"Output error: {str(e)}")
 
     def _release_ephemeral_preview_resources(self, result=None):

@@ -1,15 +1,29 @@
 import os
 
 from PySide6.QtCore import Qt, QThread, QTimer
-from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QFileDialog, QListWidgetItem, QMessageBox, QTreeView
+from loguru import logger
 from qfluentwidgets import InfoBar
 
 from raw_alchemy.i18n import tr
+from raw_alchemy.ui.widgets.gallery_list import boxed_icon
 from raw_alchemy.workers.thumbnail_worker import ThumbnailWorker
 
 
-MARK_PREFIX = "\u9983\u715d"
+# U+1F7E2 LARGE GREEN CIRCLE, kept as an escape so a mis-decoded save of this
+# file cannot turn it into mojibake again.
+MARK_PREFIX = "\U0001F7E2"
+
+# Geometry belongs to one frame. Everything else is a "look" that deliberately
+# carries over to images without saved settings, so these keys must be reset
+# explicitly (set_params leaves keys that are absent untouched).
+PER_IMAGE_RESET_PARAMS = {
+    "rotation": 0,
+    "flip_horizontal": False,
+    "flip_vertical": False,
+    "crop": (0.0, 0.0, 1.0, 1.0),
+    "perspective_corners": None,
+}
 
 
 class LibraryControllerMixin:
@@ -211,7 +225,7 @@ class LibraryControllerMixin:
 
     def add_gallery_items(self, paths, image):
         """Add a batch of placeholder items sharing one QIcon (single relayout)."""
-        icon = QIcon(QPixmap.fromImage(image))
+        icon = boxed_icon(image)
         self.gallery_list.setUpdatesEnabled(False)
         try:
             for path in paths:
@@ -228,11 +242,10 @@ class LibraryControllerMixin:
 
     def add_gallery_item(self, path, image):
         name = os.path.basename(path)
-        pixmap = QPixmap.fromImage(image)
 
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, path)
-        item.setIcon(QIcon(pixmap))
+        item.setIcon(boxed_icon(image))
 
         is_marked = path in self.marked_files
         item.setText(f"{MARK_PREFIX} {name}" if is_marked else name)
@@ -244,8 +257,7 @@ class LibraryControllerMixin:
         item = self.gallery_items_by_path.get(path)
         if item is None:
             return
-        pixmap = QPixmap.fromImage(image)
-        item.setIcon(QIcon(pixmap))
+        item.setIcon(boxed_icon(image))
         rect = self.gallery_list.visualItemRect(item)
         self.gallery_list.viewport().update(rect)
 
@@ -282,11 +294,11 @@ class LibraryControllerMixin:
             self.right_panel.set_params(self.file_params_cache[path])
         else:
             current_sticky_params = self.right_panel.get_params()
-            current_sticky_params["rotation"] = 0
-            current_sticky_params["flip_horizontal"] = False
-            current_sticky_params["flip_vertical"] = False
-            current_sticky_params["crop"] = (0.0, 0.0, 1.0, 1.0)
+            current_sticky_params.update(PER_IMAGE_RESET_PARAMS)
             self.right_panel.set_params(current_sticky_params)
+        # Revert/reset-to-baseline must use this image's baseline, never the
+        # one saved on the previously shown image.
+        self.right_panel.set_saved_baseline(self.file_baseline_params_cache.get(path))
 
         self.update_mark_button_state()
         self.load_image(path)
@@ -368,67 +380,55 @@ class LibraryControllerMixin:
         item.setText(f"{MARK_PREFIX} {name}" if is_marked else name)
 
     def delete_image(self):
-        if not self.current_raw_path:
+        path = self.current_raw_path
+        if not path:
             return
 
         reply = QMessageBox.question(
             self,
             tr("delete_image"),
-            tr("confirm_delete", filename=os.path.basename(self.current_raw_path)),
+            tr("confirm_delete", filename=os.path.basename(path)),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
 
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                import send2trash
+        try:
+            import send2trash
 
-                send2trash.send2trash(os.path.normpath(self.current_raw_path))
-                if self.current_raw_path in self.marked_files:
-                    self.marked_files.remove(self.current_raw_path)
-                if self.current_raw_path in self.file_params_cache:
-                    del self.file_params_cache[self.current_raw_path]
-                if self.current_raw_path in self.file_baseline_params_cache:
-                    del self.file_baseline_params_cache[self.current_raw_path]
+            send2trash.send2trash(os.path.normpath(path))
+        except Exception as e:
+            # The user confirmed a move to the recycle bin. Never fall back to
+            # a permanent delete; report the failure and keep the file.
+            logger.warning(f"Moving {path} to the recycle bin failed: {e}")
+            InfoBar.error(tr("delete_failed"), str(e), parent=self)
+            return
 
-                current_row = self.gallery_list.currentRow()
-                item = self.gallery_items_by_path.pop(self.current_raw_path, None)
-                if item is not None:
-                    row = self.gallery_list.row(item)
-                    if row >= 0:
-                        self.gallery_list.takeItem(row)
+        self._forget_deleted_image(path)
+        InfoBar.success(tr("delete_image"), tr("delete_image"), parent=self)
 
-                if self.gallery_list.count() > 0:
-                    if current_row >= self.gallery_list.count():
-                        current_row = self.gallery_list.count() - 1
-                    self.gallery_list.setCurrentRow(current_row)
-                else:
-                    self.current_raw_path = None
-                    self.preview_lbl.setText(tr("no_image_selected"))
-                    self.update_window_title()
-                InfoBar.success(tr("delete_image"), tr("delete_image"), parent=self)
-            except Exception:
-                try:
-                    os.remove(self.current_raw_path)
-                    if self.current_raw_path in self.marked_files:
-                        self.marked_files.remove(self.current_raw_path)
-                    current_row = self.gallery_list.currentRow()
-                    item = self.gallery_items_by_path.pop(self.current_raw_path, None)
-                    if item is not None:
-                        row = self.gallery_list.row(item)
-                        if row >= 0:
-                            self.gallery_list.takeItem(row)
-                    if self.gallery_list.count() > 0:
-                        if current_row >= self.gallery_list.count():
-                            current_row = self.gallery_list.count() - 1
-                        self.gallery_list.setCurrentRow(current_row)
-                    else:
-                        self.current_raw_path = None
-                        self.preview_lbl.setText(tr("no_image_selected"))
-                        self.update_window_title()
-                    InfoBar.success(tr("delete_image"), tr("delete_image"), parent=self)
-                except Exception as e2:
-                    InfoBar.error(tr("delete_failed"), str(e2), parent=self)
+    def _forget_deleted_image(self, path):
+        self.marked_files.discard(path)
+        self.file_params_cache.pop(path, None)
+        self.file_baseline_params_cache.pop(path, None)
+
+        current_row = self.gallery_list.currentRow()
+        # Removing the row moves the gallery selection; clear the current path
+        # first so the change handler does not persist a sidecar next to the
+        # file that was just deleted.
+        self.current_raw_path = None
+        item = self.gallery_items_by_path.pop(path, None)
+        if item is not None:
+            row = self.gallery_list.row(item)
+            if row >= 0:
+                self.gallery_list.takeItem(row)
+
+        if self.gallery_list.count() > 0:
+            self.gallery_list.setCurrentRow(min(current_row, self.gallery_list.count() - 1))
+        else:
+            self.preview_lbl.setText(tr("no_image_selected"))
+            self.update_window_title()
 
     def show_original(self):
         img_to_show = self.baseline if self.baseline.uint8_data is not None else self.original

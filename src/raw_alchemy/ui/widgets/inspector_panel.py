@@ -3,6 +3,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy, QFileDialog
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent
+from loguru import logger
 from qfluentwidgets import (
     ScrollArea, SimpleCardWidget, StrongBodyLabel, BodyLabel, 
     SwitchButton, ComboBox, Slider, LineEdit, ToolButton, 
@@ -45,7 +46,10 @@ class InspectorPanel(ScrollArea):
         
         # 保存的基准参数
         self.saved_baseline_params = None
-        
+        # Recorded LUT that lives outside the current LUT folder (shown as an
+        # extra combo entry so it is neither lost nor silently replaced).
+        self._external_lut_path = None
+
         # 保存各模式的EV值
         self.manual_ev_value = 0.0  # 手动模式的EV
         self.auto_ev_value = 0.0    # 自动模式计算的EV（只读）
@@ -67,7 +71,10 @@ class InspectorPanel(ScrollArea):
         self._update_display_mode_switch_text()
         
         display_mode_layout.addWidget(self.display_mode_switch)
-        self.scope_source_label = BodyLabel("Scopes: full")
+        # Internal detail (proxy vs full-resolution statistics): a tooltip on
+        # the scopes rather than a label in the panel.
+        self.scope_source_label = BodyLabel("")
+        self.scope_source_label.hide()
         display_mode_layout.addWidget(self.scope_source_label)
         
         self.add_section(tr('histogram_waveform'), display_mode_card)
@@ -180,7 +187,7 @@ class InspectorPanel(ScrollArea):
         lut_layout = QHBoxLayout()
         self.lut_combo = ComboBox()
         self.lut_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.lut_combo.addItem(tr('none'))
+        self.lut_combo.addItem(tr('lut_none'))
         self.lut_combo.currentTextChanged.connect(self._on_param_change)
         
         self.lut_btn = ToolButton(FIF.FOLDER)
@@ -414,18 +421,7 @@ class InspectorPanel(ScrollArea):
             display_text = self.log_space_reverse_map.get(params['log_space'], tr('none'))
             self.log_combo.setCurrentText(display_text)
         
-        # LUT (Path reconstruction logic needed if we only store path)
-        # Assuming lut_path is full path
-        if 'lut_path' in params and params['lut_path']:
-            lut_name = os.path.basename(params['lut_path'])
-            idx = self.lut_combo.findText(lut_name)
-            if idx >= 0:
-                self.lut_combo.setCurrentIndex(idx)
-            else:
-                 # Maybe LUT folder changed? For now set to None or handle gracefully
-                 pass
-        else:
-            self.lut_combo.setCurrentIndex(0)
+        self._set_lut_from_params(params.get('lut_path'))
         
         # Lens Correction
         if 'lens_correct' in params:
@@ -516,10 +512,79 @@ class InspectorPanel(ScrollArea):
                 main_window.last_lut_folder_path = folder
             self.refresh_lut_list()
 
+    def _set_lut_from_params(self, lut_path):
+        """Select the recorded LUT without ever keeping the previous image's.
+
+        A LUT in the current folder is selected by name. A recorded LUT from
+        another folder that still exists is shown as an extra entry and keeps
+        its full path; a missing one falls back to "none".
+        """
+        if self._external_lut_path is not None:
+            idx = self.lut_combo.findText(os.path.basename(self._external_lut_path))
+            if idx > 0:
+                self.lut_combo.removeItem(idx)
+            self._external_lut_path = None
+
+        if not lut_path:
+            self.lut_combo.setCurrentIndex(0)
+            return
+        lut_name = os.path.basename(lut_path)
+        idx = self.lut_combo.findText(lut_name)
+        if idx >= 0:
+            self.lut_combo.setCurrentIndex(idx)
+        elif os.path.isfile(lut_path):
+            self._external_lut_path = lut_path
+            self.lut_combo.addItem(lut_name)
+            self.lut_combo.setCurrentIndex(self.lut_combo.count() - 1)
+        else:
+            logger.warning(f"Recorded LUT not found, showing none: {lut_path}")
+            self.lut_combo.setCurrentIndex(0)
+
+    def _current_lut_path(self):
+        name = self.lut_combo.currentText()
+        if self.lut_combo.currentIndex() <= 0:
+            return None
+        if self._external_lut_path and name == os.path.basename(self._external_lut_path):
+            return self._external_lut_path
+        return os.path.join(self.lut_folder, name) if self.lut_folder else None
+
+    def default_params(self):
+        """Parameters of an image that has never been edited.
+
+        Used as the base when settings are pasted onto an image with no
+        settings of its own, so no value leaks in from the image on screen.
+        """
+        params = {
+            'exposure_mode': 'Auto',
+            'metering_mode': 'matrix',
+            'exposure': 0.0,
+            'log_space': 'None',
+            'lut_path': None,
+            'lens_correct': True,
+            'custom_db_path': None,
+            'rotation': 0,
+            'flip_horizontal': False,
+            'flip_vertical': False,
+            'crop': (0.0, 0.0, 1.0, 1.0),
+            'perspective_corners': None,
+            'denoise_enabled': False,
+            'denoise_strength': 0.25,
+            'sharpen_strength': 0.0,
+        }
+        for key, (_slider, _scale, default, _name) in self.sliders.items():
+            params[key] = default
+        return params
+
+    def set_saved_baseline(self, params):
+        """Point the revert / reset-to-baseline controls at one image's baseline."""
+        self.saved_baseline_params = params.copy() if params else None
+        self.reset_baseline_btn.setEnabled(self.saved_baseline_params is not None)
+
     def refresh_lut_list(self):
         if not self.lut_folder: return
+        self._external_lut_path = None
         self.lut_combo.clear()
-        self.lut_combo.addItem(tr('none'))
+        self.lut_combo.addItem(tr('lut_none'))
         files = sorted([f for f in os.listdir(self.lut_folder) if f.lower().endswith('.cube')])
         self.lut_combo.addItems(files)
     
@@ -599,6 +664,9 @@ class InspectorPanel(ScrollArea):
     def update_scope_source(self, source_name):
         source_name = "proxy" if source_name == "proxy" else "full"
         self.scope_source_label.setText(f"Scopes: {source_name}")
+        tip = tr('scopes_from_proxy') if source_name == "proxy" else tr('scopes_from_full')
+        self.hist_widget.setToolTip(tip)
+        self.waveform_widget.setToolTip(tip)
 
     def shutdown_scope_workers(self):
         self.hist_widget.shutdown_worker()
@@ -730,7 +798,7 @@ class InspectorPanel(ScrollArea):
             'exposure': self.exp_slider.value() / 10.0,
             
             'log_space': self.log_space_map.get(self.log_combo.currentText(), 'None'),
-            'lut_path': os.path.join(self.lut_folder, self.lut_combo.currentText()) if self.lut_folder and self.lut_combo.currentText() != tr('none') else None,
+            'lut_path': self._current_lut_path(),
             
             'lens_correct': self.lens_correct_switch.isChecked(),
             'custom_db_path': self.db_path_edit.text() if self.db_path_edit.text() else None,

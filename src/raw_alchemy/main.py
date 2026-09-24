@@ -40,6 +40,13 @@ def main():
     os.environ["QT_SCALE_FACTOR"] = "1"
 
     app = QApplication(sys.argv)
+    # Configure the file log for the GUI process (worker/decode processes do
+    # it on import). Without this import the GUI process only logged to
+    # stderr, which a windowed build does not have.
+    import raw_alchemy.logger  # noqa: F401
+    # Route unhandled exceptions and native faults into the log file too.
+    from raw_alchemy.crash_handler import install_crash_handler
+    install_crash_handler()
     app_font = app.font()
     if app_font.pointSize() <= 0:
         app_font.setPointSize(9)

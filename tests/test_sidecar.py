@@ -114,6 +114,9 @@ class _DummyRightPanel:
     def set_params(self, params):
         self.applied_params = params.copy()
 
+    def set_saved_baseline(self, params):
+        self.saved_baseline = params
+
 
 class _DummyGalleryList:
     def row(self, _item):

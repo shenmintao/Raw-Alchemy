@@ -51,11 +51,34 @@ in vec2 TexCoord;
 out vec4 FragColor;
 
 uniform sampler2D u_texture;
+uniform float u_lod_bias;
 
 void main() {
-    FragColor = texture(u_texture, TexCoord);
+    FragColor = texture(u_texture, TexCoord, u_lod_bias);
 }
 """
+
+# Minification picks a mip level half a step finer than trilinear's default:
+# the box-filtered mip chain alone renders the fit view visibly soft.
+BASE_LOD_BIAS = -0.5
+# From 2 screen pixels per image pixel on, magnify with nearest-neighbour so
+# pixel peeping shows actual pixels instead of a bilinear blur.
+NEAREST_FROM_PIXELS_PER_TEXEL = 2.0
+
+_GL_TEXTURE_FREE_MEMORY_ATI = 0x87FC
+_GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX = 0x9049
+
+
+def hundred_percent_zoom(source_w, source_h, view_w, view_h, device_pixel_ratio):
+    """Zoom factor (1.0 = fit) at which one image pixel is one device pixel."""
+    dpr = max(float(device_pixel_ratio), 1e-6)
+    return max(source_w / (view_w * dpr), source_h / (view_h * dpr))
+
+
+def mag_filter_for(pixels_per_texel):
+    if pixels_per_texel >= NEAREST_FROM_PIXELS_PER_TEXEL:
+        return GL.GL_NEAREST
+    return GL.GL_LINEAR
 
 
 class ImageViewportGL(QOpenGLWidget):
@@ -130,10 +153,39 @@ class ImageViewportGL(QOpenGLWidget):
         self._clear_base_texture_pending = False
         self._clear_roi_texture_pending = False
 
+        # GPU limits read in initializeGL; they gate the native base map.
+        self.max_texture_size = 0
+        self.free_vram_mb = None  # None = driver does not report it
+
+    def _query_gpu_limits(self):
+        self.max_texture_size = int(GL.glGetIntegerv(GL.GL_MAX_TEXTURE_SIZE))
+        self.free_vram_mb = None
+        for enum in (
+            _GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX,
+            _GL_TEXTURE_FREE_MEMORY_ATI,
+        ):
+            # Explicit 4-int buffer: PyOpenGL does not know these vendor enums
+            # and would size its output for one value, but the ATI query
+            # writes four (a heap overrun that surfaced as a crash on exit).
+            value = np.zeros(4, dtype=np.int32)
+            try:
+                GL.glGetIntegerv(enum, value)
+            except Exception:
+                GL.glGetError()  # clear GL_INVALID_ENUM from an absent extension
+                continue
+            if value[0] > 0:
+                self.free_vram_mb = int(value[0]) // 1024  # both report KB
+                break
+        logger.debug(
+            f"[ViewportGL] max texture {self.max_texture_size}px, "
+            f"free VRAM {self.free_vram_mb} MB"
+        )
+
     def initializeGL(self):
         """Set up OpenGL state, shaders, buffers."""
         GL.glClearColor(0.12, 0.12, 0.12, 1.0)
         GL.glDisable(GL.GL_DEPTH_TEST)
+        self._query_gpu_limits()
 
         # --- Compile shaders ---
         self._shader_program = QOpenGLShaderProgram(self)
@@ -292,6 +344,7 @@ class ImageViewportGL(QOpenGLWidget):
                 self._texture_id,
                 scale_x, scale_y,
                 self._offset_x, self._offset_y,
+                tex_width=self._img_width, lod_bias=BASE_LOD_BIAS,
             )
 
         # ROI overlay quad: the same unit quad, positioned over the ROI's
@@ -307,25 +360,36 @@ class ImageViewportGL(QOpenGLWidget):
                 self._roi_texture_id,
                 roi_scale_x, roi_scale_y,
                 roi_offset_x, roi_offset_y,
+                tex_width=self._roi_img_width, lod_bias=0.0,
             )
 
         self._shader_program.release()
         if self._pbo_trim_pending:
             self._release_pbo_storage()
 
-    def _draw_quad(self, texture_id, scale_x, scale_y, offset_x, offset_y):
+    def _draw_quad(self, texture_id, scale_x, scale_y, offset_x, offset_y,
+                   *, tex_width, lod_bias):
         """Draw the unit quad with the given texture and NDC placement."""
         # Set uniforms via raw GL calls (PySide6 setUniformValue doesn't support str+float)
         scale_loc = self._shader_program.uniformLocation("u_scale")
         offset_loc = self._shader_program.uniformLocation("u_offset")
         tex_loc = self._shader_program.uniformLocation("u_texture")
+        bias_loc = self._shader_program.uniformLocation("u_lod_bias")
 
         GL.glUniform2f(scale_loc, scale_x, scale_y)
         GL.glUniform2f(offset_loc, offset_x, offset_y)
+        GL.glUniform1f(bias_loc, lod_bias)
 
         GL.glActiveTexture(GL.GL_TEXTURE0)
         GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
         GL.glUniform1i(tex_loc, 0)
+        # The quad spans 2*scale_x of NDC, i.e. scale_x * viewport device px.
+        if tex_width > 0:
+            view_px = self.width() * self.devicePixelRatioF()
+            GL.glTexParameteri(
+                GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER,
+                mag_filter_for(scale_x * view_px / tex_width),
+            )
 
         GL.glBindVertexArray(self._vao)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
@@ -587,14 +651,16 @@ class ImageViewportGL(QOpenGLWidget):
         self.zoom_changed.emit(self._zoom)
 
     def zoom_to_100(self):
-        """Zoom to 100% (1 image pixel = 1 screen pixel)."""
+        """Zoom to 100% (1 image pixel = 1 device pixel, also on HiDPI)."""
         source_w = self._source_width if self._source_width > 0 else self._img_width
         source_h = self._source_height if self._source_height > 0 else self._img_height
         if source_w > 0 and source_h > 0:
             vp_w, vp_h = self.width(), self.height()
             if vp_w <= 0 or vp_h <= 0:
                 return
-            self._zoom = max(source_w / vp_w, source_h / vp_h)
+            self._zoom = hundred_percent_zoom(
+                source_w, source_h, vp_w, vp_h, self.devicePixelRatioF()
+            )
             self._offset_x = 0.0
             self._offset_y = 0.0
             self.update()

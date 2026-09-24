@@ -75,6 +75,114 @@ def _resolve_lib(directory: Path, pattern: str) -> Optional[str]:
     return os.path.basename(matches[0]) if matches else None
 
 
+# Display-adapter device class; each numbered subkey is one installed adapter.
+_DISPLAY_CLASS_KEY = (
+    r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+)
+_NVIDIA_MARKERS = ('nvidia', 'geforce', 'quadro', 'rtx', 'gtx')
+
+
+def _windows_gpu_names_from_registry() -> list:
+    import winreg
+
+    names = []
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _DISPLAY_CLASS_KEY) as device_class:
+        index = 0
+        while True:
+            try:
+                subkey = winreg.EnumKey(device_class, index)
+            except OSError:
+                break
+            index += 1
+            if not subkey.isdigit():
+                continue  # "Configuration" / "Properties" are not adapters
+            try:
+                with winreg.OpenKey(device_class, subkey) as adapter:
+                    name, _ = winreg.QueryValueEx(adapter, "DriverDesc")
+            except OSError:
+                continue
+            name = str(name).strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _windows_gpu_names_from_wmic() -> list:
+    import subprocess
+
+    # CREATE_NO_WINDOW prevents a console popup in the PyInstaller build.
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    output = subprocess.check_output(
+        ['wmic', 'path', 'win32_VideoController', 'get', 'name'],
+        text=True, stderr=subprocess.DEVNULL, timeout=5,
+        startupinfo=startupinfo,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    return [
+        line.strip() for line in output.strip().split('\n')
+        if line.strip() and line.strip() != 'Name'
+    ]
+
+
+def _windows_gpu_names() -> list:
+    """Installed display adapter names.
+
+    The registry read is instant and works everywhere; WMIC is only a
+    fallback because Windows 11 24H2+ no longer ships it.
+    """
+    for source in (_windows_gpu_names_from_registry, _windows_gpu_names_from_wmic):
+        try:
+            names = source()
+        except Exception as e:
+            logger.debug(f"GPU detection via {source.__name__} failed: {e}")
+            continue
+        if names:
+            return names
+    return []
+
+
+def _classify_gpu_names(names, result: dict) -> None:
+    """Fill vendor/name, preferring NVIDIA (dual-GPU laptops), then AMD, Intel."""
+    lowered = [(name, name.lower()) for name in names]
+    for name, lower in lowered:
+        if any(marker in lower for marker in _NVIDIA_MARKERS):
+            result.update(vendor='nvidia', cuda_compatible=True, name=name)
+            return
+    for vendor, markers in (('amd', ('amd', 'radeon')), ('intel', ('intel',))):
+        for name, lower in lowered:
+            if any(marker in lower for marker in markers):
+                result.update(vendor=vendor, name=name)
+                return
+    if names:
+        result['name'] = names[0]
+
+
+def cuda_provider_bundled() -> Optional[bool]:
+    """Whether the installed onnxruntime ships the CUDA execution provider.
+
+    DirectML/CPU builds cannot use a downloaded CUDA runtime, so the ~1 GB
+    download must not be offered there. Returns None when the layout cannot
+    be inspected, so callers keep the old behaviour instead of guessing.
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("onnxruntime")
+    except Exception:
+        return None
+    if spec is None:
+        return False
+    capi_dirs = [
+        Path(base) / "capi" for base in (spec.submodule_search_locations or [])
+    ]
+    capi_dirs = [d for d in capi_dirs if d.is_dir()]
+    if not capi_dirs:
+        return None
+    return any(any(d.glob("*onnxruntime_providers_cuda*")) for d in capi_dirs)
+
+
 def detect_gpu_vendor() -> dict:
     """
     Detect the GPU vendor on the system.
@@ -93,54 +201,11 @@ def detect_gpu_vendor() -> dict:
     }
     
     if system == 'Windows':
-        try:
-            import subprocess
-            # Use WMIC to get GPU info
-            # Use CREATE_NO_WINDOW flag to prevent console popup in PyInstaller
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            
-            output = subprocess.check_output(
-                ['wmic', 'path', 'win32_VideoController', 'get', 'name'],
-                text=True, stderr=subprocess.DEVNULL, timeout=5,
-                startupinfo=startupinfo,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            lines = [l.strip() for l in output.strip().split('\n') if l.strip() and l.strip() != 'Name']
-            
-            # Check ALL GPUs, prioritize NVIDIA for laptops with dual graphics
-            all_gpus = []
-            for gpu_name in lines:
-                gpu_lower = gpu_name.lower()
-                if 'nvidia' in gpu_lower or 'geforce' in gpu_lower or 'quadro' in gpu_lower or 'rtx' in gpu_lower or 'gtx' in gpu_lower:
-                    # Found NVIDIA, use it immediately
-                    result['vendor'] = 'nvidia'
-                    result['cuda_compatible'] = True
-                    result['name'] = gpu_name
-                    break
-                all_gpus.append(gpu_name)
-            else:
-                # No NVIDIA found, check other vendors
-                if all_gpus:
-                    gpu_name = all_gpus[0]
-                    result['name'] = gpu_name
-                    gpu_lower = gpu_name.lower()
-                    if 'amd' in gpu_lower or 'radeon' in gpu_lower:
-                        result['vendor'] = 'amd'
-                    elif 'intel' in gpu_lower:
-                        result['vendor'] = 'intel'
-        except Exception as e:
-            logger.debug(f"Failed to detect GPU via WMIC: {e}")
-            # Fallback: try to check if nvidia-smi exists
-            try:
-                nvidia_smi = shutil.which('nvidia-smi')
-                if nvidia_smi:
-                    result['vendor'] = 'nvidia'
-                    result['cuda_compatible'] = True
-                    result['name'] = 'NVIDIA GPU (detected via nvidia-smi)'
-            except Exception:
-                pass
+        _classify_gpu_names(_windows_gpu_names(), result)
+        if result['vendor'] == 'unknown' and shutil.which('nvidia-smi'):
+            result['vendor'] = 'nvidia'
+            result['cuda_compatible'] = True
+            result['name'] = 'NVIDIA GPU (detected via nvidia-smi)'
     
     elif system == 'Linux':
         try:

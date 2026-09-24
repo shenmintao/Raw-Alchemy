@@ -102,6 +102,13 @@ LENSFUN_DB_CACHE_ENTRIES = 4
 QUALITY_BASE_MAX_SIDE = 4096
 QUALITY_BASE_MAX_PIXELS = 16_000_000
 
+# Native base (Settings, on by default): the idle refine keeps the full frame
+# so zoom and pan are pure texture sampling. There is no pixel cap; the frame
+# only has to fit the GPU texture limit, free VRAM (when the driver reports
+# it) and free RAM. Measured on a 42MP DNG: refine 2.8 s in the background,
+# ~0.4 GB more RSS, one ~37 ms texture upload; 1:1 then costs 0 s instead of
+# ~0.4 s per zoom or pan step.
+
 # One large PBO upload is released after presentation instead of pinning its
 # high-water allocation for the rest of the session.
 PBO_RETAIN_LIMIT_MB = 64

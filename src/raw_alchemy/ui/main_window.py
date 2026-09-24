@@ -5,11 +5,13 @@ import time
 from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QListWidget, QFrame, QSplitter, QSizePolicy, QTreeView,
+    QAbstractItemView, QAbstractSlider, QAbstractSpinBox, QLineEdit,
+    QPlainTextEdit, QStyleFactory, QTextEdit,
 )
 from PySide6.QtWidgets import QFileSystemModel as _QFileSystemModel
 from PySide6.QtCore import QDir
 from PySide6.QtCore import Qt, QSize, QTimer, QEvent, QRect
-from PySide6.QtGui import QIcon, QPixmap, QImage
+from PySide6.QtGui import QIcon, QImage
 
 from qfluentwidgets import (
     FluentWindow, SubtitleLabel, PrimaryPushButton,
@@ -27,6 +29,7 @@ from loguru import logger
 from raw_alchemy.ui.image_state import ImageState
 from raw_alchemy.workers.image_processor import ImageProcessor
 from raw_alchemy.pipeline.ops import _as_hashable
+from raw_alchemy.ui.widgets.gallery_list import GalleryListWidget, boxed_icon
 from raw_alchemy.ui.widgets.inspector_panel import InspectorPanel
 from raw_alchemy.ui.widgets.title_bar import CenteredFluentTitleBar
 from raw_alchemy.ui.widgets.crop_rotate_viewer import CropRotateViewer
@@ -38,10 +41,29 @@ from raw_alchemy.ui.widgets.settings_panel import SettingsPanel
 from raw_alchemy.ui.edit_modes import EditModesMixin
 from raw_alchemy.ui.export_controller import ExportControllerMixin
 from raw_alchemy.ui.library_controller import LibraryControllerMixin
+from raw_alchemy.ui.settings_clipboard import SettingsClipboardMixin
 from PySide6.QtWidgets import QStackedWidget
 
 
-class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, FluentWindow):
+# Thin dark scrollbars for the library views: with a per-widget stylesheet Qt
+# drew the native scrollbar groove as a hatched pattern.
+_SCROLLBAR_STYLE = """
+    QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
+    QScrollBar:horizontal { background: transparent; height: 8px; margin: 0; }
+    QScrollBar::handle:vertical {
+        background: rgba(255, 255, 255, 0.22); border-radius: 4px; min-height: 28px;
+    }
+    QScrollBar::handle:horizontal {
+        background: rgba(255, 255, 255, 0.22); border-radius: 4px; min-width: 28px;
+    }
+    QScrollBar::handle:hover { background: rgba(255, 255, 255, 0.38); }
+    QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+    QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+"""
+
+
+class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
+                 SettingsClipboardMixin, FluentWindow):
     def __init__(self):
         # Initialize image states BEFORE super().__init__() to avoid resizeEvent issues
         # FluentWindow.__init__ may trigger resizeEvent during initialization
@@ -91,6 +113,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self._preload_lensfun_database()
         
         self.create_ui()
+        self._init_settings_clipboard()
         self.create_settings_interface()
         self.create_help_interface()
         self.create_about_interface()
@@ -252,6 +275,16 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         if hasattr(self, 'settings_widget'):
             self.settings_widget.set_thumb_cache_enabled(self.thumb_cache_enabled)
 
+        self.native_base_enabled = bool(settings.get('native_base', True))
+        if hasattr(self, 'settings_widget'):
+            self.settings_widget.set_native_base_enabled(self.native_base_enabled)
+
+        library_width = settings.get('library_width')
+        if isinstance(library_width, int) and library_width >= 260:
+            sizes = self.main_splitter.sizes()
+            rest = max(400, sum(sizes) - library_width - sizes[2])
+            self.main_splitter.setSizes([library_width, rest, sizes[2]])
+
     def restore_ui(self):
         """Restore UI state from saved settings"""
         if self.last_lut_folder_path and os.path.exists(self.last_lut_folder_path):
@@ -320,6 +353,8 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             'write_sidecar': self.write_sidecar_enabled,
             'cache_limit_mb': int(getattr(self, 'cache_limit_mb', config.CACHE_LIMIT_MB)),
             'thumb_cache': bool(getattr(self, 'thumb_cache_enabled', True)),
+            'native_base': bool(getattr(self, 'native_base_enabled', True)),
+            'library_width': int(self.left_panel.width()),
         }
         i18n.save_app_settings(settings)
 
@@ -341,9 +376,10 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         except Exception:
             pass
         
-        # 1. Left Panel (Folder Tree + Gallery): Bridge-style browser
+        # 1. Left Panel (Folder Tree + Gallery): Bridge-style browser.
+        # Resizable through main_splitter; the gallery adds columns as it grows.
         self.left_panel = QWidget()
-        self.left_panel.setFixedWidth(400)
+        self.left_panel.setMinimumWidth(260)
         self.left_panel.setStyleSheet("background-color: transparent;")
         self.left_layout = QVBoxLayout(self.left_panel)
         self.left_layout.setContentsMargins(5, 10, 5, 10)
@@ -363,6 +399,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.folder_model.directoryLoaded.connect(self._on_directory_loaded)
 
         self.folder_tree = QTreeView()
+        # Fusion instead of the platform style: Qt's Windows 11 style draws
+        # its selection accent bar once per indentation level (a row of blue
+        # dashes left of the selected folder). Colours come from the sheet.
+        self._folder_tree_style = QStyleFactory.create("Fusion")
+        if self._folder_tree_style is not None:
+            self.folder_tree.setStyle(self._folder_tree_style)
         self.folder_tree.setModel(self.folder_model)
         self.folder_tree.setRootIndex(self.folder_model.index(""))
         # Only show the Name column
@@ -378,6 +420,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
                 border: none;
                 outline: none;
                 color: white;
+                show-decoration-selected: 0;
             }
             QTreeView::item {
                 padding: 4px 2px;
@@ -391,15 +434,13 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             QTreeView::branch {
                 background-color: transparent;
             }
-        """)
+            QTreeView::branch:selected {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+        """ + _SCROLLBAR_STYLE)
 
         # --- Gallery Thumbnail Grid ---
-        self.gallery_list = QListWidget()
-        self.gallery_list.setIconSize(QSize(130, 100))
-        self.gallery_list.setGridSize(QSize(160, 140))
-        self.gallery_list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.gallery_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.gallery_list.setSpacing(10)
+        self.gallery_list = GalleryListWidget()
         self.gallery_list.setDragEnabled(False)
         self.gallery_list.setAcceptDrops(False)
         self.gallery_list.setDropIndicatorShown(False)
@@ -426,7 +467,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             QListWidget::item:hover {
                 background-color: rgba(255, 255, 255, 0.05);
             }
-        """)
+        """ + _SCROLLBAR_STYLE)
 
         self.open_btn = PrimaryPushButton(FIF.FOLDER, tr('open_folder'))
         self.open_btn.clicked.connect(self.browse_folder)
@@ -526,6 +567,8 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.toolbar_layout.addStretch()
         self.toolbar_layout.addWidget(self.btn_mark)
         self.toolbar_layout.addWidget(self.btn_delete)
+        for button in self._create_settings_clipboard_buttons():
+            self.toolbar_layout.addWidget(button)
         self.toolbar_layout.addStretch()
         self.toolbar_layout.addWidget(self.btn_compare)
         self.toolbar_layout.addWidget(self.export_progress)
@@ -565,9 +608,21 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.right_panel.enter_perspective_mode.connect(self.enter_perspective_mode)
         self.right_panel.save_baseline_btn.clicked.connect(self.save_baseline_image)
 
-        self.h_layout.addWidget(self.left_panel)
-        self.h_layout.addWidget(self.center_panel, 1)
-        self.h_layout.addWidget(self.right_panel)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(6)
+        self.main_splitter.setStyleSheet(
+            "QSplitter::handle { background-color: transparent; }"
+            "QSplitter::handle:hover { background-color: rgba(255,255,255,0.08); }"
+        )
+        self.main_splitter.addWidget(self.left_panel)
+        self.main_splitter.addWidget(self.center_panel)
+        self.main_splitter.addWidget(self.right_panel)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.main_splitter.setSizes([400, 1100, 360])
+        self.h_layout.addWidget(self.main_splitter)
         
         self.addSubInterface(self.main_widget, FIF.PHOTO, tr('editor'))
         setTheme(Theme.DARK)
@@ -592,6 +647,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         self.settings_widget.thumb_cache_clear_requested.connect(
             self.on_thumb_cache_clear_requested
         )
+        self.settings_widget.native_base_changed.connect(self.on_native_base_changed)
         self.addSubInterface(self.settings_widget, FIF.SETTING, tr('settings'))
 
     def on_cache_limit_changed(self, limit_mb):
@@ -603,6 +659,12 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
         behavior: every folder visit re-extracts thumbnails."""
         self.thumb_cache_enabled = bool(enabled)
         self.thumb_cache.set_enabled(self.thumb_cache_enabled)
+
+    def on_native_base_changed(self, enabled):
+        """Toggle the native-resolution base map; re-render so it applies."""
+        self.native_base_enabled = bool(enabled)
+        if self.current_raw_path and self.processor_connection_mode == 'normal':
+            self.trigger_processing()
 
     def on_thumb_cache_clear_requested(self):
         removed = self.thumb_cache.clear()
@@ -693,10 +755,43 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             return
         self.on_gallery_item_clicked(current)
 
+    # Widgets that consume every key themselves (typing, value entry).
+    _KEY_OWNING_EDITORS = (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit)
+
+    def _library_shortcuts_active(self, obj, key):
+        """Whether a window-wide library shortcut may handle this key.
+
+        The filter is installed application-wide, so without these guards
+        Delete/T/Space typed into a text field deleted or marked the image,
+        arrows could not nudge a slider, and arrows in crop mode switched the
+        image underneath the crop being edited.
+        """
+        if not self.main_widget.isVisible():
+            return False  # Settings / Help / About page is showing
+        if (
+            getattr(self, 'processor_connection_mode', 'normal') != 'normal'
+            or self.center_stack.currentWidget() is not self.page_preview
+        ):
+            return False  # crop/perspective editing owns the current image
+        if isinstance(obj, self._KEY_OWNING_EDITORS):
+            return False
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right) and (
+            isinstance(obj, QAbstractSlider)
+            or (isinstance(obj, QAbstractItemView) and obj is not self.gallery_list)
+        ):
+            return False  # sliders and the folder tree keep their arrow keys
+        return True
+
     def eventFilter(self, obj, event):
-        if isinstance(obj, QWidget) and obj.window() == self:
-            if event.type() == QEvent.Type.KeyPress:
-                key = event.key()
+        event_type = event.type()
+        if (
+            event_type in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+            and isinstance(obj, QWidget)
+            and obj.window() == self
+            and self._library_shortcuts_active(obj, event.key())
+        ):
+            key = event.key()
+            if event_type == QEvent.Type.KeyPress:
                 if key == Qt.Key.Key_Left:
                     self.prev_image()
                     return True
@@ -713,11 +808,10 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
                 elif key == Qt.Key.Key_T:
                     self.toggle_mark()
                     return True
-            elif event.type() == QEvent.Type.KeyRelease:
-                if event.key() == Qt.Key.Key_Space:
-                    if not event.isAutoRepeat():
-                        self.show_processed()
-                    return True
+            elif key == Qt.Key.Key_Space:
+                if not event.isAutoRepeat():
+                    self.show_processed()
+                return True
         return super().eventFilter(obj, event)
 
     def on_param_changed(self, params):
@@ -808,6 +902,10 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
             params['device_pixel_ratio'] = float(self.viewport.devicePixelRatioF())
         except Exception:
             params['device_pixel_ratio'] = 1.0
+        # Native base map gate (worker decides against these GPU limits).
+        params['native_base'] = bool(getattr(self, 'native_base_enabled', True))
+        params['max_texture_size'] = int(getattr(self.viewport, 'max_texture_size', 0))
+        params['free_vram_mb'] = getattr(self.viewport, 'free_vram_mb', None)
         if include_visible_rect:
             # Lets the worker do zoom>fit ROI rendering (T7.5). Excluded for
             # baseline renders, which must always be full-frame.
@@ -919,7 +1017,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin, 
                 scaled = img.scaledToHeight(
                     300, Qt.TransformationMode.FastTransformation
                 )
-                item.setIcon(QIcon(QPixmap.fromImage(scaled)))
+                item.setIcon(boxed_icon(scaled))
                 rect = self.gallery_list.visualItemRect(item)
                 self.gallery_list.viewport().update(rect)
 
