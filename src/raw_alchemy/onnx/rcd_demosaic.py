@@ -39,6 +39,7 @@ from .migraphx_precision import RCD_MODEL_FILE as MIGRAPHX_MODEL_FILE, RCD_TILE
 
 MODEL_FILE = "rcd_demosaic_dyn2.onnx"
 TILE = 1536   # even (CFA phase), single compiled shape
+COREML_TILE = 768
 OVERLAP = 24  # even; > border(4) + neighbourhood influence (~8px)
 
 _sessions: dict = {}
@@ -47,13 +48,14 @@ _session_provider = None
 _session_token = None
 
 
-def model_file_for_providers(providers):
+def model_file_for_providers(providers, *, tile=None):
     first = providers[0] if providers else None
     first = first[0] if isinstance(first, tuple) else first
-    return MIGRAPHX_MODEL_FILE if first == "MIGraphXExecutionProvider" and TILE == RCD_TILE else MODEL_FILE
+    tile = TILE if tile is None else tile
+    return MIGRAPHX_MODEL_FILE if first == "MIGraphXExecutionProvider" and tile == RCD_TILE else MODEL_FILE
 
 
-def _get_session():
+def _get_session(tile=None):
     global _session_provider, _cpu_fallback, _session_token
     check_cancelled()
     token = configuration_token("rcd")
@@ -62,11 +64,17 @@ def _get_session():
             _sessions.clear()
             _cpu_fallback = False
     _session_token = token
-    sess = _sessions.get(TILE)
+    if tile is not None and tile in _sessions:
+        return _sessions[tile]
+    preferred = ["CPUExecutionProvider"] if _cpu_fallback else demosaic_providers(_get_providers())
+    first = preferred[0][0] if isinstance(preferred[0], tuple) else preferred[0]
+    if tile is None:
+        tile = min(TILE, COREML_TILE) if first == "CoreMLExecutionProvider" else TILE
+    sess = _sessions.get(tile)
     if sess is not None:
         return sess
     with _session_lock:
-        sess = _sessions.get(TILE)
+        sess = _sessions.get(tile)
         if sess is not None:
             return sess
         import onnxruntime as ort
@@ -76,25 +84,25 @@ def _get_session():
         # still gives CUDA/DirectML one fixed compiled tile graph.
         def session_options():
             so = _make_session_options(ort)
-            so.add_free_dimension_override_by_name("h", TILE)
-            so.add_free_dimension_override_by_name("w", TILE)
+            so.add_free_dimension_override_by_name("h", tile)
+            so.add_free_dimension_override_by_name("w", tile)
             return so
 
         if _cpu_fallback:
             providers = ["CPUExecutionProvider"]
         else:
-            providers = demosaic_providers(_get_providers())
+            providers = preferred
         # The AMD asset has fixed Gather indices; never run it at another tile size.
         first = providers[0][0] if isinstance(providers[0], tuple) else providers[0]
-        if first == "MIGraphXExecutionProvider" and TILE != RCD_TILE:
+        if first == "MIGraphXExecutionProvider" and tile != RCD_TILE:
             providers = ["CPUExecutionProvider"]
-        model_path = _find_model(model_file_for_providers(providers))
+        model_path = _find_model(model_file_for_providers(providers, tile=tile))
         configured = _configure_providers(
-            providers, model_path, variant=f"rcd:h={TILE},w={TILE}"
+            providers, model_path, variant=f"rcd:h={tile},w={tile}"
         )
         so = session_options()
         try:
-            sess = construct_session(ort, model_path, so, configured, variant=f"rcd:h={TILE},w={TILE}")
+            sess = construct_session(ort, model_path, so, configured, variant=f"rcd:h={tile},w={tile}")
         except (PipelineAborted, MemoryError):
             raise
         except Exception as exc:
@@ -112,13 +120,14 @@ def _get_session():
             # Do not recurse/clear_session(): we already hold the session lock.
             sess = construct_session(
                 ort, _find_model(MODEL_FILE), session_options(), ["CPUExecutionProvider"],
-                variant=f"rcd:h={TILE},w={TILE}",
+                variant=f"rcd:h={tile},w={tile}",
             )
             _cpu_fallback = True
             _sessions.clear()  # Drop accelerated sessions for other tile sizes.
-        _sessions[TILE] = sess
+        sess._rawalchemy_tile = tile
+        _sessions[tile] = sess
         _session_provider = sess.get_providers()[0]
-        logger.info(f"RCD demosaic session (tile {TILE}): preferred EP {_session_provider} (not placement)")
+        logger.info(f"RCD demosaic session (tile {tile}): preferred EP {_session_provider} (not placement)")
     return sess
 
 
@@ -152,7 +161,8 @@ def _run_tile(session, patch: np.ndarray, m2: np.ndarray,
     # If an earlier tile fell back from GPU to CPU, do not keep invoking the
     # stale failed session for every later tile.
     checkpoint()
-    session = _get_session()
+    tile = patch.shape[0]
+    session = _get_session(tile)
     feeds = {
         "bayer": np.ascontiguousarray(patch, dtype=np.float32),
         "mr2": m2[0], "mg2": m2[1], "mb2": m2[2],
@@ -173,7 +183,7 @@ def _run_tile(session, patch: np.ndarray, m2: np.ndarray,
             f"({type(e).__name__}: {str(e)[:80]}); rebuilding on CPU EP")
         _cpu_fallback = True
         clear_session()
-        return _get_session().run(None, feeds)[0]
+        return _get_session(tile).run(None, feeds)[0]
 
 
 def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray,
@@ -196,6 +206,7 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray,
     t0 = time.time()
     checkpoint()
     session = _get_session()
+    tile = getattr(session, "_rawalchemy_tile", TILE)
     m2 = _phase_masks(np.asarray(cfa_pattern))
     # 输出端在图内折叠 WB 增益 + 相机矩阵 + clip(省 42MP 的 CPU einsum);
     # 缺省恒等 = 纯去马赛克(数值同旧图 + clip[0,1])
@@ -204,8 +215,8 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray,
     cam_mat = (np.eye(3, dtype=np.float32) if cam_mat is None
                else np.ascontiguousarray(cam_mat, np.float32))
 
-    if H <= TILE and W <= TILE:
-        ph, pw = TILE - H, TILE - W
+    if H <= tile and W <= tile:
+        ph, pw = tile - H, tile - W
         patch = (np.pad(bayer, ((0, ph), (0, pw)), mode="reflect")
                  if (ph or pw) else bayer)
         rgb = _run_tile(session, patch, m2, wb3, cam_mat)[:H, :W]
@@ -216,7 +227,7 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray,
             rgb[iy0:iy1, ix0:ix1] = out[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0]
 
         rgb = np.zeros((H, W, 3), np.float32)
-        step = TILE - 2 * OVERLAP
+        step = tile - 2 * OVERLAP
         # Each tile's interior is copied out on a helper thread while the
         # next tile runs (ORT and numpy copies both release the GIL); run
         # serially, the copies were ~20% of the demosaic. One copy in flight
@@ -225,15 +236,15 @@ def rcd_demosaic(bayer: np.ndarray, cfa_pattern: np.ndarray,
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="rcd-copy") as pool:
             for y in range(0, H, step):
                 for x in range(0, W, step):
-                    y0 = max(0, min(y - OVERLAP, H - TILE))
-                    x0 = max(0, min(x - OVERLAP, W - TILE))
+                    y0 = max(0, min(y - OVERLAP, H - tile))
+                    x0 = max(0, min(x - OVERLAP, W - tile))
                     y0 -= y0 % 2  # keep CFA phase
                     x0 -= x0 % 2
-                    y1, x1 = min(H, y0 + TILE), min(W, x0 + TILE)
+                    y1, x1 = min(H, y0 + tile), min(W, x0 + tile)
                     patch = bayer[y0:y1, x0:x1]
                     th, tw = patch.shape
-                    if th < TILE or tw < TILE:
-                        patch = np.pad(patch, ((0, TILE - th), (0, TILE - tw)),
+                    if th < tile or tw < tile:
+                        patch = np.pad(patch, ((0, tile - th), (0, tile - tw)),
                                        mode="reflect")
                     out = _run_tile(session, patch, m2, wb3, cam_mat)
                     if pending is not None:

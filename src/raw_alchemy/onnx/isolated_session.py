@@ -73,6 +73,8 @@ def _serve(connection, model, options, providers):
         from raw_alchemy.onnx.denoiser import _setup_cuda_paths
         _setup_cuda_paths()
         import onnxruntime as ort
+        from .session_policy import configure_native_runtime
+        configure_native_runtime(ort)
         so = ort.SessionOptions()
         for key, value in options["fields"].items():
             setattr(so, key, value)

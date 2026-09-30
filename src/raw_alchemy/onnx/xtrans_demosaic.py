@@ -38,6 +38,7 @@ MODEL_FILE = "xtrans_markesteijn_dyn.onnx"
 COREML_MODEL_FILE = "xtrans_markesteijn_coreml.onnx"
 MIGRAPHX_MODEL_FILE = "xtrans_markesteijn_migraphx.onnx"
 TILE = 1560  # multiple of 6
+COREML_TILE = 780  # smaller mixed CPU/CoreML working set, same overlap/math
 OVERLAP = 24  # multiple of 6, > max neighbourhood influence (12px) + border (8px)
 
 CANONICAL_PATTERN = np.array([
@@ -109,7 +110,7 @@ def model_file_for_providers(providers):
             "MIGraphXExecutionProvider": MIGRAPHX_MODEL_FILE}.get(name, MODEL_FILE)
 
 
-def _get_session():
+def _get_session(tile=None):
     global _session_provider, _masks, _cpu_fallback, _session_token
     check_cancelled()
     token = configuration_token("xtrans")
@@ -118,32 +119,38 @@ def _get_session():
             _sessions.clear()
             _cpu_fallback = False
     _session_token = token
-    session = _sessions.get(TILE)
+    if tile is not None and tile in _sessions:
+        return _sessions[tile]
+    preferred = ["CPUExecutionProvider"] if _cpu_fallback else demosaic_providers(_get_providers())
+    first = preferred[0][0] if isinstance(preferred[0], tuple) else preferred[0]
+    if tile is None:
+        tile = min(TILE, COREML_TILE) if first == "CoreMLExecutionProvider" else TILE
+    session = _sessions.get(tile)
     if session is not None:
         return session
     with _session_lock:
-        session = _sessions.get(TILE)
+        session = _sessions.get(tile)
         if session is not None:
             return session
         import onnxruntime as ort
 
         def session_options():
             so = _make_session_options(ort)
-            so.add_free_dimension_override_by_name("h", TILE)
-            so.add_free_dimension_override_by_name("w", TILE)
+            so.add_free_dimension_override_by_name("h", tile)
+            so.add_free_dimension_override_by_name("w", tile)
             return so
 
         if _cpu_fallback:
             providers = ["CPUExecutionProvider"]
         else:
-            providers = demosaic_providers(_get_providers())
+            providers = preferred
         model_path = _find_model(model_file_for_providers(providers))
         configured = _configure_providers(
-            providers, model_path, variant=f"xtrans:h={TILE},w={TILE}"
+            providers, model_path, variant=f"xtrans:h={tile},w={tile}"
         )
         so = session_options()
         try:
-            session = construct_session(ort, model_path, so, configured, variant=f"xtrans:h={TILE},w={TILE}")
+            session = construct_session(ort, model_path, so, configured, variant=f"xtrans:h={tile},w={tile}")
         except (PipelineAborted, MemoryError):
             raise
         except Exception as exc:
@@ -160,14 +167,15 @@ def _get_session():
             # Construct directly: this non-reentrant lock is already held.
             session = construct_session(
                 ort, _find_model(MODEL_FILE), session_options(), ["CPUExecutionProvider"],
-                variant=f"xtrans:h={TILE},w={TILE}",
+                variant=f"xtrans:h={tile},w={tile}",
             )
             _cpu_fallback = True
             _sessions.clear()
-        _sessions[TILE] = session
+        session._rawalchemy_tile = tile
+        _sessions[tile] = session
         _session_provider = session.get_providers()[0]
         _masks = _build_masks(CANONICAL_PATTERN)
-        logger.info(f"X-Trans demosaic session (tile {TILE}): preferred EP {_session_provider} (not placement)")
+        logger.info(f"X-Trans demosaic session (tile {tile}): preferred EP {_session_provider} (not placement)")
     return session
 
 
@@ -189,7 +197,8 @@ def _run_graph(session, feeds):
     # Always adopt the current session instead of retrying a stale GPU object
     # for every remaining tile.
     checkpoint()
-    session = _get_session()
+    tile = feeds["raw"].shape[0]
+    session = _get_session(tile)
     try:
         return session.run(None, feeds)[0]
     except (PipelineAborted, MemoryError):
@@ -202,7 +211,7 @@ def _run_graph(session, feeds):
             f"({type(e).__name__}: {str(e)[:80]}); rebuilding on CPU EP")
         _cpu_fallback = True
         clear_session()
-        return _get_session().run(None, feeds)[0]
+        return _get_session(tile).run(None, feeds)[0]
 
 
 def _canonical_roll(pattern: np.ndarray):
@@ -265,26 +274,27 @@ def xtrans_markesteijn_demosaic(raw_norm: np.ndarray, xtrans_pattern: np.ndarray
 
 def _demosaic_tiled(session, raw: np.ndarray) -> np.ndarray:
     H, W = raw.shape
-    if H <= TILE and W <= TILE:
-        ph, pw = TILE - H, TILE - W
+    tile = getattr(session, "_rawalchemy_tile", TILE)
+    if H <= tile and W <= tile:
+        ph, pw = tile - H, tile - W
         patch = np.pad(raw, ((0, ph), (0, pw)), mode="reflect") if (ph or pw) else raw
         rgb = _run_graph(session, {"raw": patch, "masks": _masks})
         return rgb[:H, :W]
 
     out = np.zeros((H, W, 3), np.float32)
-    step = TILE - 2 * OVERLAP
+    step = tile - 2 * OVERLAP
     for y in range(0, H, step):
         for x in range(0, W, step):
-            y0 = max(0, min(y - OVERLAP, H - TILE))
-            x0 = max(0, min(x - OVERLAP, W - TILE))
+            y0 = max(0, min(y - OVERLAP, H - tile))
+            x0 = max(0, min(x - OVERLAP, W - tile))
             # keep the tile origin on the 6px CFA grid
             y0 -= y0 % 6
             x0 -= x0 % 6
-            y1, x1 = min(H, y0 + TILE), min(W, x0 + TILE)
+            y1, x1 = min(H, y0 + tile), min(W, x0 + tile)
             patch = raw[y0:y1, x0:x1]
             th, tw = patch.shape
-            if th < TILE or tw < TILE:
-                patch = np.pad(patch, ((0, TILE - th), (0, TILE - tw)), mode="reflect")
+            if th < tile or tw < tile:
+                patch = np.pad(patch, ((0, tile - th), (0, tile - tw)), mode="reflect")
             rgb = _run_graph(session, {"raw": np.ascontiguousarray(patch), "masks": _masks})
             iy0, ix0 = y, x
             iy1, ix1 = min(H, y + step), min(W, x + step)

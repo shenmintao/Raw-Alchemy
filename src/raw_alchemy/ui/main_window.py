@@ -108,6 +108,8 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
         self._param_interaction_active = False
         self._last_param_leading_time = 0.0
         self._last_param_submit_key = None
+        self._denoise_ui_key = None
+        self._denoise_settle_deadline = 0.0
         
         # Preload lensfun database in the background.
         self._preload_lensfun_database()
@@ -158,7 +160,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
         # Proxy processing and prefix-cache reuse support a tighter cadence;
         # avoid adding 150ms of input latency before work even begins.
         self.update_timer.setInterval(80)
-        self.update_timer.timeout.connect(self.trigger_processing)
+        self.update_timer.timeout.connect(self._trigger_param_processing)
 
         self._preload_neighbors_args = None
         self._preload_neighbors_timer = QTimer()
@@ -815,6 +817,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
         return super().eventFilter(obj, event)
 
     def on_param_changed(self, params):
+        self._note_denoise_change(params)
         if self.current_raw_path:
             self.file_params_cache[self.current_raw_path] = params.copy()
             self._schedule_current_sidecar_write()
@@ -823,7 +826,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
             if now - self._last_param_leading_time >= 0.08:
                 self.update_timer.stop()
                 self._last_param_leading_time = now
-                self.trigger_processing()
+                self._trigger_param_processing()
             else:
                 self.update_timer.start()
         else:
@@ -837,13 +840,70 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
     def _on_param_interaction_finished(self, params):
         self._param_interaction_active = False
         self.update_timer.stop()
+        if self._denoise_settle_deadline:
+            self._note_denoise_change(params)
         if self.current_raw_path:
             self.file_params_cache[self.current_raw_path] = params.copy()
             self._schedule_current_sidecar_write()
         # Submit the exact release value unless that same parameter set was
         # already handed to the worker by the leading/throttled path.
-        if self._last_param_submit_key != _as_hashable(params):
-            self.trigger_processing()
+        if (self._last_param_submit_key != _as_hashable(params)
+                or self._denoise_settle_deadline):
+            self._trigger_param_processing()
+
+    def _note_denoise_change(self, params):
+        """Wait for 200ms of stable input before requesting a new denoise."""
+        signature = ImageProcessor._denoise_signature(params)
+        key = (self.current_raw_path, signature)
+        if signature is False:
+            self._denoise_settle_deadline = 0.0
+        elif (key != self._denoise_ui_key or self._denoise_settle_deadline):
+            cached = self.processor.preview_denoise_strength(self.current_raw_path)
+            self._denoise_settle_deadline = (
+                time.monotonic() + 0.2 if cached != signature else 0.0
+            )
+        self._denoise_ui_key = key
+
+    def _denoise_settle_remaining(self):
+        if (self._denoise_settle_deadline
+                and self._denoise_ui_key[0] == self.current_raw_path):
+            if self._param_interaction_active:
+                return 0.2
+            return max(0.0, self._denoise_settle_deadline - time.monotonic())
+        return 0.0
+
+    def _interactive_params(self):
+        """Keep colour previews fast while a new noise strength settles."""
+        params = self.right_panel.get_params()
+        remaining = self._denoise_settle_remaining()
+        if remaining:
+            params = params.copy()
+            cached = self.processor.preview_denoise_strength(self.current_raw_path)
+            params['denoise_enabled'] = cached is not None
+            params['denoise_strength'] = cached if cached is not None else 0.25
+        return params, remaining
+
+    def _trigger_param_processing(self):
+        """Keep one slider render in flight, then submit the latest values.
+
+        Submitting every 80ms killed the isolated GPU session whenever a
+        frame took longer than that, so dragging repeatedly reinitialized
+        CoreML and could show no intermediate frames. Leave the current
+        request valid for presentation while coalescing newer slider values.
+        Image/view changes still use the ordinary preemptive request path.
+        """
+        if not self.current_raw_path:
+            return
+        params, remaining = self._interactive_params()
+        if self._last_param_submit_key == _as_hashable(params):
+            if remaining:
+                self.update_timer.start(max(1, math.ceil(remaining * 1000)))
+            return
+        if self.processor.has_interactive_request():
+            self.update_timer.start(16)
+            return
+        self.update_timer.setInterval(80)
+        self.trigger_processing()
 
     def _kick_zoom_update(self):
         """去抖加前沿(T7.9):一轮交互的第一次事件立即出活,后续事件照旧
@@ -915,13 +975,24 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
         return params
 
     def _get_preview_params(self):
-        return self._add_preview_output_params(self.right_panel.get_params())
+        return self._add_preview_output_params(self._interactive_params()[0])
     
     def trigger_processing(self):
         if not self.current_raw_path: return
-        params = self._get_preview_params()
-        self._last_param_submit_key = _as_hashable(self.right_panel.get_params())
+        desired = self.right_panel.get_params()
+        key = (self.current_raw_path, ImageProcessor._denoise_signature(desired))
+        if key != self._denoise_ui_key:
+            self._note_denoise_change(desired)
+        interactive, remaining = self._interactive_params()
+        params = self._add_preview_output_params(interactive)
+        params['_denoise_target'] = ImageProcessor._denoise_signature(desired)
+        params['_denoise_deferred'] = bool(remaining)
+        self._last_param_submit_key = _as_hashable(interactive)
+        if not remaining:
+            self._denoise_settle_deadline = 0.0
         self.current_request_id = self.processor.update_preview(self.current_raw_path, params)
+        if remaining:
+            self.update_timer.start(max(1, math.ceil(remaining * 1000)))
     
     def save_baseline_image(self):
         if not self.current_raw_path: return
@@ -981,7 +1052,8 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
             return
 
         # Close denoise/processing progress dialog
-        if self.denoise_progress_dialog:
+        if (self.denoise_progress_dialog
+                and not self.processor.background_denoise_pending()):
             self.denoise_progress_dialog.setContent(tr('done'))
             self.denoise_progress_dialog.setState(True)
             self.denoise_progress_dialog = None
@@ -1100,8 +1172,7 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
     
     def _trigger_processing_for_path(self, path):
         if path != self.current_raw_path: return
-        params = self._get_preview_params()
-        self.current_request_id = self.processor.update_preview(path, params)
+        self.trigger_processing()
 
     def on_error(self, msg):
         self.preview_lbl.setText(f"{tr('error')}: {msg}")

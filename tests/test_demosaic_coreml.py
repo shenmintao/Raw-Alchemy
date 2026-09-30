@@ -93,7 +93,7 @@ def test_native_coreml_compiles_and_matches_cpu(sensor, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("mode,affected,cpu", [
-    ("auto", True, True), ("auto", False, True),
+    ("auto", True, False), ("auto", False, True),
     ("cpu", True, True), ("cpu", False, True),
     ("mlprogram", True, False), ("mlprogram", False, False),
     ("invalid", True, True), ("invalid", False, True),
@@ -102,7 +102,7 @@ def test_measured_regression_policy(monkeypatch, mode, affected, cpu):
     from raw_alchemy.onnx import demosaic_coreml
 
     monkeypatch.setenv("RAWALCHEMY_COREML_DEMOSAIC", mode)
-    monkeypatch.setattr(demosaic_coreml, "_measured_slow_runtime", lambda: affected)
+    monkeypatch.setattr(demosaic_coreml, "_eligible_runtime", lambda: affected)
     selected = demosaic_coreml.demosaic_providers([
         "CoreMLExecutionProvider", "CPUExecutionProvider"
     ])
@@ -124,19 +124,23 @@ def test_policy_does_not_touch_other_backends(monkeypatch, providers):
     def unexpected_runtime_probe():
         pytest.fail("Non-CoreML backends must not probe Apple runtime")
 
-    monkeypatch.setattr(demosaic_coreml, "_measured_slow_runtime", unexpected_runtime_probe)
+    monkeypatch.setattr(demosaic_coreml, "_eligible_runtime", unexpected_runtime_probe)
     assert demosaic_coreml.demosaic_providers(providers) == providers
 
 
 @pytest.mark.parametrize("system,machine,mac,version,affected", [
     ("Darwin", "arm64", "27.0", "1.29.0", True),
-    ("Darwin", "arm64", "26.0", "1.29.0", False),
-    ("Darwin", "arm64", "27.0", "1.28.0", False),
+    ("Darwin", "arm64", "26.0", "1.29.0", True),
+    ("Darwin", "arm64", "27.0", "1.28.0", True),
+    ("Darwin", "arm64", "27.0", "1.30.0", True),
+    ("Darwin", "arm64", "12.0", "1.20.0", True),
+    ("Darwin", "arm64", "11.0", "1.30.0", False),
+    ("Darwin", "arm64", "27.0", "1.19.0", False),
     ("Darwin", "x86_64", "27.0", "1.29.0", False),
     ("Windows", "AMD64", "", "1.29.0", False),
     ("Linux", "aarch64", "", "1.29.0", False),
 ])
-def test_runtime_guard_uses_shared_measured_matrix(
+def test_runtime_guard_uses_shared_capability_floor(
     monkeypatch, system, machine, mac, version, affected
 ):
     import onnxruntime as ort
@@ -146,7 +150,7 @@ def test_runtime_guard_uses_shared_measured_matrix(
     monkeypatch.setattr(session_policy.platform, "machine", lambda: machine)
     monkeypatch.setattr(session_policy.platform, "mac_ver", lambda: (mac, (), ""))
     monkeypatch.setattr(ort, "__version__", version)
-    assert demosaic_coreml._measured_slow_runtime() is affected
+    assert demosaic_coreml._eligible_runtime() is affected
 
 
 @pytest.mark.parametrize("mode,measured,coreml", [
@@ -157,7 +161,7 @@ def test_xtrans_precision_policy(monkeypatch, mode, measured, coreml):
     from raw_alchemy.onnx import demosaic_coreml
 
     monkeypatch.setenv("RAWALCHEMY_COREML_DEMOSAIC", mode)
-    monkeypatch.setattr(demosaic_coreml, "_measured_slow_runtime", lambda: measured)
+    monkeypatch.setattr(demosaic_coreml, "_eligible_runtime", lambda: measured)
     providers = demosaic_coreml.xtrans_providers([
         "CoreMLExecutionProvider", "CPUExecutionProvider",
     ])

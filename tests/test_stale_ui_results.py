@@ -49,6 +49,7 @@ def test_edit_mode_accepts_its_own_request_id(mode):
         processor_connection_mode=mode, denoise_progress_dialog=progress,
         on_crop_ready=lambda *args: routed.append(("crop", args)),
         on_perspective_ready=lambda *args: routed.append(("perspective", args)),
+        processor=SimpleNamespace(background_denoise_pending=lambda: False),
     )
     image = object()
     MainWindow.on_process_result(

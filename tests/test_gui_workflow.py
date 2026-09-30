@@ -348,6 +348,9 @@ class _ParamTimer(_FakeTimer):
     def start(self):
         self.started += 1
 
+    def setInterval(self, _interval):
+        pass
+
 
 def test_slider_interaction_has_leading_preview_and_exact_release(monkeypatch):
     from raw_alchemy.pipeline.ops import _as_hashable
@@ -361,9 +364,13 @@ def test_slider_interaction_has_leading_preview_and_exact_release(monkeypatch):
             self._param_interaction_active = False
             self._last_param_leading_time = 0.0
             self._last_param_submit_key = None
+            self._denoise_settle_deadline = 0.0
             self.current_params = None
             self.triggered = []
             self.sidecar_writes = 0
+            from types import SimpleNamespace
+            self.right_panel = SimpleNamespace(get_params=lambda: self.current_params)
+            self.processor = SimpleNamespace(has_interactive_request=lambda: False)
 
         def _schedule_current_sidecar_write(self):
             self.sidecar_writes += 1
@@ -371,6 +378,15 @@ def test_slider_interaction_has_leading_preview_and_exact_release(monkeypatch):
         def trigger_processing(self):
             self._last_param_submit_key = _as_hashable(self.current_params)
             self.triggered.append(self.current_params.copy())
+
+        def _trigger_param_processing(self):
+            main_window.MainWindow._trigger_param_processing(self)
+
+        def _interactive_params(self):
+            return self.current_params.copy(), 0.0
+
+        def _note_denoise_change(self, params):
+            main_window.MainWindow._note_denoise_change(self, params)
 
     harness = Harness()
     times = iter((1.0, 1.02))

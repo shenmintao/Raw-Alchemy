@@ -12,16 +12,27 @@ first-compile timing, or a guarantee for other Apple devices.
 | Stage | Apple default | Other backends |
 | --- | --- | --- |
 | Bundled `fastdenoise_v4_512_fp16.onnx` RGB denoise | CoreML `ModelFormat=MLProgram`, `MLComputeUnits=ALL` on native arm64 macOS 12+ / ORT 1.20+; CPU on ineligible Apple configurations | Existing CUDA/ROCm/DirectML/CPU ordering and provider options |
-| Fused grade | CPU ORT on the diagnosed software generation: Apple Silicon, macOS 27, ORT 1.29; existing selection elsewhere | Existing selection |
+| Fused grade | MLProgram + CPUAndGPU on native arm64 macOS 12+ / ORT 1.20+; fixed 1024×3072 pixel tiles, or 512×1536 for LUT/Log graphs | Existing selection and 6MP strips |
 | CANS packed RAW denoise | Existing selection; not covered by the RGB model benchmark | Existing selection |
-| RCD demosaic | CPU; explicit MLProgram diagnostics remain available | CUDA/DirectML unchanged; MIGraphX uses its Gather-mask variant at tile 1536 on validated Linux x86-64 ORT 1.23.2 / ROCm 7.2.0; CPU elsewhere |
-| X-Trans demosaic | Repaired MLProgram + ALL on measured Apple Silicon macOS 27 / ORT 1.29; CPU elsewhere unless explicitly selected | CUDA/DirectML unchanged; MIGraphX uses its precision variant on validated Linux x86-64 ORT 1.23.2 / ROCm 7.2.0; CPU elsewhere |
+| RCD demosaic | MLProgram + ALL, 768px tiles, on native arm64 macOS 12+ / ORT 1.20+ | CUDA/DirectML unchanged; MIGraphX uses its Gather-mask variant at tile 1536 on validated Linux x86-64 ORT 1.23.2 / ROCm 7.2.0; CPU elsewhere |
+| X-Trans demosaic | Repaired MLProgram + ALL, 780px tiles, on native arm64 macOS 12+ / ORT 1.20+ | CUDA/DirectML unchanged; MIGraphX uses its precision variant on validated Linux x86-64 ORT 1.23.2 / ROCm 7.2.0; CPU elsewhere |
 
-The grade CPU decision keeps the fused ONNX graph: it does **not** disable grade
-or switch to the older per-operation NumPy path. Only one Apple machine was
-measured; the version gate deliberately avoids asserting a speed regression on
-unmeasured macOS/ORT generations. Capability eligibility does not guarantee a
-speedup across all Apple Silicon hardware. DirectML options and CUDA memory limits/workspace controls are unchanged.
+The September 30 policy removes the exact macOS/ORT release gates for Apple
+grade and demosaic. Auto-selection uses provider availability and the minimum
+API capabilities above; accelerated construction/inference failures recover on
+CPU. Merely installing ORT does not add a GPU execution provider. The installed
+Mac application already includes ORT (1.30.0 on the tested machine).
+
+Grade's fixed tiles reuse one compiled shape across image sizes and ROIs. This
+is valid because the grade graphs have no spatial operators; final padding is
+discarded. LUT graphs use smaller tiles to bound Gather intermediates. Demosaic
+retains its original 24px overlap and CFA alignment. CPU fallback retains the
+shape of the active invocation, including fixed grade tiles.
+
+See [the September 30 decode and performance report](decoding-performance-2026-09-30.md)
+for actual M4/ORT 1.30 measurements and precision checks. Capability eligibility
+does not guarantee a speedup across all Apple Silicon hardware. DirectML options
+and CUDA memory limits/workspace controls are unchanged.
 Linux now recognizes the modern MIGraphX EP after CUDA and before legacy ROCM.
 Bundled FastDenoise passed native MIGraphX acceptance; demosaic is guarded separately.
 
@@ -36,12 +47,12 @@ policy, because its graph has not received the same performance validation.
   capability checks or force CoreML on non-Apple systems. This applies to bundled
   RGB FastDenoise, not the packed RAW CANS denoiser.
 - `RAWALCHEMY_COREML_GRADE=auto|cpu|coreml` (default `auto`). `coreml` permits
-  explicit comparison on the affected Apple configuration. It does not force
+  explicit comparison with the same capability floor as auto. It does not force
   CoreML in place of a selected CUDA/DirectML/ROCm provider.
 - Invalid Apple override values fail closed to CPU and emit a warning.
-- `RAWALCHEMY_COREML_DEMOSAIC=auto|cpu|mlprogram` (default `auto`). Auto and
-  CPU select by stage: auto enables repaired X-Trans on the measured runtime;
-  cpu always selects CPU. RCD auto stays CPU. MLProgram uses static shapes,
+- `RAWALCHEMY_COREML_DEMOSAIC=auto|cpu|mlprogram` (default `auto`). Auto enables
+  repaired RCD and X-Trans on capable Apple runtimes; cpu always selects CPU.
+  `mlprogram` remains an explicit diagnostic selection. MLProgram uses static shapes,
   ALL compute units and full-precision GPU accumulation. X-Trans uses the
   prebuilt precision model, leaving the original model for CPU/CUDA/DirectML.
 - `RAWALCHEMY_MIGRAPHX_DEMOSAIC=auto|cpu|gpu` (default `auto`). Auto and cpu
@@ -72,9 +83,14 @@ known-failing accelerator repeatedly.
   platform, ORT, provider availability, live controls and thread/memory settings;
 - `provider_identity(providers)` — stable ordered provider identity including all
   options;
+- `configure_native_runtime(ort)` — disable telemetry before session creation;
 - `create_session(ort, model_path, options_factory, providers, *, variant)` —
   constructor and inference exception recovery to a freshly configured CPU
   session. Dimension overrides and thread limits are retained by the factory.
+
+The ONNX package also disables telemetry immediately on runtime import, avoiding
+the ORT 1.30/macOS HTTP telemetry shutdown race reproduced in a frozen child.
+Provider selection, numerical precision and ORT profiling remain enabled.
 
 Compilation cache names include the model plus external-weight contents,
 platform/ORT/policy identity and provider options. Different formats, compute
@@ -98,9 +114,11 @@ unknown. ORT profiling is required to attribute nodes/partitions to an EP.
 
 ## Native session isolation
 
-Production ONNX sessions (CoreML, CUDA, DirectML, ROCm and CPU) now use spawned
-processes by default; RAW decode has its own bounded lifetime. CPU retry retains
-this boundary. Cancellation and memory-budget failures do not trigger fallback.
+Production ONNX sessions (CoreML, CUDA, DirectML, ROCm and CPU) use spawned
+processes by default, except bounded CPU-only fused grade, which runs on the
+existing processing thread to avoid preview IPC copies. A grade CPU retry uses
+that same exception; other CPU retries retain the process boundary. RAW decode
+has its own bounded lifetime. Cancellation and memory-budget failures do not trigger fallback.
 See [runtime ownership](runtime-architecture.md) for controls, cooperative scheduling,
 memory accounting, IPC constraints, and the operations outside this boundary.
 
@@ -150,7 +168,17 @@ RAWALCHEMY_TEST_XTRANS_RAW=/path/to/sample.RAF \
 PYTHONPATH=src python -m pytest -s -q tests/test_demosaic_backend_native.py
 ```
 
-For CoreML use CoreMLExecutionProvider and select -k xtrans. For FastDenoise,
+For CoreML use CoreMLExecutionProvider; both Bayer and X-Trans are accepted.
+Additional Apple grade and Bayer phase/seam checks:
+
+```sh
+RAWALCHEMY_TEST_GRADE_COREML=1 RAWALCHEMY_TEST_RCD_COREML=1 \
+RAWALCHEMY_TEST_BAYER_RAW=/path/to/sample.NEF \
+PYTHONPATH=src python -m pytest -s -q \
+  tests/test_grade_coreml_native.py tests/test_rcd_coreml_native.py
+```
+
+For FastDenoise,
 RAWALCHEMY_TEST_REQUIRED_EP also prevents accepting the wrong accelerator.
 A failed or silently replaced child cannot be counted as a GPU pass. Both
 Linux GPU machines tested here run Ubuntu 24.04 under WSL2 with physical GPUs;

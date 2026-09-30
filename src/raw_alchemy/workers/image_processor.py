@@ -131,11 +131,17 @@ class ImageProcessor(QThread):
     export_completed = Signal(int, bool, str)
     preview_source_changed = Signal(str)
 
-    def __init__(self, *, retain_preview_cache: bool = True, warmup_sessions: bool = True):
+    def __init__(self, *, retain_preview_cache: bool = True, warmup_sessions: bool = True,
+                 background_denoise: bool = True):
         super().__init__()
         self.lock = threading.RLock()
+        self._request_wake = threading.Event()
         self.retain_preview_cache = bool(retain_preview_cache)
         self.warmup_sessions = bool(warmup_sessions)
+        self.background_denoise = bool(background_denoise and retain_preview_cache)
+        self._denoise_task = None
+        self._denoise_failure_key = None
+        self._latest_preview_request = None
 
         # Request management
         self.pending_request: Optional[ProcessRequest] = None
@@ -183,6 +189,7 @@ class ImageProcessor(QThread):
 
         self._should_stop = False
         self._busy = False
+        self._active_request = None
         self._gpu_uint8 = None      # Pre-allocated pooled uint8 output buffer
         # Proxy and full previews each keep their own executor (T7.4), so a
         # zoom across 1.0 or an idle full refine never evicts the other
@@ -212,6 +219,11 @@ class ImageProcessor(QThread):
             self._preload_queue.clear()
             self._export_queue.clear()
             self._full_refine_request = None
+            self._latest_preview_request = None
+            if self._denoise_task is not None:
+                self._denoise_task.cancelled.set()
+
+            self._request_wake.set()
 
     def stop_and_cleanup(self):
         """Synchronous cleanup for non-GUI callers; UI polls before joining."""
@@ -234,8 +246,13 @@ class ImageProcessor(QThread):
             self.current_request_id += 1
             request_id = self.current_request_id
             self._full_refine_request = None
+            self._latest_preview_request = None
+            self._denoise_failure_key = None
+            if self._denoise_task is not None:
+                self._denoise_task.cancelled.set()
             self._last_interaction = time.perf_counter()
             self.pending_request = ProcessRequest(path, {'_load': True}, request_id)
+            self._request_wake.set()
         if not self.isRunning():
             self.start()
         return request_id
@@ -246,6 +263,7 @@ class ImageProcessor(QThread):
                 return
             if not any(p.path == path for p in self._preload_queue):
                 self._preload_queue.append(ProcessRequest(path, {'_preload': True}, -1))
+                self._request_wake.set()
         if not self.isRunning():
             self.start()
 
@@ -258,6 +276,16 @@ class ImageProcessor(QThread):
             self._full_refine_request = None
             self._last_interaction = time.perf_counter()
             self.pending_request = ProcessRequest(path, params, request_id)
+            self._latest_preview_request = self.pending_request
+            if params.get('_denoise_target', self._denoise_signature(params)) is False:
+                self._denoise_failure_key = None
+            task = self._denoise_task
+            if task is not None and (
+                task.path != path
+                or task.strength != params.get('_denoise_target', self._denoise_signature(params))
+            ):
+                task.cancelled.set()
+            self._request_wake.set()
         if not self.isRunning():
             self.start()
         return request_id
@@ -305,13 +333,18 @@ class ImageProcessor(QThread):
 
         # Permanent worker loop 鈥?thread stays alive until app closes
         while not self._should_stop:
+            self._collect_background_denoise()
             # Dequeue and mark busy atomically relative to GUI snapshots.
             with self.lock:
+                self._request_wake.clear()
                 request = self._take_next_request()
                 self._busy = request is not None
+                self._active_request = request
 
             if not request:
-                time.sleep(0.05)
+                # Wake immediately for a slider/load request; the timeout
+                # retains idle refinement and memory-maintenance cadence.
+                self._request_wake.wait(0.05)
                 # 空闲定时卸载(T-VRAM):>120s 无请求则释放全部 ONNX 会话
                 # (RCD/X-Trans/grade/SCUNet)。分块+冻结后重建仅 ~1s,
                 # 换来空闲时显存归零。
@@ -337,6 +370,9 @@ class ImageProcessor(QThread):
                 abort = (lambda: self._should_stop) if '_export' in request.params else self._interactive_abort_requested
                 with cancellation_scope(abort):
                     frame = self.cpu_linear if request.path == self.current_path else None
+                    if (frame is not None and '_load' not in request.params
+                            and self._should_use_proxy_preview(request.params)):
+                        frame = self.cpu_proxy_linear
                     priority = 2 if '_preload' in request.params else 0
                     with governor.job(estimate_job(request.path, frame), priority=priority):
                         self._dispatch_request(request)
@@ -349,9 +385,14 @@ class ImageProcessor(QThread):
             finally:
                 with self.lock:
                     self._busy = False
+                    self._active_request = None
 
         self._export_dispatcher.wake.set()
         self._export_dispatcher.join()
+        if self._denoise_task is not None:
+            self._denoise_task.cancelled.set()
+            self._denoise_task.join()
+            self._denoise_task = None
         # Release pipeline buffers and ONNX sessions before thread shutdown.
         self._release_gpu_buffers()
 
@@ -403,6 +444,12 @@ class ImageProcessor(QThread):
                 return self._export_queue.pop(0)
             if self._preload_queue:
                 return self._preload_queue.pop(0)
+            if (self._denoise_task is not None and not self._denoise_task.ready.is_set()
+                    and not self._denoise_task.cancelled.is_set()):
+                # A native noise result will replace this source shortly.
+                # Avoid building an idle full-size lens/base cache for the
+                # temporary un-denoised/old-strength preview.
+                return None
             if self._full_refine_request is not None and now >= self._full_refine_due:
                 if now - self._last_interaction < FULL_REFINE_IDLE_SECONDS:
                     self._full_refine_due = (
@@ -427,6 +474,100 @@ class ImageProcessor(QThread):
         """
         with self.lock:
             return self.pending_request is not None or self._should_stop
+
+    def has_interactive_request(self) -> bool:
+        """Cheap GUI snapshot for coalescing slider changes during a render.
+
+        A neighbour preload must still be preempted by user interaction.
+        The active request is published atomically with dequeueing.
+        """
+        with self.lock:
+            return self.pending_request is not None or (
+                self._active_request is not None
+                and '_preload' not in self._active_request.params
+                and not self._active_request.params.get('_force_full_preview')
+            )
+
+    def preview_denoise_strength(self, path: str) -> Optional[float]:
+        """Snapshot the reusable denoise strength without copying pixels."""
+        with self.lock:
+            key = self.last_denoise_key
+            if (path == self.current_path and self.cached_denoise_full is not None
+                    and key is not None and key[:2] == (path, 'denoise')):
+                return key[2]
+            return None
+
+    def background_denoise_pending(self) -> bool:
+        with self.lock:
+            return self._denoise_task is not None and not self._denoise_task.published
+
+    def _collect_background_denoise(self):
+        """Publish only on the preview lane, then replay its latest edit/view."""
+        task = self._denoise_task
+        if task is None or not (task.done.is_set() or (task.ready.is_set() and not task.published)):
+            return
+        finished = task.done.is_set()
+        if finished:
+            task.join()
+        token = source_identity(task.path) if not task.cancelled.is_set() else None
+        with self.lock:
+            if finished:
+                self._denoise_task = None
+            latest = self._latest_preview_request
+            valid = (
+                not self._should_stop and not task.cancelled.is_set()
+                and latest is not None and latest.path == task.path
+                and latest.params.get('_denoise_target', self._denoise_signature(latest.params)) == task.strength
+                and self.current_path == task.path and self.cpu_linear is task.source
+                and self._loaded_source_token == token == task.source_token
+                and self._denoise_policy_token == task.policy_token
+            )
+            replay = not task.published or not valid
+            if valid and task.result is not None and not task.published:
+                self.cached_denoise_original = task.source
+                self.cached_denoise_full = task.result
+                self.cached_denoise_proxy = None
+                self.last_denoise_key = (task.path, 'denoise', task.strength)
+                self.last_metering_key = None
+            elif valid and task.error is not None and task.result is None:
+                self._denoise_failure_key = task.key
+                logger.error(f"[Worker] Background denoise failed: {task.error}")
+                self.error_occurred.emit(f"Denoising failed: {task.error}")
+            task.published = True
+            # A replaced strength may now start its one job; pending user
+            # requests always win. Reuse the same id, so the GUI accepts the
+            # refined image without changing the user's parameter snapshot.
+            if replay and latest is not None and self.pending_request is None and not self._should_stop:
+                self.pending_request = latest
+                self._full_refine_request = None
+
+    def _background_denoise_params(self, request):
+        params = request.params.copy()
+        target = params.get('_denoise_target', self._denoise_signature(params))
+        key = (request.path, target, self._loaded_source_token, self._denoise_policy_token)
+        task = self._denoise_task
+        if task is not None and (task.key != key or target is False):
+            task.cancelled.set()
+        if (target is not False and not params.get('_denoise_deferred')
+                and not self._has_current_denoise(dict(params, denoise_enabled=True, denoise_strength=target))
+                and task is None and key != self._denoise_failure_key):
+            from .denoise_task import DenoiseTask
+            task = DenoiseTask(
+                request.path, target, self.cpu_linear, self._loaded_source_token,
+                self._denoise_policy_token, self._decode_variant or 'unknown-preview-decode',
+                denoise=denoise_rgb_linear, started=self.denoise_started.emit,
+                progress=self.denoise_progress.emit, finished=self.denoise_finished.emit,
+                wake=self._request_wake,
+            )
+            with self.lock:
+                if not self._interactive_abort_requested():
+                    self._denoise_task = task
+                    task.start()
+        if target is not False:
+            cached = self.preview_denoise_strength(request.path)
+            params['denoise_enabled'] = cached is not None
+            params['denoise_strength'] = cached if cached is not None else 0.25
+        return params
 
     # =================================================================
     # Loading
@@ -576,6 +717,12 @@ class ImageProcessor(QThread):
 
         # Check CPU cache first
         token = source_identity(path)
+        if path != self.current_path or token != self._loaded_source_token:
+            self._invalidate_pipeline_caches()
+            self.cached_denoise_original = None
+            self.cached_denoise_full = None
+            self.cached_denoise_proxy = None
+            self.last_denoise_key = None
         cached_item = self.cache_manager.get(path)
         if cached_item and cached_item.source_token != token:
             cached_item = None
@@ -1715,7 +1862,9 @@ class ImageProcessor(QThread):
             if self._interactive_abort_requested():
                 raise PipelineAborted('request superseded after load')
 
-            params = request.params.copy()
+            params = (self._background_denoise_params(request)
+                      if self.background_denoise and self.isRunning()
+                      else request.params.copy())
             use_proxy = self._should_use_proxy_preview(params)
             preview_source = 'proxy' if use_proxy else 'full'
             params['_preview_source'] = preview_source

@@ -34,6 +34,17 @@ def test_source_replacement_invalidates_cache(cache_source):
     assert disk.load(cache_source, "stage") is None
 
 
+def test_queued_source_cannot_bind_old_pixels_to_replaced_raw(cache_source):
+    token = identity.source_identity(cache_source)
+    Path(cache_source).write_bytes(b"replaced-before-background-start")
+    with pytest.raises(PipelineAborted, match="before denoising"):
+        artifacts.resolve_denoised_source(
+            cache_source, 0.25, source=np.ones((2, 3, 3), np.float32),
+            expected_source_token=token,
+            denoise=lambda *a, **kw: pytest.fail("stale source reached model"),
+        )
+
+
 @pytest.mark.parametrize("payload", [b"RADC1\n", b"RADC2\n\x02\x00\x00\x00\x03\x00\x00\x00truncated"])
 def test_legacy_or_corrupt_cache_is_never_promoted(cache_source, payload):
     target = disk._cache_dir() / f"{disk._key(cache_source, 'stage')}.radc"

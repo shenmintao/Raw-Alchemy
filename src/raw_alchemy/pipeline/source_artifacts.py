@@ -17,7 +17,8 @@ from .stage_identity import DECODE_CANONICAL, denoise_tag, source_identity
 
 def resolve_denoised_source(raw_path, strength, *, decode=None, denoise=None,
                             source=None, decode_variant=DECODE_CANONICAL,
-                            should_abort=None, progress_callback=None):
+                            should_abort=None, progress_callback=None,
+                            expected_source_token=None, result_callback=None):
     def check():
         check_cancelled()
         if should_abort is not None and should_abort():
@@ -31,6 +32,8 @@ def resolve_denoised_source(raw_path, strength, *, decode=None, denoise=None,
     check()
     t0 = time.perf_counter()
     generation = source_identity(raw_path)
+    if expected_source_token is not None and generation != expected_source_token:
+        raise PipelineAborted("source changed before denoising")
     tag = denoise_tag(strength, decode_variant=decode_variant)
 
     def check_identity():
@@ -43,6 +46,8 @@ def resolve_denoised_source(raw_path, strength, *, decode=None, denoise=None,
     cached = denoise_disk_cache.load(raw_path, tag, source_token=generation) if tag is not None else None
     check_identity()
     if cached is not None:
+        if result_callback is not None:
+            result_callback(cached)
         logger.info(f"[StageTiming] denoise artifact hit {time.perf_counter() - t0:.3f}s")
         return cached
     if source is None:
@@ -59,6 +64,10 @@ def resolve_denoised_source(raw_path, strength, *, decode=None, denoise=None,
     kwargs = {"strength": strength, "progress_callback": progress}
     result = denoise(source, **kwargs)
     check_identity()
+    # A preview can display validated pixels before optional compression.
+    # The result remains immutable while the same bounded job persists it.
+    if result_callback is not None:
+        result_callback(result)
     checkpoint()
     t_denoise = time.perf_counter()
     # Never publish data computed across a source-file replacement.

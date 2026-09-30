@@ -55,7 +55,11 @@ def subtract_black_level(sensor_raw, bl, wl, cfa_pattern, clip_negative=True):
 
 
 def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
-    """Detect and replace hot/dead pixels using per-channel median comparison."""
+    """Optional median-based sensor-defect correction, outside normal decode.
+
+    This heuristic can mistake real fine detail for sensor defects,
+    especially on the six-pixel-spaced X-Trans phase planes.
+    """
     import cv2
     pat_size = cfa_pattern.shape[0]
     # uint16 量化后中值(cv2 直方图法,较 fp32 快 ~5x);
@@ -93,7 +97,7 @@ def fix_hot_pixels(raw_norm, cfa_pattern, threshold=4.0):
 def highlight_inpaint_opposed(raw_data, cfa_pattern, wb):
     """Segmentation-based highlight reconstruction.
 
-    Same semantics as the darktable ``DT_IOP_HIGHLIGHTS_SEGMENTS`` mode:
+    Adapted from darktable's ``DT_IOP_HIGHLIGHTS_SEGMENTS`` approach:
     per-pixel opposing-channel reference average + per-segment chroma
     correction.
 
@@ -390,10 +394,11 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     """Decode RAW to working-space linear float32 (H, W, 3).
 
     Bayer: RawSpeed (or rawpy) raw decode + RCD demosaic on the ONNX runtime
-    (GPU via DirectML/CUDA) — the Taichi port is retired; the ONNX graph is
-    pixel-exact against it.
-    X-Trans / other sensors: libraw demosaic (unit WB, linear), then this
-    app's white balance + cam->working matrix (colour-matched, ~0.16% delta).
+    (GPU via the platform provider). The graph is validated against the
+    retired Taichi port, rather than the complete darktable pipeline.
+    X-Trans: ONNX Markesteijn 1-pass. Other sensors use LibRaw.
+    CFA white balance and cam->working conversion follow demosaicing; this
+    complete pipeline is not pixel-equivalent to darktable's module chain.
     """
     import rawpy
     from raw_alchemy.onnx.denoiser import _apply_flip
@@ -471,7 +476,9 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
         # Keep sub-black noise (see subtract_black_level): clipped here, white
         # balance turned it into magenta night skies.
         raw_norm = subtract_black_level(sensor_raw, bl, wl, cfa_pattern, clip_negative=False)
-        fix_hot_pixels(raw_norm, cfa_pattern)
+        # Defect correction is independent of demosaicing. The median
+        # heuristic erased real petals/leaves and introduced false colour;
+        # keep the measured samples intact in the standard decode path.
         highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
         g = wb[1] if wb[1] > 0 else 1.0
         wb3 = np.array([wb[0] / g, 1.0, wb[2] / g], np.float32)

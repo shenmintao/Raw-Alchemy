@@ -5,17 +5,17 @@ Legacy NeuralNetwork lowering fails on rank-two Slice in the original graphs
 overrides compiles and executes both graphs. Mixed CoreML/CPU runs are not
 necessarily faster. X-Trans uses a precision-preserving graph variant that
 keeps sensitive division on CPU. The measured ALL schedule accelerates the
-repaired X-Trans graph; RCD keeps its CPU default.
+repaired X-Trans graph. Both sensors use smaller CoreML tiles to bound the
+mixed CPU/GPU working set.
 """
 
 import os
 
 
-def _measured_slow_runtime() -> bool:
-    # Share the measured hardware/runtime matrix, not grade's backend mode.
-    from raw_alchemy.onnx.session_policy import affected_apple_grade
+def _eligible_runtime() -> bool:
+    from raw_alchemy.onnx.session_policy import eligible_apple
 
-    return affected_apple_grade()
+    return eligible_apple()
 
 
 def demosaic_providers(providers: list, *, variant="rcd") -> list:
@@ -25,8 +25,8 @@ def demosaic_providers(providers: list, *, variant="rcd") -> list:
     The caller must freeze h/w through ORT SessionOptions. The X-Trans caller selects its prebuilt precision graph; this policy needs
     no Apple-only import. Non-CoreML providers are unchanged.
     RAWALCHEMY_COREML_DEMOSAIC=auto|cpu|mlprogram is startup configuration.
-    auto enables the repaired X-Trans graph on the measured Apple runtime;
-    RCD and unmeasured runtimes keep CPU. Explicit mlprogram permits diagnostics.
+    auto enables repaired MLProgram graphs on capable Apple runtimes;
+    cpu provides an explicit override. Selection is not tied to an ORT release.
     """
     if not providers:
         return []
@@ -41,13 +41,12 @@ def demosaic_providers(providers: list, *, variant="rcd") -> list:
     if first != "CoreMLExecutionProvider":
         return list(providers)
     mode = os.environ.get("RAWALCHEMY_COREML_DEMOSAIC", "auto").strip().lower()
-    # The precision-preserving X-Trans variant uses mixed CPU/CoreML work.
-    # ALL was measured faster after the division repair; keep automatic
-    # selection scoped to that tested runtime, and keep RCD on CPU.
+    # ALL was measured faster after the X-Trans division repair. Capability
+    # checks protect the provider API; constructor/inference recovery handles
+    # an unavailable accelerator without a release-specific allowlist.
     if mode not in {"auto", "cpu", "mlprogram"}:
         mode = "cpu"
-    if mode == "cpu" or (mode == "auto" and not (
-            variant == "xtrans" and _measured_slow_runtime())):
+    if mode == "cpu" or (mode == "auto" and not _eligible_runtime()):
         return ["CPUExecutionProvider"]
     result = []
     for entry in providers:

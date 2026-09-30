@@ -19,7 +19,6 @@ def test_native_xtrans_real_frame_strict_precision(monkeypatch):
     ort = pytest.importorskip("onnxruntime")
     assert "CoreMLExecutionProvider" in ort.get_available_providers()
     from raw_alchemy.core import (
-        fix_hot_pixels,
         highlight_inpaint_opposed,
         subtract_black_level,
     )
@@ -52,7 +51,6 @@ def test_native_xtrans_real_frame_strict_precision(monkeypatch):
             np.array(frame.black_level_per_channel, np.float32),
             float(frame.white_level), pattern,
         )
-        fix_hot_pixels(raw, pattern)
         highlight_inpaint_opposed(
             raw, pattern, np.array(frame.camera_whitebalance, np.float32),
         )

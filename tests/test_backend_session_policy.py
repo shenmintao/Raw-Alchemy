@@ -53,14 +53,61 @@ def test_denoise_cpu_and_invalid_override(monkeypatch, value):
 
 def test_grade_cpu_is_scoped_and_overridable(monkeypatch):
     apple(monkeypatch)
+    selected = policy.stage_providers([COREML, CPU], "grade")
+    assert selected[0][0] == COREML
+    assert selected[0][1]["ModelFormat"] == "MLProgram"
+    assert selected[0][1]["MLComputeUnits"] == "CPUAndGPU"
+    assert selected[0][1]["RequireStaticInputShapes"] == "1"
+    monkeypatch.setenv("RAWALCHEMY_COREML_GRADE", "cpu")
     assert policy.stage_providers([COREML, CPU], "grade") == [CPU]
     monkeypatch.setenv("RAWALCHEMY_COREML_GRADE", "coreml")
-    assert policy.stage_providers([COREML, CPU], "grade") == [COREML, CPU]
+    assert policy.stage_providers([COREML, CPU], "grade")[0][0] == COREML
     monkeypatch.delenv("RAWALCHEMY_COREML_GRADE")
     apple(monkeypatch, os_version="15.5")
-    assert policy.stage_providers([COREML, CPU], "grade") == [COREML, CPU]
+    assert policy.stage_providers([COREML, CPU], "grade")[0][0] == COREML
     apple(monkeypatch, ort_version="1.30.0")
-    assert policy.stage_providers([COREML, CPU], "grade") == [COREML, CPU]
+    assert policy.stage_providers([COREML, CPU], "grade")[0][0] == COREML
+
+
+def test_cpu_grade_does_not_copy_frames_through_an_isolated_child(monkeypatch):
+    from raw_alchemy.onnx import isolated_session
+
+    isolated = Mock()
+    monkeypatch.setattr(isolated_session, "IsolatedSession", isolated)
+    constructor = Mock(return_value=object())
+    constructor.__module__ = "onnxruntime.capi.onnxruntime_inference_collection"
+    runtime_ = SimpleNamespace(InferenceSession=constructor)
+    options = object()
+    providers = [CPU]
+
+    result = policy.construct_session(runtime_, "grade.onnx", options, providers, variant="grade")
+
+    assert result is constructor.return_value
+    constructor.assert_called_once_with("grade.onnx", options, providers=providers)
+    isolated.assert_not_called()
+
+
+@pytest.mark.parametrize("variant,providers", [
+    ("rcd:h=120,w=120", [CPU]), ("rgb-denoiser", [CPU]),
+    ("grade", [COREML, CPU]), ("grade", ["DmlExecutionProvider", CPU]),
+])
+def test_native_stages_keep_process_isolation(monkeypatch, variant, providers):
+    from raw_alchemy.onnx import isolated_session
+
+    isolated = Mock(return_value=object())
+    monkeypatch.setattr(isolated_session, "IsolatedSession", isolated)
+    monkeypatch.setenv("RAWALCHEMY_NATIVE_ISOLATION", "1")
+    monkeypatch.setenv("RAWALCHEMY_COREML_ISOLATION", "1")
+    constructor = Mock()
+    constructor.__module__ = "onnxruntime.capi.onnxruntime_inference_collection"
+    runtime_ = SimpleNamespace(InferenceSession=constructor)
+    options = object()
+
+    result = policy.construct_session(runtime_, "model.onnx", options, providers, variant=variant)
+
+    assert result is isolated.return_value
+    isolated.assert_called_once_with("model.onnx", options, providers, variant=variant)
+    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize("system,providers", [
@@ -137,6 +184,23 @@ def session(providers, *, error=None):
 
 def runtime(factory):
     return SimpleNamespace(InferenceSession=Mock(side_effect=factory))
+
+
+@pytest.mark.parametrize("variant", ["grade", "rgb-denoiser"])
+def test_native_runtime_disables_telemetry_before_in_process_initialization(monkeypatch, variant):
+    monkeypatch.setenv("RAWALCHEMY_NATIVE_ISOLATION", "0")
+    telemetry = [True]
+    result = object()
+
+    def disable():
+        telemetry[0] = False
+
+    def initialize(*args, **kwargs):
+        assert not telemetry[0], "native initialization must not start telemetry uploads"
+        return result
+
+    runtime_ = SimpleNamespace(InferenceSession=initialize, disable_telemetry_events=disable)
+    assert policy.construct_session(runtime_, "model.onnx", object(), [CPU], variant=variant) is result
 
 
 def create(runtime_, providers=None, path="test.onnx", variant="rgb-denoiser"):

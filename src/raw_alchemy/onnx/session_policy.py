@@ -17,7 +17,7 @@ from raw_alchemy.pipeline.cancellation import check_cancelled
 
 CPU = "CPUExecutionProvider"
 COREML = "CoreMLExecutionProvider"
-POLICY_VERSION = 7
+POLICY_VERSION = 9
 
 
 def provider_names(providers):
@@ -54,19 +54,6 @@ def eligible_apple():
     )
 
 
-def affected_apple_grade():
-    """Limit automatic CPU grade to the macOS/ORT generation measured locally.
-
-    Other generations keep their existing selection until measured, with an
-    explicit override available for comparison. This is not a hardware speed
-    guarantee for every Apple Silicon chip on this software generation.
-    """
-    import onnxruntime as ort
-
-    return (eligible_apple() and _version(platform.mac_ver()[0])[0] == 27
-            and _version(ort.__version__) == (1, 29))
-
-
 def stage_providers(providers, variant):
     """Apply Apple-only stage policy; never replace CUDA/ROCm/DirectML."""
     names = provider_names(providers)
@@ -80,8 +67,15 @@ def stage_providers(providers, variant):
         if mode not in ("auto", "cpu", "coreml"):
             logger.warning(f"Invalid RAWALCHEMY_COREML_GRADE={mode!r}; using CPU")
             return [CPU]
-        if mode == "cpu" or (mode == "auto" and affected_apple_grade()):
+        if mode == "cpu" or not eligible_apple():
             return [CPU]
+        # Fixed pixel tiles in grade.py let MLProgram execute the fused
+        # colour graph on the GPU instead of the slower legacy lowering.
+        first = providers[0]
+        options = dict(first[1]) if isinstance(first, tuple) else {}
+        options.update(ModelFormat="MLProgram", MLComputeUnits="CPUAndGPU",
+                       RequireStaticInputShapes="1", AllowLowPrecisionAccumulationOnGPU="0")
+        return [(COREML, options), *providers[1:]]
     if stage == "rgb-denoiser":
         mode = os.environ.get("RAWALCHEMY_COREML_DENOISE", "auto").lower().strip()
         if mode not in ("auto", "cpu", "mlprogram"):
@@ -234,9 +228,28 @@ def create_session(ort, model_path, options_factory, providers, *, variant):
     return session
 
 
+def configure_native_runtime(ort):
+    """Disable ORT telemetry before its first native session is created.
+
+    ORT 1.30 on macOS can abort during interpreter shutdown when its HTTP
+    telemetry worker dispatches through an already-destroyed recursive mutex.
+    Inference and provider profiling do not need that background service.
+    """
+    disable = getattr(ort, "disable_telemetry_events", None)
+    if disable is not None:
+        disable()
+
+
 def construct_session(ort, model_path, options, providers, *, variant):
-    """Production CoreML owns a spawned process for its full session lifetime."""
+    """Isolate native sessions, except bounded CPU-only grading."""
     check_cancelled()
+    configure_native_runtime(ort)
+    # CPU grading is a bounded elementwise graph (strip-limited by grade.py).
+    # Keeping it on the existing processing thread avoids copying each
+    # interactive frame into/out of a child and two IPC round trips. Native
+    # decoders, demosaic, denoise and accelerated sessions remain killable.
+    if variant.split(":", 1)[0] == "grade" and provider_names(providers) == [CPU]:
+        return ort.InferenceSession(model_path, options, providers=providers)
     isolation = os.environ.get("RAWALCHEMY_NATIVE_ISOLATION", "1")
     if COREML in provider_names(providers):
         isolation = os.environ.get("RAWALCHEMY_COREML_ISOLATION", isolation)

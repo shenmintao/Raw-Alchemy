@@ -12,8 +12,8 @@ Elementwise-only graphs do not exhibit DirectML's dynamic-shape pathology
 (verified across sizes), so no dimension freezing is needed here.
 
 Disable with RAWALCHEMY_GRADE_GPU=0 (falls back to the per-op numpy path).
-The affected Apple configuration uses fused CPU ORT instead of fragmented
-CoreML partitions; RAWALCHEMY_COREML_GRADE=coreml explicitly retries CoreML.
+Apple Silicon uses MLProgram on fixed pixel tiles, reusing compiled GPU
+graphs across image sizes. RAWALCHEMY_COREML_GRADE=cpu selects fused CPU ORT.
 """
 
 import os
@@ -29,12 +29,16 @@ from .denoiser import (
     _make_session_options,
 )
 
-from .session_policy import configuration_token, create_session
+from .session_policy import configuration_token, create_session, provider_names, stage_providers
 from raw_alchemy.pipeline.resources import checkpoint
 
 MODEL_FILE = "grade_dyn.onnx"
 MODEL_FILE_LOG = "grade_log_dyn.onnx"   # ...→log 矩阵→max→1D LUT→[3D LUT]
 MODEL_FILE_LUT = "grade_lut_dyn.onnx"   # ...→3D LUT→sRGB 矩阵→OETF
+COREML_PIXEL_TILE = (1024, 3072)
+# Gather-heavy tetrahedral LUT graphs need smaller working sets. Reuse one
+# compiled shape per graph while bounding CoreML and CPU partition buffers.
+COREML_LUT_PIXEL_TILE = (512, 1536)
 
 _sessions: dict = {}
 _session_lock = threading.Lock()
@@ -76,11 +80,26 @@ def _get_session(model_file: str):
         import onnxruntime as ort
 
         model_path = _find_model(model_file)
-        providers = _configure_providers(_get_providers(), model_path, variant="grade")
+        preferred = _get_providers()
+        use_coreml = "CoreMLExecutionProvider" in provider_names(stage_providers(preferred, "grade"))
+        h, w = COREML_PIXEL_TILE if model_file == MODEL_FILE else COREML_LUT_PIXEL_TILE
+        variant = f"grade:h={h},w={w}" if use_coreml else "grade"
+        providers = _configure_providers(preferred, model_path, variant=variant)
+
+        def options():
+            so = _make_session_options(ort)
+            if use_coreml:
+                so.add_free_dimension_override_by_name("h", h)
+                so.add_free_dimension_override_by_name("w", w)
+            return so
+
         sess = create_session(
-            ort, model_path, lambda: _make_session_options(ort), providers,
-            variant="grade",
+            ort, model_path, options, providers,
+            variant=variant,
         )
+        # The CPU retry retains these dimension overrides. Tile selection
+        # must follow the session shape even after its provider changes.
+        sess._rawalchemy_pixel_tile = (h, w) if use_coreml else None
         _sessions[model_file] = sess
         _session_provider = sess.get_providers()[0]
     return sess
@@ -100,6 +119,8 @@ _STRIP_PIXELS = 6_000_000  # 单次喂图上限:约束 DML arena 增长(逐像�
 
 
 def _run_strips(session, feeds, img_key="img"):
+    if getattr(session, "_rawalchemy_pixel_tile", None) is not None:
+        return _run_coreml_pixel_tiles(session, feeds, img_key)
     img = feeds[img_key]
     h, w = img.shape[:2]
     if h * w <= _STRIP_PIXELS:
@@ -112,6 +133,37 @@ def _run_strips(session, feeds, img_key="img"):
         part = dict(feeds)
         part[img_key] = np.ascontiguousarray(img[y:y + rows])
         out[y:y + rows] = session.run(None, part)[0]
+    return out
+
+
+def _run_coreml_pixel_tiles(session, feeds, img_key="img"):
+    """Reuse one fixed CoreML shape across crops, zoom and image dimensions.
+
+    Grade graphs have no spatial operators: only the last RGB axis matters.
+    Flattening pixels into fixed tiles preserves the math and avoids a new
+    compiled model for every ROI. Padding is discarded after inference.
+    """
+    img = feeds[img_key]
+    flat = img.reshape(-1, 3)
+    th, tw = session._rawalchemy_pixel_tile
+    capacity = th * tw
+    out = np.empty_like(img)
+    dest = out.reshape(-1, 3)
+    scratch = None
+    for start in range(0, len(flat), capacity):
+        checkpoint()
+        count = min(capacity, len(flat) - start)
+        if count == capacity:
+            tile = flat[start:start + count].reshape(th, tw, 3)
+        else:
+            if scratch is None:
+                scratch = np.zeros((th, tw, 3), np.float32)
+            scratch.reshape(-1, 3)[:count] = flat[start:start + count]
+            tile = scratch
+        part = dict(feeds)
+        part[img_key] = tile
+        result = session.run(None, part)[0]
+        dest[start:start + count] = result.reshape(-1, 3)[:count]
     return out
 
 

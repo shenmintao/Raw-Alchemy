@@ -27,7 +27,7 @@ def test_real_frame_matches_original_cpu_and_executes_gpu(sensor, monkeypatch, t
     import rawpy
 
     from raw_alchemy.core import (
-        fix_hot_pixels, highlight_inpaint_opposed, subtract_black_level,
+        highlight_inpaint_opposed, subtract_black_level,
     )
     from raw_alchemy.onnx import rcd_demosaic as rcd, xtrans_demosaic as xt
 
@@ -45,7 +45,6 @@ def test_real_frame_matches_original_cpu_and_executes_gpu(sensor, monkeypatch, t
             np.array(frame.black_level_per_channel, np.float32),
             float(frame.white_level), pattern,
         )
-        fix_hot_pixels(raw, pattern)
         highlight_inpaint_opposed(
             raw, pattern, np.array(frame.camera_whitebalance, np.float32),
         )

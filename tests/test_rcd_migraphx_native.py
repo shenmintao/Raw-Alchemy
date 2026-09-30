@@ -17,7 +17,7 @@ def test_native_amd_bayer_cases_and_compiled_cache(monkeypatch, tmp_path):
     import rawpy
     from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
     from raw_alchemy.core import (
-        fix_hot_pixels, highlight_inpaint_opposed,
+        highlight_inpaint_opposed,
         subtract_black_level,
     )
     from raw_alchemy.onnx import rcd_demosaic as rcd
@@ -33,7 +33,6 @@ def test_native_amd_bayer_cases_and_compiled_cache(monkeypatch, tmp_path):
             np.array(frame.black_level_per_channel, np.float32),
             float(frame.white_level), pattern,
         )
-        fix_hot_pixels(raw, pattern)
         highlight_inpaint_opposed(raw, pattern, wb)
         wb3 = np.array([wb[0] / wb[1], 1, wb[2] / wb[1]], np.float32)
         matrix = cam_to_working_space_matrix(np.array(frame.rgb_xyz_matrix, np.float64)).astype(np.float32)

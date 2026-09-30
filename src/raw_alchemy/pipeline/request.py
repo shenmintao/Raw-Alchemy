@@ -39,6 +39,9 @@ class ProcessorParams(TypedDict, total=False):
     
     # New Features
     denoise_enabled: bool
+    denoise_strength: float
+    _denoise_target: float | bool
+    _denoise_deferred: bool
     sharpen_strength: float
     viewport_size: Tuple[int, int]
     preview_zoom: float
