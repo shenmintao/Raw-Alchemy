@@ -1,10 +1,20 @@
 name: Create Release and Upload Binaries
+run-name: Release ${{ inputs.release_tag || github.ref_name }}
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild
+        required: true
+        type: string
   push:
     tags:
       - 'v*' # Push events to tags matching v*, e.g. v1.0, v20.15.10
       - 'studio-v*' # Push events to tags matching studio-v*, e.g. studio-v1.0
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   build-windows:
@@ -13,6 +23,8 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,7 +54,7 @@ jobs:
       - name: Package Windows portable ZIP
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           @(
             'Raw Alchemy Studio Windows portable package'
@@ -78,6 +90,8 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -107,7 +121,7 @@ jobs:
 
       - name: Package Linux portable tarball
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           printf '%s\n' \
             'Raw Alchemy Studio Linux portable package' \
@@ -134,6 +148,8 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -175,7 +191,7 @@ jobs:
 
       - name: Package macOS .app into .dmg
         run: |
-          tag="${{ github.ref_name }}"
+          tag="$RELEASE_TAG"
           create-dmg \
             --volname "RawAlchemyStudio Installer" \
             --window-pos 200 120 \
@@ -205,6 +221,7 @@ jobs:
       - name: Check out release notes
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           path: source
           sparse-checkout: docs/release-notes
 
@@ -215,7 +232,7 @@ jobs:
 
       - name: Prepare Artifacts for Release
         run: |
-          tag="${{ github.ref_name }}"
+          tag="$RELEASE_TAG"
           mv artifacts/RawAlchemyStudio-windows-portable/*.zip .
           mv artifacts/RawAlchemyStudio-linux-portable/*.tar.gz .
           # The macOS artifact is now a DMG and already named correctly
@@ -226,7 +243,7 @@ jobs:
       - name: Remove stale legacy assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           gh release delete-asset "$TAG" "RawAlchemyStudio-${TAG}-windows.exe" --yes || true
           gh release delete-asset "$TAG" "RawAlchemyStudio-${TAG}-windows-x64-onedir.zip" --yes || true
@@ -234,7 +251,7 @@ jobs:
 
       - name: Write release notes
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           # A hand-written docs/release-notes/<tag>.md wins; final releases
           # need one, since the template below describes a prerelease.
@@ -278,8 +295,10 @@ jobs:
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           body_path: release-notes.md
-          prerelease: ${{ contains(github.ref_name, '-pre') || contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          draft: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-pre') || contains(env.RELEASE_TAG, '-rc') || contains(env.RELEASE_TAG, '-beta') || contains(env.RELEASE_TAG, '-alpha') }}
           overwrite_files: true
           files: |
             RawAlchemyStudio-*-windows-x64-portable.zip
