@@ -14,8 +14,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # The HE-enabled build from tools/build_rawpy.py also satisfies this range.
-    "rawpy>=0.27.1,<0.28",
+    # Standard source dependency: pip compiles and installs the HE decoder.
+    "rawpy @ https://github.com/shenmintao/Raw-Alchemy/releases/download/v0.6.1/rawpy-0.27.1%2Brawalchemy.he1.tar.gz#sha256=b28f51090c33ff9d5ab0f646ce1c8cc4ab1247bd3ace3d60f48ffb3f241f69f5",
     "numpy>=1.26,<3",
     "requests",
     "tifffile",

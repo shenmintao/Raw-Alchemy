@@ -27,6 +27,16 @@ def main():
     assert Path(lensfun_wrapper._lensfun._name).resolve().is_relative_to(prefix)
     database = lensfun_wrapper.LensfunDatabase()
     assert database.db, "Packaged camera database did not load"
+    camera = database.find_camera("Sony", "ZV-1")
+    assert camera, "Packaged compact-camera profile is missing"
+    lens = database.find_lens(camera, None, None)
+    assert lens and lens.contents.Model == b"ZV-1 & compatibles", "Packaged fixed-lens fallback failed"
+    coords = lensfun_wrapper.compute_lens_distortion_map(
+        np.full((96, 128, 3), 0.25, np.float32),
+        "Sony", "ZV-1", None, "", 9.4, 1.8, crop_factor=2.55,
+        correct_vignetting=False,
+    )
+    assert coords is not None and np.isfinite(coords[0]).all(), "Packaged fixed-lens correction failed"
     from raw_alchemy.pipeline.stage_identity import denoise_tag
     assert denoise_tag() is not None, "Packaged stage assets cannot be identified"
     from raw_alchemy.onnx import rgb_denoiser

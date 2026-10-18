@@ -1,5 +1,41 @@
 # Upgrade Status
 
+## Post-v0.6.1 — automatic HE dependency and issue follow-ups
+
+`pip install .` now installs the enhanced rawpy decoder as a standard source
+dependency, pinned by archive SHA256. Its self-contained source archive includes
+all four verified upstream source archives and licence notices. pip supplies
+CMake/NumPy/Cython in build isolation and installs the finished rawpy wheel in
+the destination environment. No setup hook runs a nested `pip install`.
+`tools/build_rawpy_sdist.py` reproduces the archive byte-for-byte on the same
+host platform; changes to
+its bundled native helper require a new decoder package version/archive URL.
+CI and release builds use the same dependency resolution path.
+
+A completely new Windows virtual environment successfully ran `pip install .`
+without a prior rawpy installation. Both application and enhanced decoder loaded
+from that environment; all four HE/HE★ mosaics matched, and `pip check` passed.
+Local regression suite: **638 passed, 11 skipped**.
+
+- #27: the save dialog uses a format-specific default suffix before destination
+  validation, including `.hdr.heif`. Existing explicit suffixes and cancellation
+  are preserved, with Qt retaining its overwrite confirmation.
+- #22: missing/unmatched compact-camera lens metadata can resolve a unique
+  profile through the camera's private mount. Declared interchangeable mounts
+  never take this fallback; body-name fuzzy searches can select unrelated lenses.
+  A recovered fixed lens uses the database crop factor: the reporter's ZV-1
+  EXIF estimate of 2.55 disables interpolation against the 2.70 calibration.
+  Full-frame, striped and GPU-map tests cover this case. Both original files
+  attached to #22 (ZV-1 ARW and PEN-F/14–150mm at 150mm ORF) were downloaded,
+  matched to their profiles, and exported with correction enabled.
+- Approved issue closures: #5 (mirrorless LCP fallback mounts), #21 (native
+  detail preview), #28 (zoom controls and visible export marks).
+
+Lensfun audit: binaries remain at the verified 2026-03-25 snapshot, reporting
+0.3.99.0. Compared with upstream `43f9e001ab66c4fcdd4f400463f13b72f94b2288`,
+the changes affect 21 database XML files and no library/build code. Updating
+the database independently is recommended; it has not been replaced here.
+
 ## 2026-10-18 — Nikon HE/HE★, DNG colour metadata and preview controls
 
 The decoder is built with rawpy 0.27.1 and

@@ -92,7 +92,7 @@ def static_library(prefix, *names):
     raise RuntimeError(f'Static codec library missing: {names}')
 
 
-def prepare_wrapper(source, prefix, lock):
+def prepare_wrapper(source, prefix, lock, *, build_from_source=False):
     """Use our already built LibRaw, rather than rawpy's bundled upstream copy."""
     setup = source / 'setup.py'
     body = setup.read_text(encoding='utf-8')
@@ -100,7 +100,15 @@ def prepare_wrapper(source, prefix, lock):
         signature = f'def {function}():'
         if body.count(signature) != 1:
             raise RuntimeError('rawpy build hooks changed; review the source pin')
-        body = body.replace(signature, signature + '\n    return  # Built by Raw Alchemy before the extension.')
+        hook = ("\n    return __import__('rawalchemy_native').build_bundled()"
+                if build_from_source else '\n    return  # Built by Raw Alchemy before the extension.')
+        body = body.replace(signature, signature + hook)
+    if build_from_source:
+        # PEP 517 backends execute setup.py without adding its directory to
+        # sys.path. Make the sdist's local native helper importable explicitly.
+        body = ('import os as _rawalchemy_os, sys as _rawalchemy_sys\n'
+                '_rawalchemy_sys.path.insert(0, _rawalchemy_os.path.dirname('
+                '_rawalchemy_os.path.abspath(__file__)))\n' + body)
     setup.write_text(body, encoding='utf-8')
     (source / 'rawpy/_version.py').write_text(
         '__version__ = ' + repr(lock['wheel_version']) + '\n', encoding='utf-8',
@@ -109,6 +117,11 @@ def prepare_wrapper(source, prefix, lock):
         '# Native source provenance; also identifies persistent decode caches.\n'
         'BUILD = ' + repr(lock) + '\n', encoding='utf-8',
     )
+    if prefix is not None:
+        bundle_libraries(source, prefix)
+
+
+def bundle_libraries(source, prefix):
     package = source / 'rawpy'
     if sys.platform == 'win32':
         libraries = list((prefix / 'bin').glob('raw_r.dll'))
@@ -129,9 +142,23 @@ def prepare_probe():
         run([sys.executable, '-m', 'pip', 'install', 'numpy>=1.26,<3'])
 
 
-def build_wheel(output, cache):
+def build_bundled():
+    """Native-only build hook used inside the self-contained rawpy sdist.
+
+    pip owns Python dependency installation and the final wheel. This hook
+    compiles the native libraries without invoking another pip process.
+    """
+    source = Path(__file__).resolve().parent
+    return build_wheel(
+        source / 'dist', source / 'external/rawalchemy-sources',
+        native_only=True, rawpy_source=source,
+    )
+
+
+def build_wheel(output, cache, *, native_only=False, rawpy_source=None):
     lock = json.loads(LOCK.read_text(encoding='utf-8'))
-    prepare_probe()
+    if not native_only:
+        prepare_probe()
     cache.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
     archives = {name: download(asset, cache) for name, asset in lock['sources'].items()}
@@ -141,6 +168,8 @@ def build_wheel(output, cache):
         work = Path(directory)
         sources = {name: unpack(archives[name], asset, work)
                    for name, asset in lock['sources'].items()}
+        if rawpy_source is not None:
+            sources['rawpy'] = rawpy_source
         source = sources['rawpy']
         native = source / 'external/LibRaw-cmake/build'
         prefix = native / 'install'
@@ -175,6 +204,9 @@ def build_wheel(output, cache):
         for flag in ('LIBRAW_USE_DNGDEFLATECODEC', 'LIBRAW_USE_DNGLOSSYCODEC'):
             if '#define ' + flag + ' 1' not in config:
                 raise RuntimeError('The native build lost codec support: ' + flag)
+        if native_only:
+            bundle_libraries(source, prefix)
+            return prefix
         prepare_wrapper(source, prefix, lock)
         # Carry the shared decoder and statically linked codec notices.
         notices = [sources['libraw'] / name for name in ('COPYRIGHT', 'LICENSE.LGPL', 'REDLAMP.md')]

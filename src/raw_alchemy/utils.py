@@ -291,7 +291,7 @@ def apply_lens_correction(image: np.ndarray, exif_data: dict, custom_db_path: Op
     params = {**exif_data, **kwargs}
     
     # 蹇呰鐨?key 妫€鏌?
-    if not params.get('camera_model') or not params.get('lens_model'):
+    if not params.get('camera_model'):
         logger.warning("  鈿狅笍  [Lens] Missing camera model info, skipping.")
         return image
     

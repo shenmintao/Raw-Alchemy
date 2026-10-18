@@ -294,6 +294,11 @@ if _lensfun:
         ctypes.c_int      # sflags
     ]
     
+    # Named interchangeable mounts are declared in the database. Compact
+    # cameras instead use a private mount tying the body to its fixed lens.
+    _lensfun.lf_db_find_mount.restype = ctypes.c_void_p
+    _lensfun.lf_db_find_mount.argtypes = [ctypes.POINTER(lfDatabase), ctypes.c_char_p]
+
     # 修改器函数
     _lensfun.lf_modifier_create.restype = ctypes.POINTER(lfModifier)
     _lensfun.lf_modifier_create.argtypes = [
@@ -439,13 +444,23 @@ class LensfunDatabase:
         return None
     
     def find_lens(self, camera: Optional[ctypes.POINTER(lfCamera)], 
-                  maker: Optional[str], model: str) -> Optional[ctypes.POINTER(lfLens)]:
+                  maker: Optional[str], model: Optional[str]) -> Optional[ctypes.POINTER(lfLens)]:
         """查找镜头"""
         maker_b = maker.encode('utf-8') if maker else None
-        model_b = model.encode('utf-8')
-        
-        lenses = _lensfun.lf_db_find_lenses(self.db, camera, maker_b, model_b, 1)
-        if lenses and lenses[0]:
+        if model:
+            lenses = _lensfun.lf_db_find_lenses(self.db, camera, maker_b, model.encode('utf-8'), 1)
+            if lenses and lenses[0]:
+                return lenses[0]
+        if not camera:
+            return None
+        mount = camera.contents.Mount
+        if not mount or _lensfun.lf_db_find_mount(self.db, mount):
+            return None
+        # A private compact-camera mount identifies the fixed lens even
+        # without LensModel EXIF (e.g. Sony ZV-1). Require a unique profile;
+        # fuzzy body-name matching can select unrelated interchangeable lenses.
+        lenses = _lensfun.lf_db_find_lenses(self.db, camera, None, None, 1)
+        if lenses and lenses[0] and not lenses[1]:
             return lenses[0]
         return None
 
@@ -696,6 +711,12 @@ def apply_lens_correction(
         logger.warning(f"  ⚠️ [Lensfun] Lens not found: {lens_maker} {lens_model}. Skipping correction.")
         return image
     
+    # A recovered fixed-lens profile needs its calibrated sensor crop.
+    # Coarse EXIF equivalent-focal ratios (ZV-1: 2.55 vs 2.70) can disable
+    # calibration interpolation entirely. This path previously had no profile.
+    if not lens_model:
+        crop_factor = None
+
     # 确定裁剪系数
     if crop_factor is None:
         # 优先从相机获取crop factor
@@ -872,6 +893,8 @@ def compute_lens_distortion_map(
     if not lens:
         return None
 
+    if not lens_model:
+        crop_factor = None
     if crop_factor is None:
         if camera:
             try:
@@ -1015,6 +1038,8 @@ def apply_lens_correction_tiled(
     lens = db.find_lens(camera, lens_maker, lens_model)
     if not lens:
         return None
+    if not lens_model:
+        crop_factor = None
     if crop_factor is None:
         if camera:
             try:

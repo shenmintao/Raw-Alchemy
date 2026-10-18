@@ -107,24 +107,20 @@ cd raw-alchemy
 pip install .
 ```
 
-要读取**尼康高效率 HE／HE★ NEF**，在安装项目前构建增强解码器；已有环境也可执行：
+`pip install .` 和 `pip install -e .` 会**自动编译并安装支持尼康 HE／HE★ 的
+增强版 rawpy**，无需另行执行解码器安装命令。首次源码安装需要系统中的 C++
+编译器：Windows 使用 Visual Studio 2022 C++ Build Tools，macOS 使用 Xcode
+Command Line Tools，Linux 使用 GCC。包括 CMake 在内的 Python 构建依赖由 pip
+自动安装；解码器构建失败时，安装会明确报错。
 
-```bash
-python -m pip install cmake
-python tools/build_rawpy.py --install
-python -m pip install -r requirements.lock
-pip install .
-python tools/build_rawpy.py --verify
-```
-
-需要 C++ 编译器：Windows 使用 Visual Studio 2022 C++ Build Tools，macOS
-使用 Xcode Command Line Tools，Linux 使用 GCC。源码及校验值固定在
-`raw-dependencies.json`。构建采用 rawpy 0.27.1，以及基于
+增强版 rawpy 源码依赖固定 SHA256，包内包含已校验的四份上游源码和静态编解码器。
+各组件的来源及校验值记录在 `raw-dependencies.json`。构建采用 rawpy 0.27.1，以及基于
 [LibRaw PR #826](https://github.com/LibRaw/LibRaw/pull/826) 并补充正确性修复的
 [HE／HE★ 分支](https://github.com/pdcgomes/redlamp-libraw)。原 PR 仅支持 HE；
 Halcyon 的 Ceyx 核心另有 HE★ 扩展，本项目无需引入整个 Flutter 应用。
-CI 与便携版发布流程会构建增强解码器；仅执行 `pip install .` 安装的是上游
-rawpy，不会自动获得 HE 支持。
+源码安装、CI 与便携版使用同一套增强解码器。维护者可用
+`python tools/build_rawpy_sdist.py` 重建源码依赖包，并用
+`python tools/build_rawpy.py --verify` 验证已安装的解码器。
 
 预览区提供“适应窗口”、100%（一个原图像素对应一个屏幕像素）和可编辑缩放
 百分比。已标记图片的缩略图显示绿色边框和勾选徽标，异步刷新缩略图后仍会保留。

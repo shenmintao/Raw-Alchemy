@@ -108,25 +108,24 @@ cd raw-alchemy
 pip install .
 ```
 
-For **Nikon High Efficiency (HE / HE★)** NEFs, build the enhanced decoder before
-installing the project (or run this in an existing environment):
+**Nikon High Efficiency (HE / HE★)** decoding is installed automatically by
+`pip install .` and `pip install -e .`. pip builds the enhanced rawpy source
+dependency and installs it in the destination environment. There is no separate
+decoder-install command. First-time source installs need a C++ compiler
+(Visual Studio 2022 C++ Build Tools on Windows, Xcode Command Line Tools on
+macOS, or GCC on Linux); pip supplies the Python build dependencies, including
+CMake. Installation fails if the decoder cannot be built.
 
-```bash
-python -m pip install cmake
-python tools/build_rawpy.py --install
-python -m pip install -r requirements.lock
-pip install .
-python tools/build_rawpy.py --verify
-```
-
-This needs a C++ compiler (Visual Studio 2022 C++ Build Tools on Windows,
-Xcode Command Line Tools on macOS, or GCC on Linux). Sources and checksums are
-pinned in `raw-dependencies.json`. The build uses rawpy 0.27.1 and the corrected
+The dependency archive has a pinned SHA256 and contains all four checked source
+archives, including the static codecs. Sources and checksums are recorded in
+`raw-dependencies.json`. The build uses rawpy 0.27.1 and the corrected
 [HE/HE★ LibRaw fork](https://github.com/pdcgomes/redlamp-libraw), derived from
 [LibRaw PR #826](https://github.com/LibRaw/LibRaw/pull/826). The original PR only
 supports HE. Halcyon's Ceyx core carries a separate HE★ extension; the complete
-Flutter application is not needed here. CI and portable releases build this
-decoder; plain `pip install .` uses upstream rawpy and does not add HE support.
+Flutter application is not needed here. Source installs, CI and portable releases
+use the same enhanced decoder. Maintainers can reproduce the source dependency
+with `python tools/build_rawpy_sdist.py` and verify an installed decoder with
+`python tools/build_rawpy.py --verify`.
 
 Preview controls include Fit, 100% (one original pixel per display pixel),
 and an editable zoom percentage. Marked thumbnails have a green border and a

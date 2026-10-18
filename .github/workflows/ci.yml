@@ -48,8 +48,6 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install cmake
-          python tools/build_rawpy.py --install
           python -m pip install -r requirements.lock
           python -m pip install -e ".[test]"
           python tools/build_rawpy.py --verify

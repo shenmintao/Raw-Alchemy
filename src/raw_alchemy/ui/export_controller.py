@@ -14,6 +14,30 @@ from raw_alchemy.exporting import resolve_export_exposure
 from raw_alchemy.i18n import tr
 
 
+class ExportFileDialog(QFileDialog):
+    """Resolve the format suffix before Qt checks for an existing destination."""
+
+    SUFFIXES = {
+        'JPEG (*.jpg)': 'jpg', 'HEIF (*.heif)': 'heif',
+        'HDR HEIF (*.hdr.heif)': 'hdr.heif', 'TIFF (*.tif)': 'tif',
+        'DNG (*.dng)': 'dng',
+    }
+
+    def __init__(self, parent, default_path):
+        super().__init__(parent, tr('export_image'))
+        self.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        self.setFileMode(QFileDialog.FileMode.AnyFile)
+        self.setNameFilters(list(self.SUFFIXES))
+        self.setDefaultSuffix('jpg')
+        self.filterSelected.connect(self._set_format_suffix)
+        if os.path.dirname(default_path):
+            self.setDirectory(os.path.dirname(default_path))
+        self.selectFile(os.path.basename(default_path))
+
+    def _set_format_suffix(self, name_filter):
+        self.setDefaultSuffix(self.SUFFIXES[name_filter])
+
+
 class BatchExportDialog(MessageBoxBase):
     """Dialog for batch export settings."""
 
@@ -55,12 +79,8 @@ class ExportControllerMixin:
         )
         default_path = os.path.join(start_dir, base) if start_dir else base
 
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            tr("export_image"),
-            default_path,
-            "JPEG (*.jpg);;HEIF (*.heif);;HDR HEIF (*.hdr.heif);;TIFF (*.tif);;DNG (*.dng)",
-        )
+        dialog = ExportFileDialog(self, default_path)
+        path = dialog.selectedFiles()[0] if dialog.exec() else ''
 
         if path:
             self.last_export_path = os.path.dirname(path)
