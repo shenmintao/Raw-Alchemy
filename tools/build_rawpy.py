@@ -7,6 +7,7 @@ ordinary PyPI rawpy wheel remains usable for other RAW formats.
 import argparse
 from contextlib import contextmanager
 import hashlib
+from importlib.util import find_spec
 import json
 import os
 from pathlib import Path
@@ -120,8 +121,17 @@ def prepare_wrapper(source, prefix, lock):
         shutil.copyfile(library, package / library.name)
 
 
+def prepare_probe():
+    # pip's isolated wheel build installs NumPy only inside its temporary
+    # build environment. The fresh interpreter used to validate the wheel
+    # needs it too, including on a clean source install or hosted runner.
+    if find_spec('numpy') is None:
+        run([sys.executable, '-m', 'pip', 'install', 'numpy>=1.26,<3'])
+
+
 def build_wheel(output, cache):
     lock = json.loads(LOCK.read_text(encoding='utf-8'))
+    prepare_probe()
     cache.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
     archives = {name: download(asset, cache) for name, asset in lock['sources'].items()}
