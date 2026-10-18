@@ -1,6 +1,6 @@
 # Upgrade Status
 
-## Post-v0.6.1 — automatic HE dependency and issue follow-ups
+## v0.6.2 — automatic HE dependency and issue follow-ups
 
 `pip install .` now installs the enhanced rawpy decoder as a standard source
 dependency, pinned by archive SHA256. Its self-contained source archive includes
@@ -16,6 +16,13 @@ A completely new Windows virtual environment successfully ran `pip install .`
 without a prior rawpy installation. Both application and enhanced decoder loaded
 from that environment; all four HE/HE★ mosaics matched, and `pip check` passed.
 Local regression suite: **638 passed, 11 skipped**.
+
+[Hosted CI for the application changes](https://github.com/shenmintao/Raw-Alchemy/actions/runs/39132551593)
+passed on Windows, macOS 15 and Ubuntu: **631 passed, 18 skipped** on each.
+Each platform also built and loaded the enhanced decoder, matched all four
+Nikon HE/HE★ mosaics, and passed an isolated installed-wheel probe covering the
+packaged Lensfun library/database, fixed-lens lookup, ONNX CPU model and Qt.
+The v0.6.2 portable macOS build continues to target macOS 26 or later.
 
 - #27: the save dialog uses a format-specific default suffix before destination
   validation, including `.hdr.heif`. Existing explicit suffixes and cancellation
