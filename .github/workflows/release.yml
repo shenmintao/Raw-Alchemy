@@ -129,7 +129,8 @@ jobs:
 
   build-macos:
     name: Build for macOS
-    runs-on: macos-latest
+    # Match the supported minimum OS and CI; macos-latest now targets macOS 26.
+    runs-on: macos-15
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
