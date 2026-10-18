@@ -94,6 +94,11 @@ Final Windows/Python 3.12 validation:
   No new portable executable has been published; Linux/macOS execution remains
   for CI. Issue #34's original DNG is still needed for file-specific acceptance.
 
+Release validation subsequently passed on Windows, macOS 15 and Ubuntu, each
+with 620 tests passed and 11 skipped. The v0.6.1 macOS portable app was built on
+macOS 26.6.2 and requires macOS 26 or later; the release runner is pinned to
+`macos-26`. Source compatibility checks continue on macOS 15.
+
 ## Post-`studio-v0.6.0-pre7` — bounded working set and VRAM reclamation
 
 This follow-up pass removes the remaining high-water allocations that were

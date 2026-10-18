@@ -143,8 +143,8 @@ jobs:
 
   build-macos:
     name: Build for macOS
-    # Match the supported minimum OS and CI; macos-latest now targets macOS 26.
-    runs-on: macos-15
+    # Portable releases target macOS 26+; source compatibility is tested on 15.
+    runs-on: macos-26
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4

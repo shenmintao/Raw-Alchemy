@@ -97,6 +97,8 @@ sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev
 
 Linux 构建会校验固定版本的 Lensfun 源码，并针对构建机器的 libc 编译。发布包应在计划支持的最旧发行版上构建，较新发行版生成的 wheel 不保证兼容旧版 glibc。Windows x86-64 和 macOS arm64 使用固定的平台二进制文件；macOS 原生库至少需要 macOS 15，具体下载包可能因内置 Python/Qt 而要求更新版本。其他架构需要补充原生依赖验证。
 
+**v0.6.1 的 macOS 便携版要求 macOS 26 或更新版本**；源码构建另在 macOS 15 上测试。
+
 **Linux / Windows** — 随后安装项目：
 
 ```bash
