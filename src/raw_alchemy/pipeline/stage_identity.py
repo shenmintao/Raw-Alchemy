@@ -55,10 +55,12 @@ def _identity_files():
             "onnx/demosaic_coreml.py", "onnx/session_policy.py", "onnx/migraphx_precision.py",
             "onnx/gpu_runtime.py", "onnx/coreml_cache.py", "math_ops.py",
             "rawspeed.py", "onnx/isolated_session.py", "native_decode.py",
-            "colorspace_matrices.py", "demosaic_helpers.py",
+            "colorspace_matrices.py", "raw_color.py", "demosaic_helpers.py",
             "pipeline/stage_identity.py", "pipeline/source_artifacts.py",
         )
     ]
+    from raw_alchemy.rawspeed import _vendor_dir
+    files.append(_vendor_dir() / 'cameras.xml')
     # Follow the same locator/constants as inference (including frozen builds).
     from raw_alchemy.onnx.denoiser import _find_model
     from raw_alchemy.onnx.rgb_denoiser import MODEL_FILE as RGB_MODEL
@@ -81,6 +83,16 @@ def _runtime_version(package):
         return version(package)
     except PackageNotFoundError:
         return "unavailable"
+
+
+def _rawpy_decoder_build():
+    # LibRaw still reports 0.22.0 for the HE fork. Its source revision must
+    # distinguish enhanced builds even when frozen metadata is unavailable.
+    try:
+        from rawpy._rawalchemy_build import BUILD
+    except ImportError:
+        return None
+    return (BUILD['wheel_version'], BUILD['decoder_revision'])
 
 
 def denoise_tag(strength=0.25, *, decode_variant=DECODE_CANONICAL):
@@ -113,6 +125,7 @@ def denoise_tag(strength=0.25, *, decode_variant=DECODE_CANONICAL):
         "runtime": {p: _runtime_version(p) for p in
                     ("onnxruntime", "onnxruntime-directml", "onnxruntime-gpu", "onnxruntime-migraphx",
                      "rawpy", "rawspeedpy", "numpy")},
+        "raw_decoder_build": _rawpy_decoder_build(),
         "platform": (platform.system(), platform.machine()),
         "session_policy": [configuration_token(v) for v in
                            ("rgb-denoiser", "rcd", "xtrans")],

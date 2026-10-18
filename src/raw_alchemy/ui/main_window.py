@@ -30,6 +30,7 @@ from raw_alchemy.ui.image_state import ImageState
 from raw_alchemy.workers.image_processor import ImageProcessor
 from raw_alchemy.pipeline.ops import _as_hashable
 from raw_alchemy.ui.widgets.gallery_list import GalleryListWidget, boxed_icon
+from raw_alchemy.ui.widgets.zoom_controls import ZoomControls
 from raw_alchemy.ui.widgets.inspector_panel import InspectorPanel
 from raw_alchemy.ui.widgets.title_bar import CenteredFluentTitleBar
 from raw_alchemy.ui.widgets.crop_rotate_viewer import CropRotateViewer
@@ -578,6 +579,8 @@ class MainWindow(ExportControllerMixin, EditModesMixin, LibraryControllerMixin,
         self.toolbar_layout.addWidget(self.btn_export_all)
         
         self.preview_layout.addWidget(self.viewport)
+        self.zoom_controls = ZoomControls(self.viewport)
+        self.preview_layout.addWidget(self.zoom_controls)
         self.preview_layout.addWidget(self.toolbar)
         
         # --- Page 2: Crop Viewer ---

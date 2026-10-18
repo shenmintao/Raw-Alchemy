@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "raw_alchemy_studio"
-version = "0.6.0"
+version = "0.6.1"
 description = "Raw Alchemy Studio - A fast culling/grading tool that applies cinematic LUTs to RAW photos with mathematical precision. Powered by ONNX Runtime for GPU-accelerated image processing."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,26 +14,28 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "rawpy @ git+https://github.com/shenmintao/rawpy.git@eb9ff0bd9a9aa4337c93cca9f660a2ebdf31a2e7",
-    "numpy",
+    # The HE-enabled build from tools/build_rawpy.py also satisfies this range.
+    "rawpy>=0.27.1,<0.28",
+    "numpy>=1.26,<3",
     "requests",
     "tifffile",
     "click",
     "colour-science @ git+https://github.com/colour-science/colour.git@4ee3b72a2c6205c1d0cd964075621ec19290d571",
-    "opencv-python-headless",
+    "opencv-python-headless>=4.13,<5",
     "scipy",
-    "Pillow",
-    "pillow-heif",
+    "Pillow>=12.2,<13",
+    "pillow-heif>=1.8.1,<2",
     "zstandard",
     "ordered-set",
     "PyOpenGL",
-    "PySide6-Fluent-Widgets",
+    "PySide6>=6.11.2,<6.12",
+    "PySide6-Fluent-Widgets>=1.11.3,<2",
     "Send2Trash",
     "packaging",
     "loguru",
     "pyexiv2",
     "psutil",
-    "onnx",
+    "onnx>=1.23.2,<2",
     "rawspeedpy @ git+https://github.com/shenmintao/rawspeedpy.git@b3eff714300da7092864a3c35179d31baf97f799",
     # Windows: DirectML build so AMD/Intel GPUs accelerate ONNX (CUDA-only
     # onnxruntime-gpu left AMD cards on CPU). Linux keeps the CUDA build.

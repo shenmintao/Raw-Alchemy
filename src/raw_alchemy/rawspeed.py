@@ -43,6 +43,44 @@ def _dll_name() -> str:
     return "librawspeed_capi.so"
 
 
+@lru_cache(maxsize=1)
+def _camera_matrix_table(xml_bytes):
+    """Read declared camera profiles; cache by content, never file timestamps."""
+    table = {}
+    for camera in ET.fromstring(xml_bytes).iter('Camera'):
+        profiles = camera.findall('ColorMatrices/ColorMatrix')
+        matrices = []
+        for profile in profiles:
+            rows = sorted(profile.findall('ColorMatrixRow'), key=lambda row: int(row.get('plane', '0')))
+            try:
+                matrix = np.array([[float(v) for v in (row.text or '').split()]
+                                   for row in rows], dtype=np.float64) / 10000.0
+            except ValueError:
+                continue
+            if matrix.shape == (3, 3) and np.isfinite(matrix).all():
+                matrices.append(matrix)
+        if not matrices:
+            continue
+        keys = [(camera.get('make'), camera.get('model'))]
+        keys += [(alias.get('make'), alias.get('model')) for alias in camera.findall('ID')]
+        for key in keys:
+            if all(key):
+                table.setdefault(key, []).extend(matrices)
+    return table
+
+
+def camera_matrix(make, model):
+    """Return a profile only when every declared mode agrees on its matrix."""
+    try:
+        profiles = _camera_matrix_table((_vendor_dir() / 'cameras.xml').read_bytes()).get((make, model))
+    except (OSError, ET.ParseError, ValueError) as exc:
+        logger.debug(f'Camera profile database unavailable: {exc}')
+        return None
+    if not profiles or any(not np.array_equal(matrix, profiles[0]) for matrix in profiles[1:]):
+        return None
+    return profiles[0].copy()
+
+
 def _patch_binding(binding) -> Optional[str]:
     """Point rawspeedpy at Raw Alchemy's packaged RawSpeed runtime files."""
     global _binding_patched

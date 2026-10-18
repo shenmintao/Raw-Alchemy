@@ -17,11 +17,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          # windows-latest 正在滚动换代到 Server2025+VS2026 beta
-          # (actions/runner-images#13638),裸 pip 环境下 MSVC 工具链
-          # 不在 PATH,rawpy fork 的 LibRaw cmake 构建连环失配。
-          # 钉到稳定镜像;fork 侧的命名自适应(shenmintao/rawpy@eb9ff0b 起)
-          # 留作 2022 退役时的过渡保障。
+          # The pinned HE decoder build uses the stable VS 2022 toolchain.
           - windows-2022
           - macos-15
         python-version:
@@ -52,12 +48,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
+          python -m pip install cmake
+          python tools/build_rawpy.py --install
+          python -m pip install -r requirements.lock
           python -m pip install -e ".[test]"
+          python tools/build_rawpy.py --verify
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # rawpy fork 走源码构建:runner 默认生成器换成 Ninja 后 LibRaw
-          # 产物带 lib 前缀(libraw_r.dll),rawpy setup 只认 MSVC 命名
-          # (raw_r.dll)。钉死 VS 生成器恢复旧命名。
           CMAKE_GENERATOR: ${{ runner.os == 'Windows' && 'Visual Studio 17 2022' || '' }}
 
       - name: Use CPU onnxruntime for tests (Linux)
@@ -79,6 +76,9 @@ jobs:
 
       - name: Run Ruff
         run: python -m ruff check
+
+      - name: Check Nikon HE and HE star sensor samples
+        run: python tools/check_nikon_he.py --download
 
       - name: Check Linux OpenGL viewport
         if: runner.os == 'Linux'

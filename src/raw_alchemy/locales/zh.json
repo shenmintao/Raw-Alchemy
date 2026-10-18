@@ -214,6 +214,9 @@
     "lut_none": "无",
     "scopes_from_proxy": "直方图/波形基于预览代理图计算",
     "scopes_from_full": "直方图/波形基于全分辨率图像计算",
+    "zoom_fit": "适应窗口",
+    "zoom_percentage": "预览缩放百分比",
+    "zoom_native_hint": "一个原图像素对应一个屏幕像素",
     "native_base_enable": "原生分辨率预览（放大和平移无需等待）",
     "native_base_hint": "停止操作约 1 秒后，在后台生成全分辨率预览。高像素照片会多占用数百 MB 内存和显存；显卡纹理上限或空闲内存不足时自动退回分块渲染。"
 }

@@ -6,7 +6,7 @@ from loguru import logger
 from qfluentwidgets import InfoBar
 
 from raw_alchemy.i18n import tr
-from raw_alchemy.ui.widgets.gallery_list import boxed_icon
+from raw_alchemy.ui.widgets.gallery_list import MARKED_ROLE, boxed_icon
 from raw_alchemy.workers.thumbnail_worker import ThumbnailWorker
 
 
@@ -234,6 +234,7 @@ class LibraryControllerMixin:
                 item.setData(Qt.ItemDataRole.UserRole, path)
                 item.setIcon(icon)
                 is_marked = path in self.marked_files
+                item.setData(MARKED_ROLE, is_marked)
                 item.setText(f"{MARK_PREFIX} {name}" if is_marked else name)
                 self.gallery_list.addItem(item)
                 self.gallery_items_by_path[path] = item
@@ -248,6 +249,7 @@ class LibraryControllerMixin:
         item.setIcon(boxed_icon(image))
 
         is_marked = path in self.marked_files
+        item.setData(MARKED_ROLE, is_marked)
         item.setText(f"{MARK_PREFIX} {name}" if is_marked else name)
 
         self.gallery_list.addItem(item)
@@ -376,6 +378,9 @@ class LibraryControllerMixin:
         if item is None:
             return
         is_marked = path in self.marked_files
+        item.setData(MARKED_ROLE, is_marked)
+        item.setData(Qt.ItemDataRole.AccessibleTextRole,
+                     f"{os.path.basename(path)}, {tr('marked')}" if is_marked else os.path.basename(path))
         name = os.path.basename(path)
         item.setText(f"{MARK_PREFIX} {name}" if is_marked else name)
 

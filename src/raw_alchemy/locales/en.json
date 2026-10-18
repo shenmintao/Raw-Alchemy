@@ -214,6 +214,9 @@
     "lut_none": "None",
     "scopes_from_proxy": "Scopes are computed from the preview proxy",
     "scopes_from_full": "Scopes are computed from the full-resolution image",
+    "zoom_fit": "Fit",
+    "zoom_percentage": "Preview zoom percentage",
+    "zoom_native_hint": "One source pixel per display pixel",
     "native_base_enable": "Native-resolution preview (instant zoom and pan)",
     "native_base_hint": "About a second after you stop editing, a full-resolution preview is rendered in the background. High-megapixel photos use a few hundred MB more RAM and VRAM; if the GPU texture limit or free memory is too small, tiled detail rendering is used instead."
 }

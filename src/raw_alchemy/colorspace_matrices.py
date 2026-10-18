@@ -128,6 +128,9 @@ def cam_to_working_matrix(
         G2 channels are folded together.
     """
     xyz_to_cam_4x3 = np.asarray(xyz_to_cam_4x3, dtype=np.float64)
+    if (xyz_to_cam_4x3.shape not in ((3, 3), (4, 3))
+            or not np.isfinite(xyz_to_cam_4x3).all()):
+        raise ValueError("XYZ_to_CAM must be a finite 3x3 or 4x3 matrix.")
 
     # Drop all-zero rows (3-color cameras have a zero 4th row).
     valid = xyz_to_cam_4x3.any(axis=1)
@@ -136,6 +139,8 @@ def cam_to_working_matrix(
     if n < 3:
         raise ValueError(
             f"XYZ_to_CAM has only {n} valid rows; need at least 3.")
+    if np.linalg.matrix_rank(XYZ_to_CAM) < 3:
+        raise ValueError("XYZ_to_CAM is singular.")
 
     # Step 1: RGB(D65) → CAM.
     RGB_to_CAM = XYZ_to_CAM @ working_rgb_to_xyz_d65
@@ -144,6 +149,8 @@ def cam_to_working_matrix(
     # This is the key step we missed when first trying to derive it
     # analytically — it bakes in the daylight WB anchor.
     row_sum = RGB_to_CAM.sum(axis=1, keepdims=True)
+    if np.any(np.abs(row_sum) <= 1e-12):
+        raise ValueError("XYZ_to_CAM has an invalid white point.")
     RGB_to_CAM = RGB_to_CAM / row_sum
     daylight_mul = (1.0 / row_sum).flatten()
 

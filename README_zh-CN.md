@@ -105,7 +105,27 @@ cd raw-alchemy
 pip install .
 ```
 
-*注意：本项目依赖特定版本的 `rawpy` 和 `colour-science`。*
+要读取**尼康高效率 HE／HE★ NEF**，在安装项目前构建增强解码器；已有环境也可执行：
+
+```bash
+python -m pip install cmake
+python tools/build_rawpy.py --install
+python -m pip install -r requirements.lock
+pip install .
+python tools/build_rawpy.py --verify
+```
+
+需要 C++ 编译器：Windows 使用 Visual Studio 2022 C++ Build Tools，macOS
+使用 Xcode Command Line Tools，Linux 使用 GCC。源码及校验值固定在
+`raw-dependencies.json`。构建采用 rawpy 0.27.1，以及基于
+[LibRaw PR #826](https://github.com/LibRaw/LibRaw/pull/826) 并补充正确性修复的
+[HE／HE★ 分支](https://github.com/pdcgomes/redlamp-libraw)。原 PR 仅支持 HE；
+Halcyon 的 Ceyx 核心另有 HE★ 扩展，本项目无需引入整个 Flutter 应用。
+CI 与便携版发布流程会构建增强解码器；仅执行 `pip install .` 安装的是上游
+rawpy，不会自动获得 HE 支持。
+
+预览区提供“适应窗口”、100%（一个原图像素对应一个屏幕像素）和可编辑缩放
+百分比。已标记图片的缩略图显示绿色边框和勾选徽标，异步刷新缩略图后仍会保留。
 
 **macOS CoreML 缓存：** 编译后的模型保存在
 `~/Library/Caches/RawAlchemy/coreml/`。缓存命名空间由 ONNX 模型及其引用的全部

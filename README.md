@@ -105,7 +105,29 @@ cd raw-alchemy
 pip install .
 ```
 
-*Note: This project depends on specific versions of `rawpy` and `colour-science`.*
+For **Nikon High Efficiency (HE / HE★)** NEFs, build the enhanced decoder before
+installing the project (or run this in an existing environment):
+
+```bash
+python -m pip install cmake
+python tools/build_rawpy.py --install
+python -m pip install -r requirements.lock
+pip install .
+python tools/build_rawpy.py --verify
+```
+
+This needs a C++ compiler (Visual Studio 2022 C++ Build Tools on Windows,
+Xcode Command Line Tools on macOS, or GCC on Linux). Sources and checksums are
+pinned in `raw-dependencies.json`. The build uses rawpy 0.27.1 and the corrected
+[HE/HE★ LibRaw fork](https://github.com/pdcgomes/redlamp-libraw), derived from
+[LibRaw PR #826](https://github.com/LibRaw/LibRaw/pull/826). The original PR only
+supports HE. Halcyon's Ceyx core carries a separate HE★ extension; the complete
+Flutter application is not needed here. CI and portable releases build this
+decoder; plain `pip install .` uses upstream rawpy and does not add HE support.
+
+Preview controls include Fit, 100% (one original pixel per display pixel),
+and an editable zoom percentage. Marked thumbnails have a green border and a
+check badge, including after asynchronous thumbnail refreshes.
 
 **macOS CoreML cache:** Compiled models are cached under
 `~/Library/Caches/RawAlchemy/coreml/`. Cache namespaces are derived from the ONNX

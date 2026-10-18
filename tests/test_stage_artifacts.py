@@ -10,6 +10,21 @@ from raw_alchemy.pipeline import stage_identity as identity
 from raw_alchemy.pipeline.executor import PipelineAborted
 
 
+def test_native_decoder_revision_invalidates_artifacts_without_distribution_metadata(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    build = ModuleType('rawpy._rawalchemy_build')
+    build.BUILD = dict(wheel_version='0.27.1+rawalchemy.he1', decoder_revision='first')
+    monkeypatch.setitem(sys.modules, build.__name__, build)
+    monkeypatch.setattr(identity, '_runtime_version', lambda package: 'unavailable')
+    monkeypatch.setattr(identity, '_identity_files', lambda: [])
+    first = identity.denoise_tag()
+    assert first is not None
+    build.BUILD['decoder_revision'] = 'second'
+    assert first != identity.denoise_tag()
+
+
 @pytest.fixture
 def cache_source(tmp_path, monkeypatch):
     monkeypatch.setenv("RAWALCHEMY_DENOISE_CACHE_DIR", str(tmp_path / "cache"))

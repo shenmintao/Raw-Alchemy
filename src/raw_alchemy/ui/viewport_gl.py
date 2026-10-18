@@ -98,6 +98,7 @@ class ImageViewportGL(QOpenGLWidget):
     # Signal emitted when viewport size changes (for processor to know target size)
     viewport_resized = Signal(int, int)  # width, height
     zoom_changed = Signal(float)
+    image_changed = Signal()
     # Signals for A/B comparison (right-click hold)
     compare_pressed = Signal()
     compare_released = Signal()
@@ -512,6 +513,7 @@ class ImageViewportGL(QOpenGLWidget):
         self._has_image = True
         self._clear_roi_state(release_texture=True)
         self.update()  # Schedule repaint
+        self.image_changed.emit()
 
     def set_roi_image(self, img_uint8: np.ndarray, source_size, roi_rect):
         """Update the ROI overlay texture (T7.5).
@@ -639,8 +641,28 @@ class ImageViewportGL(QOpenGLWidget):
         self._offset_x = 0.0
         self._offset_y = 0.0
         self.update()
+        self.image_changed.emit()
 
     # --- Zoom / Pan ---
+
+    def zoom_percent(self):
+        """Displayed device pixels per source pixel, independent of proxy size."""
+        source_w, source_h = self._display_dimensions()
+        if not self._has_image or min(source_w, source_h, self.width(), self.height()) <= 0:
+            return None
+        native = hundred_percent_zoom(
+            source_w, source_h, self.width(), self.height(), self.devicePixelRatioF(),
+        )
+        return 100.0 * self._zoom / native
+
+    def set_zoom_percent(self, percent):
+        current = self.zoom_percent()
+        if current is None or not np.isfinite(percent):
+            return
+        self._zoom *= max(0.1, min(float(percent), 1600.0)) / current
+        self._clamp_offset()
+        self.update()
+        self.zoom_changed.emit(self._zoom)
 
     def fit_to_view(self):
         """Reset zoom to fit image in viewport."""
@@ -704,7 +726,10 @@ class ImageViewportGL(QOpenGLWidget):
         factor = 1.1 if delta > 0 else (1 / 1.1)
         old_zoom = self._zoom
         old_scale_x, old_scale_y = self._display_scale(old_zoom)
-        new_zoom = max(0.1, min(self._zoom * factor, 50.0))
+        percent = self.zoom_percent()
+        if percent is None:
+            return
+        new_zoom = self._zoom * max(0.1, min(percent * factor, 1600.0)) / percent
         new_scale_x, new_scale_y = self._display_scale(new_zoom)
 
         mx = (event.position().x() / self.width()) * 2.0 - 1.0

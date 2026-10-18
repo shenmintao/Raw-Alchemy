@@ -1,5 +1,99 @@
 # Upgrade Status
 
+## 2026-10-18 — Nikon HE/HE★, DNG colour metadata and preview controls
+
+The decoder is built with rawpy 0.27.1 and
+[`pdcgomes/redlamp-libraw@3b20539`](https://github.com/pdcgomes/redlamp-libraw/tree/3b20539d3faa766a370e93a529a3b87edffbf0f6).
+This is a corrected continuation of [LibRaw PR #826](https://github.com/LibRaw/LibRaw/pull/826),
+whose original head supports HE but explicitly refuses HE★. Halcyon's Ceyx
+core carries the separate zidage HE★ extension. The selected fork additionally
+fixes reconstruction boundaries, the transfer curve, malformed streams and
+concurrent decodes, and carries reference hashes for its sample corpus.
+
+`tools/build_rawpy.py --install` builds checksum-pinned sources and verifies the
+wheel before installing it. zlib 1.3.2 and libjpeg-turbo 3.2.0 are built into
+LibRaw; DNG deflate and lossy JPEG support are required checks. On Windows,
+global vcpkg MSBuild injection is disabled to prevent unpinned import libraries
+from replacing those codecs. The decoder source revision identifies persistent
+stage caches, and PyInstaller retains rawpy metadata and licence notices.
+CI and all three release jobs use this build and the runtime lock.
+
+Real sample check on Windows/Python 3.12: Z8 HE and HE★ at 8280×5520, plus
+Z50 II HE and HE★ at 3728×3728 (1:1 crop), match the upstream reference at every
+sensor sample. Reproduce with `python tools/check_nikon_he.py --download`.
+This comparison checks the imported decoder's recorded mosaics; it is not an
+independent Adobe/Nikon comparison on every supported camera. Linux/macOS
+native execution still needs the corresponding CI jobs.
+
+[Issue #34](https://github.com/shenmintao/Raw-Alchemy/issues/34): reject zero,
+nonfinite and singular camera matrices before demosaic. When `cam_xyz` is
+missing, recover the embedded camera-to-sRGB matrix, then the camera's declared
+profile in the bundled RawSpeed database. If no profile is usable, use LibRaw's
+linear sRGB colour processing. Canonical and neighbour decoders share
+the recovery path, with camera white balance and rotation applied once. Tests
+cover both working spaces and preserve existing camera-matrix golden values.
+The issue does not provide its original DNG, so that specific file has not
+been retested.
+
+Z50 II's D65 XYZ-to-camera matrix is
+`[11640,-4829,-1079; -5107,13006,2325; -972,1711,7380] / 10000`.
+It matches both the bundled RawSpeed profile and the Z50 II's own Adobe Standard
+DCP (`C:/ProgramData/Adobe/CameraRaw/CameraProfiles/Adobe Standard/Nikon Z 50 2 Adobe Standard.dcp`)
+on the validation machine. The DCP's A-illuminant matrix is
+`[13247,-7357,658; -4296,12270,2269; -237,800,7992] / 10000`;
+both also match [dnglab's Z50 II profile](https://github.com/dnglab/dnglab/blob/main/rawler/data/cameras/nikon/z50_mk2.toml).
+Only the existing numeric matrix is used; the Adobe DCP is not redistributed.
+When LibRaw lacks these coefficients, EXIF identifies the exact bundled camera
+profile so HE/HE★ retain the application's usual demosaic and colour pipeline.
+
+[Issue #28](https://github.com/shenmintao/Raw-Alchemy/issues/28): the main preview
+now exposes Fit, 100% and an editable percentage. Scaling uses original image
+dimensions and display DPI even when the displayed preview is a proxy. Marked
+thumbnails have a green frame and check badge painted independently of the
+thumbnail, so asynchronous replacement retains the mark.
+
+Dependency audit and selected updates (initial local environment → runtime lock):
+
+| Component | Initial | Selected |
+|---|---|---|
+| rawpy | 0.25.1 | 0.27.1+rawalchemy.he1 |
+| PySide6 | 6.10.1 | 6.11.2 |
+| Fluent Widgets | 1.10.5 | 1.11.3 |
+| ONNX | 1.17.0 | 1.23.2 |
+| NumPy | 2.3.5 | 2.4.4 |
+| OpenCV | contrib 4.11.0.86 | headless 4.13.0.92 |
+| Pillow | 12.1.0 | 12.2.0 |
+| pillow-heif | 1.1.1 | 1.8.1 |
+| SciPy | 1.17.0 | 1.17.1 |
+| Windows ONNX Runtime DirectML | 1.24.4 | 1.24.4 (current latest) |
+
+The selected Qt 6.11, OpenCV 4 and Pillow 12 ranges defer newer major releases.
+NumPy 2.5 and SciPy 1.18 require Python 3.12; the project still supports Python
+3.11. The universal lock now includes the previously missing ONNX dependency,
+macOS/Windows transitive dependencies and separate tifffile versions for Python
+3.11 and 3.12+. Unused Taichi dependencies are absent from the new lock.
+The local retired Numba installation was updated to 0.65.1 for NumPy 2.4
+compatibility; Numba remains outside the application runtime dependencies.
+
+Version metadata was checked against the primary
+[PyPI package index](https://pypi.org/) on 2026-10-18. The older `raw_alchemy`
+0.5.0 generated metadata was backed up under `.test-output/` and the current
+editable installation was refreshed to remove obsolete GPU/Qt requirements.
+
+Final Windows/Python 3.12 validation:
+
+- Full test suite: **620 passed, 11 skipped**; two existing colour-science
+  reference warnings for Canon Log 2/3 remain.
+- Ruff for application, tests and tools; `git diff --check`; `pip check`: passed.
+- Fresh native build and isolated enhanced-wheel load: passed, with LibRaw,
+  zlib and libjpeg-turbo notices included.
+- All four recorded Nikon mosaics match. A real Z50 II HE JPEG uses the
+  bundled camera profile and RCD path; a Z50 II HE★ HDR HEIF reads back as
+  3728×3728, 10-bit, BT.2020/PQ (NCLX primaries 9, transfer 16, matrix 9).
+- Rebuilt application wheel passes the isolated packaged asset/model/Qt probe.
+  No new portable executable has been published; Linux/macOS execution remains
+  for CI. Issue #34's original DNG is still needed for file-specific acceptance.
+
 ## Post-`studio-v0.6.0-pre7` — bounded working set and VRAM reclamation
 
 This follow-up pass removes the remaining high-water allocations that were

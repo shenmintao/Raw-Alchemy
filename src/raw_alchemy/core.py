@@ -403,11 +403,13 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
     import rawpy
     from raw_alchemy.onnx.denoiser import _apply_flip
     from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
+    from raw_alchemy.raw_color import camera_to_working, decode_with_libraw_color
 
     # ---- CFA fast path: rawspeed/rawpy decode + ONNX demosaic (GPU) ----
     cfa_data = None
     rs = None
     xtrans_cfa = None
+    camera_matrix = None
     try:
         from raw_alchemy import rawspeed
         rs = rawspeed.try_decode(raw_path)
@@ -435,6 +437,10 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
             rs and rs.color_matrix is not None
             and (rs.is_bayer or xtrans_cfa is not None)
         )
+        if rs_ok:
+            # An all-zero DNG matrix is present metadata, but cannot be used
+            # for colour conversion. LibRaw may still have an embedded profile.
+            camera_matrix = cam_to_working_space_matrix(rs.color_matrix)
     except Exception:
         rs_ok = False
     if rs_ok:
@@ -461,6 +467,10 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
         with rawpy.imread(raw_path) as raw:
             cfa = raw.raw_pattern
             if cfa is not None and cfa.shape in ((2, 2), (6, 6)):
+                camera_matrix = camera_to_working(raw, raw_path)
+                if camera_matrix is None:
+                    flip = raw.sizes.flip
+                    return np.ascontiguousarray(_apply_flip(decode_with_libraw_color(raw), flip))
                 cfa_data = (
                     raw.raw_image_visible.astype(np.float32),
                     np.array(raw.black_level_per_channel, dtype=np.float32),
@@ -482,7 +492,7 @@ def _rawpy_decode_to_prophoto(raw_path: str) -> np.ndarray:
         highlight_inpaint_opposed(raw_norm, cfa_pattern, wb)
         g = wb[1] if wb[1] > 0 else 1.0
         wb3 = np.array([wb[0] / g, 1.0, wb[2] / g], np.float32)
-        m = cam_to_working_space_matrix(xyz_to_cam).astype(np.float32)
+        m = camera_matrix.astype(np.float32)
         lift, scale = _lift_for_demosaic(raw_norm)
         if cfa_pattern.shape == (2, 2):
             # Plain demosaic on the GPU: the graph's fused WB+matrix output

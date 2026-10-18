@@ -259,14 +259,19 @@ def decode_cpu(path: str):
     """
     from raw_alchemy.math_ops import apply_matrix_inplace
     import rawpy
-    from raw_alchemy.colorspace_matrices import cam_to_working_space_matrix
+    from raw_alchemy.raw_color import camera_to_working, decode_with_libraw_color
     from raw_alchemy.onnx.denoiser import _apply_flip
     from raw_alchemy.exif import extract_lens_exif
 
     with rawpy.imread(path) as raw:
         wb = np.array(raw.camera_whitebalance, dtype=np.float32)
         flip = raw.sizes.flip
-        xyz = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
+        m = camera_to_working(raw, path)
+        if m is None:
+            rgb = np.ascontiguousarray(_apply_flip(decode_with_libraw_color(raw), flip))
+            np.clip(rgb, 0.0, 1.0, out=rgb)
+            exif_data, exif_metadata = extract_lens_exif(path, None)
+            return rgb, exif_data, exif_metadata
         # Camera-native demosaic only: unit WB, no auto-bright, linear,
         # unflipped — this app owns white balance, colour and orientation.
         cam = raw.postprocess(
@@ -286,8 +291,7 @@ def decode_cpu(path: str):
     rgb[:, :, 0] *= wb[0] / g
     rgb[:, :, 2] *= wb[2] / g
     # cam->working matrix, per-pixel (M @ [r,g,b]); numpy keeps it GPU-free.
-    m = cam_to_working_space_matrix(xyz).astype(np.float32)
-    apply_matrix_inplace(rgb, m)
+    apply_matrix_inplace(rgb, m.astype(np.float32))
     rgb = np.ascontiguousarray(_apply_flip(rgb, flip))
     np.clip(rgb, 0.0, 1.0, out=rgb)
     exif_data, exif_metadata = extract_lens_exif(path, None)

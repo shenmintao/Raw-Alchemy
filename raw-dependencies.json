@@ -1,0 +1,28 @@
+{
+  "wheel_version": "0.27.1+rawalchemy.he1",
+  "decoder_revision": "3b20539d3faa766a370e93a529a3b87edffbf0f6",
+  "decoder_source": "https://github.com/pdcgomes/redlamp-libraw",
+  "decoder_license": "LGPL-2.1",
+  "sources": {
+    "rawpy": {
+      "url": "https://files.pythonhosted.org/packages/f3/ae/c1c7816ed3f3cbf7ca284a37371243500f4eb39b6a32f7368b585c4ef5c4/rawpy-0.27.1.tar.gz",
+      "sha256": "3194d64ff690ac945e1a43237edae8a18f1f493751924de1ae2bcef473c0fb79",
+      "source_root": "rawpy-0.27.1"
+    },
+    "libraw": {
+      "url": "https://codeload.github.com/pdcgomes/redlamp-libraw/tar.gz/3b20539d3faa766a370e93a529a3b87edffbf0f6",
+      "sha256": "2c98d641b777d9a67dd8c716a6e5cfd4479648057eae267e08e3b5c4899c5145",
+      "source_root": "redlamp-libraw-3b20539d3faa766a370e93a529a3b87edffbf0f6"
+    },
+    "zlib": {
+      "url": "https://codeload.github.com/madler/zlib/tar.gz/refs/tags/v1.3.2",
+      "sha256": "b99a0b86c0ba9360ec7e78c4f1e43b1cbdf1e6936c8fa0f6835c0cd694a495a1",
+      "source_root": "zlib-1.3.2"
+    },
+    "jpeg": {
+      "url": "https://codeload.github.com/libjpeg-turbo/libjpeg-turbo/tar.gz/refs/tags/3.2.0",
+      "sha256": "980dd81f425082aa6d7c9e47fef27554ce7a9ffc8e2f6e863b97d263c5c50858",
+      "source_root": "libjpeg-turbo-3.2.0"
+    }
+  }
+}

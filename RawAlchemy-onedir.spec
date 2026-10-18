@@ -10,7 +10,7 @@ strip_executable = False
 # --- Platform-specific binaries ---
 import os
 import glob
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 from PyInstaller.config import CONF
 sys.path.insert(0, SPECPATH)
 from build_support import pyinstaller_vendor_datas
@@ -116,7 +116,7 @@ a = Analysis(
         ('icon.ico', '.'), ('icon.png', '.'),
         ('src/raw_alchemy/math_ops.py', 'raw_alchemy'),
         ('src/raw_alchemy/gpu_buffer.py', 'raw_alchemy'),
-    ] + native_vendor_datas + rawspeedpy_datas + identity_source_datas,
+    ] + native_vendor_datas + rawspeedpy_datas + identity_source_datas + copy_metadata('rawpy'),
     hiddenimports=['tkinter', 'loguru', 'pyexiv2', ort_package, 'onnx', 'OpenGL', 'OpenGL.GL', 'OpenGL.GL.shaders'],
     hookspath=[],
     hooksconfig={},
