@@ -67,6 +67,34 @@
 2.  下载适用于您系统的最新可执行文件 (例如 `RawAlchemy-vX.Y.Z-windows.exe` 或 `RawAlchemy-vX.Y.Z-linux`)。
 3.  运行工具。详情请参阅 [使用方法](#使用方法) 部分。
 
+### macOS：通过 Homebrew 安装
+
+需要已安装 Homebrew，且使用 **Apple Silicon 和 macOS 26 或更新版本**。
+本仓库提供用于安装预编译图形应用的 Homebrew Cask：
+
+```bash
+brew tap shenmintao/raw-alchemy https://github.com/shenmintao/Raw-Alchemy.git
+brew install --cask shenmintao/raw-alchemy/raw-alchemy-studio
+open -a RawAlchemy
+```
+
+Homebrew 会将自带 Python 的 `RawAlchemy.app` 安装到“应用程序”。
+照片预览、调色和导出均在本机完成，不上传照片，处理时可以断网使用。
+安装、升级以及应用内手动“检查更新”需要联网。
+
+当前 macOS 安装包尚未通过 Apple 公证。如果首次启动被 macOS 拦截，
+先点“完成”关闭提示，再进入 **系统设置 → 隐私与安全性**，
+找到 RawAlchemy 并点 **“仍要打开”**，随后确认 **“打开”**。
+详情参阅 [Apple 关于审核并打开应用的说明](https://support.apple.com/zh-cn/102445)。
+
+升级或卸载：
+
+```bash
+brew update
+brew upgrade --cask shenmintao/raw-alchemy/raw-alchemy-studio
+brew uninstall --cask shenmintao/raw-alchemy/raw-alchemy-studio
+```
+
 ## 💻 从源码安装 (开发者选项)
 
 如果您希望从源码安装本项目，可以按照以下步骤操作：
