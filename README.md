@@ -97,6 +97,13 @@ sudo apt-get install build-essential python3-dev cmake pkg-config libglib2.0-dev
 
 Linux builds compile the checksum-pinned Lensfun source against the build machine's libc. Build release packages on the oldest distribution you intend to support; a wheel built on a newer distribution is not automatically portable to older glibc versions. Windows x86-64 and macOS arm64 use pinned platform binaries. The pinned macOS native library requires macOS 15 or newer; a particular downloadable build may have a newer minimum due to its bundled Python/Qt. Other architectures need corresponding native dependency validation.
 
+Current source builds and future portable builds use the same Lensfun development
+database, pinned to upstream [`master@43f9e00`](https://github.com/lensfun/lensfun/tree/43f9e001ab66c4fcdd4f400463f13b72f94b2288).
+The library version remains 0.3.99.0. Its C/C++ implementation is unchanged from
+the verified Windows/macOS binaries; Linux builds use the pinned upstream source.
+Database checksums, source provenance and its CC BY-SA licence are included in
+the generated packages.
+
 The **v0.6.2 macOS portable app requires macOS 26 or later**. Source builds are
 tested separately on macOS 15.
 

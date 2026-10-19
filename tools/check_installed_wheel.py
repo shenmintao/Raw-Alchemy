@@ -4,6 +4,7 @@ Dependencies are inherited from the build environment. The application wheel
 itself must load from the new environment, without editable source fallbacks.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import site
@@ -15,6 +16,7 @@ import venv
 
 PROBE = '''
 from pathlib import Path
+import json
 import sys
 import numpy as np
 import raw_alchemy
@@ -27,6 +29,18 @@ def main():
     assert Path(lensfun_wrapper._lensfun._name).resolve().is_relative_to(prefix)
     database = lensfun_wrapper.LensfunDatabase()
     assert database.db, "Packaged camera database did not load"
+    database_root = Path(lensfun_wrapper._lensfun._name).parent.parent / "share/lensfun"
+    provenance = json.loads((database_root / "rawalchemy-database.json").read_text(encoding="utf-8"))
+    assert provenance["source_commit"] == sys.argv[1], "Packaged Lensfun database revision is stale"
+    assert (database_root / "COPYING.CC_BY-SA_3.0").is_file(), "Packaged database licence is missing"
+    camera = database.find_camera("Sony", "ZV-1A")
+    assert camera and camera.contents.Model == b"ZV-1A", "New development camera profile is missing"
+    assert database.find_lens(camera, None, None), "New compact-camera profile cannot resolve its fixed lens"
+    model = "Nikkor Z DX 16-50mm f/2.8 VR"
+    lens = database.find_lens(None, "Nikon", model)
+    assert lens and lens.contents.Model == model.encode(), "New development lens profile is missing"
+    modifier = lensfun_wrapper.LensfunModifier(lens, 16.0, 1.531, 128, 96, lensfun_wrapper.LF_PF_F32)
+    assert modifier.enable_distortion_correction() & lensfun_wrapper.LF_MODIFY_DISTORTION
     camera = database.find_camera("Sony", "ZV-1")
     assert camera, "Packaged compact-camera profile is missing"
     lens = database.find_lens(camera, None, None)
@@ -65,6 +79,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('wheel', type=Path)
     args = parser.parse_args()
+    lock = json.loads((Path(__file__).resolve().parents[1] / 'native-dependencies.json').read_text())
     with tempfile.TemporaryDirectory(prefix='rawalchemy-wheel-') as work:
         root = Path(work)
         environment = root / 'environment'
@@ -91,7 +106,7 @@ def main():
         env.update(QT_QPA_PLATFORM='offscreen', RAW_ALCHEMY_CPU_ONLY='1',
                    RAWALCHEMY_NATIVE_ISOLATION='1',
                    RAW_ALCHEMY_LOG_DIR=str(root / 'logs'))
-        subprocess.run([str(python), '-I', str(probe)], cwd=root, env=env,
+        subprocess.run([str(python), '-I', str(probe), lock['database']['commit']], cwd=root, env=env,
                        check=True, timeout=180)
 
 

@@ -1,5 +1,38 @@
 # Upgrade Status
 
+## Post-v0.6.2 — Lensfun development snapshot (2026-10-19)
+
+The upstream development branch is `master`, not `develop`. Source and future
+portable builds now pin its latest commit on the audit date,
+[`43f9e001ab66c4fcdd4f400463f13b72f94b2288`](https://github.com/lensfun/lensfun/tree/43f9e001ab66c4fcdd4f400463f13b72f94b2288)
+(2026-10-08), in `native-dependencies.json`. Version remains **0.3.99.0**,
+with database schema 2. The already-published v0.6.2 archives are unchanged.
+
+A direct file comparison with the previous fork commit `731add8` finds changes
+in **21 database XML files**, but none in the C/C++ library or public headers.
+The fork also differs in Windows CMake install/runtime settings and its LCP
+converter scripts; these are separate from upstream's database additions.
+Windows/macOS keep the checksum-verified native binaries and compatible layout.
+Linux now builds the library from the pinned upstream commit against the host
+ABI. All three platforms install the complete database from that same source.
+
+The source archive and extracted source tree are checked before use. On
+Windows/macOS the final combined runtime/database tree is checked as well,
+including the database's CC BY-SA licence and `rawalchemy-database.json`
+provenance. Failed source or combined-tree verification leaves an existing
+generated runtime intact. For offline builds, `RAWALCHEMY_LENSFUN_SOURCE_ARCHIVE`
+can supply the checksum-pinned database source archive; the existing
+`RAWALCHEMY_LENSFUN_ARCHIVE` override supplies the platform runtime/source.
+
+The isolated application-wheel probe verifies the exact database revision,
+finds the new Sony ZV-1A fixed-lens profile and Nikkor Z DX 16–50mm f/2.8 VR,
+and enables the latter's distortion calibration at 16mm. Existing ZV-1
+correction, model inference and Qt checks continue to pass locally. Thirteen
+native build-contract tests pass, including stale-profile replacement,
+complete-tree reuse and preservation of the previous runtime on corruption.
+The complete Windows suite with the updated database passed: **641 passed,
+11 skipped**; Ruff and the isolated installed-wheel runtime probe passed.
+
 ## v0.6.2 — automatic HE dependency and issue follow-ups
 
 `pip install .` now installs the enhanced rawpy decoder as a standard source

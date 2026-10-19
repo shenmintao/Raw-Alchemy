@@ -15,6 +15,14 @@ def test_supported_binaries_are_pinned_and_verified(system, machine):
     release, asset = build.asset_for(system, machine)
     assert release != 'latest'
     assert len(asset['sha256']) == len(asset['tree_sha256']) == 64
+    database = asset['database']
+    assert len(database['commit']) == 40
+    assert len(database['sha256']) == len(database['tree_sha256']) == 64
+    if asset.get('build') == 'cmake':
+        assert asset['commit'] == database['commit']
+        assert asset['sha256'] == database['sha256']
+    else:
+        assert len(asset['installed_tree_sha256']) == 64
 
 
 @pytest.mark.parametrize('system,machine', [('Windows', 'ARM64'), ('Linux', 'aarch64'), ('Darwin', 'x86_64')])
@@ -100,3 +108,88 @@ def test_built_runtime_must_load_before_publication(tmp_path, monkeypatch):
     monkeypatch.setattr(ctypes, 'CDLL', incompatible)
     with pytest.raises(OSError, match='GLIBC'):
         build._build_lensfun(tmp_path / 'source', tmp_path)
+
+
+@pytest.fixture
+def database_archives(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import zipfile
+
+    runtime = tmp_path / 'runtime'
+    (runtime / 'lib').mkdir(parents=True)
+    (runtime / 'lib/lensfun.dll').write_bytes(b'verified runtime')
+    old_db = runtime / 'share/lensfun/version_2'
+    old_db.mkdir(parents=True)
+    (old_db / 'stale.xml').write_bytes(b'<lensdatabase/>')
+    source = tmp_path / 'source'
+    source_db = source / 'data/db'
+    source_db.mkdir(parents=True)
+    (source_db / 'new.xml').write_bytes(b'<lensdatabase version="2"><camera/></lensdatabase>')
+    (source_db / 'timestamp.txt').write_bytes(b'1234567890\n')
+    (source / 'data/COPYING.CC_BY-SA_3.0').write_bytes(b'database licence fixture')
+
+    def archive(root, name, prefix=''):
+        path = tmp_path / name
+        with zipfile.ZipFile(path, 'w') as bundle:
+            for item in root.rglob('*'):
+                if item.is_file():
+                    bundle.write(item, prefix + item.relative_to(root).as_posix())
+        return dict(archive=name, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    tree_sha256=build.tree_digest(root))
+
+    asset = archive(runtime, 'runtime.zip')
+    database = archive(source, 'source.zip', 'source/')
+    database.update(source_root='source', commit='f' * 40, url='https://example.invalid/pinned')
+    asset['database'] = database
+    provenance = dict(source_commit=database['commit'], source_url=database['url'],
+                      database_tree_sha256=build.tree_digest(source_db))
+    expected = tmp_path / 'expected'
+    expected_files = {
+        'lib/lensfun.dll': b'verified runtime',
+        'share/lensfun/version_2/new.xml': (source_db / 'new.xml').read_bytes(),
+        'share/lensfun/version_2/timestamp.txt': b'1234567890\n',
+        'share/lensfun/COPYING.CC_BY-SA_3.0': b'database licence fixture',
+        'share/lensfun/rawalchemy-database.json':
+            (json.dumps(provenance, sort_keys=True, separators=(',', ':')) + '\n').encode(),
+    }
+    for name, content in expected_files.items():
+        target = expected / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    asset['installed_tree_sha256'] = build.tree_digest(expected)
+    monkeypatch.setattr(build, 'asset_for', lambda: ('pinned', asset))
+    monkeypatch.setenv('RAWALCHEMY_LENSFUN_ARCHIVE', str(tmp_path / 'runtime.zip'))
+    monkeypatch.setenv('RAWALCHEMY_LENSFUN_SOURCE_ARCHIVE', str(tmp_path / 'source.zip'))
+    return asset, expected
+
+
+def test_development_database_replaces_stale_profiles_and_preserves_runtime(tmp_path, monkeypatch, database_archives):
+    asset, expected = database_archives
+    output = tmp_path / 'installed'
+    build.ensure_lensfun(output)
+    assert build.tree_digest(output) == build.tree_digest(expected)
+    assert (output / 'lib/lensfun.dll').read_bytes() == b'verified runtime'
+    assert not (output / 'share/lensfun/version_2/stale.xml').exists()
+    # A complete runtime/database match can be reused without another download.
+    def unexpected_download(*args, **kwargs):
+        pytest.fail('verified installed files should be reused')
+    monkeypatch.setattr(build, '_verified_archive', unexpected_download)
+    build.ensure_lensfun(output)
+    assert build.tree_digest(output) == asset['installed_tree_sha256']
+
+
+@pytest.mark.parametrize('corrupt', ['source_checksum', 'installed_checksum'])
+def test_database_verification_failure_preserves_previous_runtime(tmp_path, database_archives, corrupt):
+    asset, _ = database_archives
+    if corrupt == 'source_checksum':
+        asset['database']['sha256'] = '0' * 64
+    else:
+        asset['installed_tree_sha256'] = '0' * 64
+    output = tmp_path / 'installed'
+    output.mkdir()
+    (output / 'working-runtime').write_bytes(b'previous working installation')
+    before = build.tree_digest(output)
+    with pytest.raises(RuntimeError, match='checksum|do not match'):
+        build.ensure_lensfun(output)
+    assert build.tree_digest(output) == before

@@ -22,6 +22,8 @@ def asset_for(system=None, machine=None):
     asset = lock['platforms'].get(system)
     if asset is None or machine not in asset['architectures']:
         raise RuntimeError(f'No verified Lensfun binary for {system}/{machine}')
+    if lock.get('database'):
+        asset = dict(asset, database=lock['database'])
     return lock['release'], asset
 
 
@@ -37,35 +39,80 @@ def ensure_lensfun(build_vendor):
     release, asset = asset_for()
     build_vendor = Path(build_vendor)
     from_source = asset.get('build') == 'cmake'
-    if not from_source and build_vendor.is_dir() and tree_digest(build_vendor) == asset['tree_sha256']:
+    expected = asset.get('installed_tree_sha256', asset['tree_sha256'])
+    if not from_source and build_vendor.is_dir() and tree_digest(build_vendor) == expected:
         return
     with tempfile.TemporaryDirectory(prefix='rawalchemy-lensfun-') as work:
-        archive = Path(work) / asset['archive']
-        local = os.environ.get('RAWALCHEMY_LENSFUN_ARCHIVE')
-        if local:
-            shutil.copyfile(local, archive)
-        else:
-            url = asset.get('url') or f"https://github.com/shenmintao/lensfun/releases/download/{release}/{asset['archive']}"
-            with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as output:
-                shutil.copyfileobj(response, output)
-        if hashlib.sha256(archive.read_bytes()).hexdigest() != asset['sha256']:
-            raise RuntimeError('Lensfun archive checksum mismatch')
-        extracted = Path(work) / 'extracted'
-        extracted.mkdir()
-        if zipfile.is_zipfile(archive):
-            with zipfile.ZipFile(archive) as bundle:
-                bundle.extractall(extracted)
-        else:
-            with tarfile.open(archive) as bundle:
-                bundle.extractall(extracted, **({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))
-        verified = extracted / asset['source_root'] if from_source else extracted
-        if tree_digest(verified) != asset['tree_sha256']:
-            raise RuntimeError('Lensfun extracted files do not match the lock')
+        verified = _verified_archive(release, asset, Path(work) / 'runtime')
+        database = asset.get('database')
+        database_source = None
+        if database:
+            if from_source and asset['sha256'] == database['sha256']:
+                database_source = verified
+            else:
+                database_source = _verified_archive(
+                    release, database, Path(work) / 'database',
+                    local_env='RAWALCHEMY_LENSFUN_SOURCE_ARCHIVE',
+                )
+        extracted = verified
         if from_source:
             extracted = _build_lensfun(verified, Path(work))
+        if database:
+            _install_database(extracted, database_source, database)
+            if not from_source and tree_digest(extracted) != expected:
+                raise RuntimeError('Lensfun runtime/database files do not match the lock')
         if build_vendor.exists():
             shutil.rmtree(build_vendor)
         shutil.copytree(extracted, build_vendor, symlinks=True)
+
+
+def _verified_archive(release, asset, work, *, local_env='RAWALCHEMY_LENSFUN_ARCHIVE'):
+    """Verify an entire native/source archive before any build or installation."""
+    work.mkdir(parents=True)
+    archive = work / asset['archive']
+    local = os.environ.get(local_env)
+    if local:
+        shutil.copyfile(local, archive)
+    else:
+        url = asset.get('url') or f"https://github.com/shenmintao/lensfun/releases/download/{release}/{asset['archive']}"
+        with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as output:
+            shutil.copyfileobj(response, output)
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != asset['sha256']:
+        raise RuntimeError('Lensfun archive checksum mismatch')
+    extracted = work / 'extracted'
+    extracted.mkdir()
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(extracted)
+    else:
+        with tarfile.open(archive) as bundle:
+            bundle.extractall(extracted, **({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))
+    verified = extracted / asset.get('source_root', '')
+    if tree_digest(verified) != asset['tree_sha256']:
+        raise RuntimeError('Lensfun extracted files do not match the lock')
+    return verified
+
+
+def _install_database(runtime, source, asset):
+    """Use one verified development database with every supported native ABI."""
+    source_db = source / 'data/db'
+    if not any(source_db.glob('*.xml')):
+        raise RuntimeError('Lensfun source is missing its camera database')
+    destination = runtime / 'share/lensfun/version_2'
+    destination.mkdir(parents=True, exist_ok=True)
+    for old in destination.iterdir():
+        if not old.is_file() or old.is_symlink():
+            raise RuntimeError('Unexpected directory or link in Lensfun database')
+        old.unlink()
+    for item in source_db.iterdir():
+        if item.is_file():
+            shutil.copyfile(item, destination / item.name)
+    shutil.copyfile(source / 'data/COPYING.CC_BY-SA_3.0', destination.parent / 'COPYING.CC_BY-SA_3.0')
+    provenance = dict(source_commit=asset['commit'], source_url=asset['url'],
+                      database_tree_sha256=tree_digest(source_db))
+    (destination.parent / 'rawalchemy-database.json').write_text(
+        json.dumps(provenance, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8', newline='\n',
+    )
 
 
 def _build_lensfun(source, work):
