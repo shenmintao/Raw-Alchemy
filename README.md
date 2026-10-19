@@ -71,6 +71,35 @@ For most users, the easiest way to use Raw Alchemy Studio is to download the pre
 2.  Download the latest executable for your system (Windows portable ZIP, macOS DMG, or Linux portable tarball).
 3.  Run the tool. See the [Usage](#usage) section for details.
 
+### macOS: install with Homebrew
+
+Requires Homebrew, **Apple Silicon and macOS 26 or later**. This repository
+provides a Homebrew Cask for the pre-built graphical application:
+
+```bash
+brew tap shenmintao/raw-alchemy https://github.com/shenmintao/Raw-Alchemy.git
+brew install --cask shenmintao/raw-alchemy/raw-alchemy-studio
+open -a RawAlchemy
+```
+
+Homebrew installs `RawAlchemy.app` in Applications with Python bundled.
+Photo previews, grading and exports run locally; photos are not uploaded.
+Processing works offline. Installation, upgrades and the app's manual
+"Check for updates" action need an internet connection.
+
+The current macOS release is not notarized. If macOS blocks the first launch,
+close the alert with **Done**, open **System Settings > Privacy & Security**,
+click **Open Anyway** for RawAlchemy, then confirm **Open**.
+See [Apple's instructions for reviewing and opening an app](https://support.apple.com/102445).
+
+To upgrade or uninstall:
+
+```bash
+brew update
+brew upgrade --cask shenmintao/raw-alchemy/raw-alchemy-studio
+brew uninstall --cask shenmintao/raw-alchemy/raw-alchemy-studio
+```
+
 ## 💻 Installation from Source (For Developers)
 
 If you want to install the project from source, you can follow these steps:
