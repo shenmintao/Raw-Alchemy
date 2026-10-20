@@ -70,10 +70,12 @@
 ### macOS：通过 Homebrew 安装
 
 需要已安装 Homebrew，且使用 **Apple Silicon 和 macOS 26 或更新版本**。
-本仓库提供用于安装预编译图形应用的 Homebrew Cask：
+独立的 [Homebrew tap 仓库](https://github.com/shenmintao/homebrew-raw-alchemy)
+提供用于安装预编译图形应用的 Cask。添加 tap 时只下载安装配置，
+安装应用时 Homebrew 再从 Releases 下载应用包。
 
 ```bash
-brew tap shenmintao/raw-alchemy https://github.com/shenmintao/Raw-Alchemy.git
+brew tap shenmintao/raw-alchemy
 brew install --cask shenmintao/raw-alchemy/raw-alchemy-studio
 open -a RawAlchemy
 ```
@@ -93,6 +95,17 @@ Homebrew 会将自带 Python 的 `RawAlchemy.app` 安装到“应用程序”。
 brew update
 brew upgrade --cask shenmintao/raw-alchemy/raw-alchemy-studio
 brew uninstall --cask shenmintao/raw-alchemy/raw-alchemy-studio
+```
+
+如果之前用显式的 `https://github.com/shenmintao/Raw-Alchemy.git` 地址添加过 tap，
+请执行一次以下迁移，移除较大的源码仓库副本并改用独立 tap：
+
+```bash
+# 如果尚未安装应用，跳过 uninstall 这一行。
+brew uninstall --cask shenmintao/raw-alchemy/raw-alchemy-studio
+brew untap shenmintao/raw-alchemy
+brew tap shenmintao/raw-alchemy
+brew install --cask shenmintao/raw-alchemy/raw-alchemy-studio
 ```
 
 ## 💻 从源码安装 (开发者选项)

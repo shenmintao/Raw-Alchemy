@@ -69,11 +69,13 @@ For most users, the easiest way to use Raw Alchemy is to download the pre-compil
 
 ### macOS: install with Homebrew
 
-Requires Homebrew, **Apple Silicon and macOS 26 or later**. This repository
-provides a Homebrew Cask for the pre-built graphical application:
+Requires Homebrew, **Apple Silicon and macOS 26 or later**. The dedicated
+[Homebrew tap](https://github.com/shenmintao/homebrew-raw-alchemy) provides a
+Cask for the pre-built graphical application. Tapping downloads only the
+installation metadata; Homebrew downloads the app from Releases when installing.
 
 ```bash
-brew tap shenmintao/raw-alchemy https://github.com/shenmintao/Raw-Alchemy.git
+brew tap shenmintao/raw-alchemy
 brew install --cask shenmintao/raw-alchemy/raw-alchemy-studio
 open -a RawAlchemy
 ```
@@ -94,6 +96,18 @@ To upgrade or uninstall:
 brew update
 brew upgrade --cask shenmintao/raw-alchemy/raw-alchemy-studio
 brew uninstall --cask shenmintao/raw-alchemy/raw-alchemy-studio
+```
+
+If you previously tapped the application source repository with an explicit
+`https://github.com/shenmintao/Raw-Alchemy.git` URL, migrate once to remove that
+large checkout and use the dedicated tap:
+
+```bash
+# Skip the uninstall line if the app is not installed.
+brew uninstall --cask shenmintao/raw-alchemy/raw-alchemy-studio
+brew untap shenmintao/raw-alchemy
+brew tap shenmintao/raw-alchemy
+brew install --cask shenmintao/raw-alchemy/raw-alchemy-studio
 ```
 
 ## 💻 Installation from Source (For Developers)
