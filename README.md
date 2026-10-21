@@ -133,7 +133,7 @@ the verified Windows/macOS binaries; Linux builds use the pinned upstream source
 Database checksums, source provenance and its CC BY-SA licence are included in
 the generated packages.
 
-The **v0.6.2 macOS portable app requires macOS 26 or later**. Source builds are
+The **v0.6.3 macOS portable app requires macOS 26 or later**. Source builds are
 tested separately on macOS 15.
 
 **Linux / Windows** — then install the project:
