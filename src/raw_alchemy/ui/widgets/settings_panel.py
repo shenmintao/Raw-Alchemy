@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QMessageBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QMessageBox, QFileDialog
 from PySide6.QtCore import Signal, QThread, QObject
 
 from qfluentwidgets import (
@@ -12,13 +12,15 @@ from raw_alchemy.i18n import tr
 
 
 class CudaDownloadWorker(QObject):
-    """Worker thread for downloading CUDA runtime."""
-    progress = Signal(int, int)  # downloaded, total
+    """Download or import a CUDA runtime away from the UI thread."""
+    progress = Signal(object, object)  # bytes copied, total; packages may exceed 2 GiB
     finished = Signal(bool)  # success
 
-    def __init__(self):
+    def __init__(self, archive_path=None):
         super().__init__()
         self._cancel_requested = False
+        self.archive_path = archive_path
+        self.error = ''
 
     def cancel(self):
         self._cancel_requested = True
@@ -26,14 +28,18 @@ class CudaDownloadWorker(QObject):
     def run(self):
         try:
             from raw_alchemy.onnx import gpu_runtime
-            success = gpu_runtime.download_cuda_runtime(
+            install = gpu_runtime.import_cuda_runtime if self.archive_path else gpu_runtime.download_cuda_runtime
+            args = (self.archive_path,) if self.archive_path else ()
+            success = install(
+                *args,
                 progress_callback=lambda d, t: self.progress.emit(d, t),
                 cancel_callback=lambda: self._cancel_requested,
             )
             self.finished.emit(success)
         except Exception as e:
             from loguru import logger
-            logger.error(f"CUDA download failed: {e}")
+            self.error = str(e)
+            logger.error(f"CUDA runtime installation failed: {e}")
             self.finished.emit(False)
 
 
@@ -52,6 +58,7 @@ class SettingsPanel(QWidget):
         
         self._download_thread = None
         self._download_worker = None
+        self._importing_cuda = False
         
         self._init_ui()
         self._update_cuda_status()
@@ -169,6 +176,7 @@ class SettingsPanel(QWidget):
         
         # GPU detection info
         self.gpu_info_label = BodyLabel("")
+        self.gpu_info_label.setWordWrap(True)
         gpu_layout.addWidget(self.gpu_info_label)
         
         # CUDA status
@@ -187,13 +195,26 @@ class SettingsPanel(QWidget):
         # Download size hint
         self.download_hint = CaptionLabel(tr('cuda_download_size'))
         self.download_hint.setStyleSheet("color: gray;")
+        self.download_hint.setWordWrap(True)
         gpu_layout.addWidget(self.download_hint)
+
+        self.cuda_details_label = CaptionLabel('')
+        self.cuda_details_label.setWordWrap(True)
+        gpu_layout.addWidget(self.cuda_details_label)
         
         # Download/Remove button
         btn_row = QHBoxLayout()
         self.cuda_download_btn = PrimaryPushButton(tr('download_cuda'))
         self.cuda_download_btn.clicked.connect(self.on_cuda_download_clicked)
         btn_row.addWidget(self.cuda_download_btn)
+
+        self.cuda_import_btn = PushButton(tr('import_cuda'))
+        self.cuda_import_btn.clicked.connect(self.on_cuda_import_clicked)
+        btn_row.addWidget(self.cuda_import_btn)
+
+        self.cuda_detect_btn = PushButton(tr('detect_cuda'))
+        self.cuda_detect_btn.clicked.connect(self._update_cuda_status)
+        btn_row.addWidget(self.cuda_detect_btn)
         
         self.cuda_remove_btn = PushButton(tr('remove_cuda'))
         self.cuda_remove_btn.clicked.connect(self.on_cuda_remove_clicked)
@@ -238,45 +259,54 @@ class SettingsPanel(QWidget):
         try:
             from raw_alchemy.onnx import gpu_runtime
             
-            # Detect GPU
+            # Inspect installed libraries before offering any installation.
+            status = gpu_runtime.detect_cuda_runtime()
             gpu_info = gpu_runtime.detect_gpu_vendor()
-            if gpu_info['cuda_compatible'] and gpu_runtime.cuda_provider_bundled() is False:
+            provider_missing = gpu_runtime.cuda_provider_bundled() is False
+            can_install = gpu_info['cuda_compatible'] and not provider_missing
+            if gpu_info['cuda_compatible'] and provider_missing:
                 # A DirectML/CPU build cannot use a downloaded CUDA runtime.
                 self.gpu_info_label.setText(
                     f"ℹ️ {tr('nvidia_gpu')}: {gpu_info['name']} - {tr('cuda_provider_missing')}"
                 )
-                self.cuda_download_btn.setEnabled(False)
             elif gpu_info['cuda_compatible']:
                 self.gpu_info_label.setText(f"✅ {tr('nvidia_gpu')}: {gpu_info['name']}")
-                self.cuda_download_btn.setEnabled(True)
             elif gpu_info['vendor'] == 'amd':
                 self.gpu_info_label.setText(f"⚠️ {tr('amd_gpu')}")
-                self.cuda_download_btn.setEnabled(False)
             elif gpu_info['vendor'] == 'intel':
                 self.gpu_info_label.setText(f"⚠️ {tr('intel_gpu')}")
-                self.cuda_download_btn.setEnabled(False)
             else:
                 self.gpu_info_label.setText(f"❓ {tr('no_gpu_detected')}")
-                self.cuda_download_btn.setEnabled(False)
-            
-            # Check CUDA installation
-            if gpu_runtime.is_cuda_runtime_installed():
-                version = gpu_runtime.get_installed_cuda_version() or ""
-                self.cuda_status_label.setText(f"✅ {tr('cuda_installed')} (v{version})")
+
+            self.cuda_download_btn.setEnabled(can_install)
+            self.cuda_import_btn.setEnabled(can_install)
+            self.cuda_download_btn.setVisible(not status['installed'] and can_install)
+            self.cuda_import_btn.setVisible(not status['installed'] and can_install)
+            # Removal only affects files managed by this application.
+            self.cuda_remove_btn.setVisible(status['local_present'])
+            self.download_hint.setVisible(not status['installed'] and can_install)
+            if status['installed']:
+                key = 'cuda_system_installed' if status['source'] == 'system' else 'cuda_installed'
+                self.cuda_status_label.setText(f"✅ {tr(key)}")
                 self.cuda_status_label.setStyleSheet("color: green;")
-                self.cuda_download_btn.setVisible(False)
-                self.cuda_remove_btn.setVisible(True)
-                self.download_hint.setVisible(False)
+                self.cuda_details_label.setText('\n'.join(status['library_dirs']))
+            elif provider_missing:
+                self.cuda_status_label.setText(tr('cuda_not_required'))
+                self.cuda_status_label.setStyleSheet("color: gray;")
+                self.cuda_details_label.setText(tr('cuda_provider_missing'))
             else:
-                self.cuda_status_label.setText(f"❌ {tr('cuda_not_installed')}")
+                key = 'cuda_incomplete' if status['detected'] else 'cuda_not_installed'
+                self.cuda_status_label.setText(f"❌ {tr(key)}")
                 self.cuda_status_label.setStyleSheet("color: orange;")
-                self.cuda_download_btn.setVisible(True)
-                self.cuda_remove_btn.setVisible(False)
-                self.download_hint.setVisible(True)
+                details = tr('cuda_install_hint')
+                if status['detected']:
+                    details += '\n' + tr('cuda_missing_libraries', libraries=', '.join(status['missing_libraries']))
+                self.cuda_details_label.setText(details)
                 
         except Exception as e:
             self.gpu_info_label.setText(f"Error: {e}")
             self.cuda_download_btn.setEnabled(False)
+            self.cuda_import_btn.setEnabled(False)
     
     def on_language_changed(self, index):
         """Handle language change"""
@@ -289,17 +319,28 @@ class SettingsPanel(QWidget):
     
     def on_cuda_download_clicked(self):
         """Start CUDA download."""
+        if self._download_thread is not None:
+            return
+        from raw_alchemy.onnx import gpu_runtime
+        if gpu_runtime.is_cuda_runtime_installed():
+            self._update_cuda_status()
+            return
+        if not self._can_install_cuda():
+            return
+        self._start_cuda_install()
+
+    def _can_install_cuda(self):
         try:
             from raw_alchemy.onnx import gpu_runtime
             gpu_info = gpu_runtime.detect_gpu_vendor()
             if not gpu_info['cuda_compatible']:
                 InfoBar.warning(
                     title=tr('cuda_not_supported'),
-                    content=tr('amd_gpu') if gpu_info['vendor'] == 'amd' else tr('intel_gpu'),
+                    content=tr('no_gpu_detected') if gpu_info['vendor'] == 'unknown' else tr(f"{gpu_info['vendor']}_gpu"),
                     parent=self,
                     position=InfoBarPosition.TOP
                 )
-                return
+                return False
             if gpu_runtime.cuda_provider_bundled() is False:
                 InfoBar.warning(
                     title=tr('cuda_not_supported'),
@@ -307,55 +348,85 @@ class SettingsPanel(QWidget):
                     parent=self,
                     position=InfoBarPosition.TOP
                 )
-                return
-        except Exception:
-            pass
-        
-        # Disable button and show progress
+                return False
+            return True
+        except Exception as exc:
+            self.cuda_details_label.setText(str(exc))
+            return False
+
+    def on_cuda_import_clicked(self):
+        if self._download_thread is not None:
+            return
+        from raw_alchemy.onnx import gpu_runtime
+        if gpu_runtime.is_cuda_runtime_installed():
+            self._update_cuda_status()
+            return
+        if not self._can_install_cuda():
+            return
+        archive_path, _ = QFileDialog.getOpenFileName(
+            self, tr('import_cuda'), '', tr('cuda_archive_filter'),
+        )
+        if archive_path:
+            self._start_cuda_install(archive_path)
+
+    def _start_cuda_install(self, archive_path=None):
+        self._importing_cuda = archive_path is not None
         self.cuda_download_btn.setEnabled(False)
-        self.cuda_download_btn.setText(tr('cuda_downloading'))
+        self.cuda_import_btn.setEnabled(False)
+        self.cuda_detect_btn.setEnabled(False)
+        self.cuda_remove_btn.setEnabled(False)
+        if self._importing_cuda:
+            self.cuda_import_btn.setText(tr('cuda_importing'))
+        else:
+            self.cuda_download_btn.setText(tr('cuda_downloading'))
         self.cuda_progress.setVisible(True)
         self.cuda_progress.setValue(0)
         
         # Start download in background thread
         self._download_thread = QThread()
-        self._download_worker = CudaDownloadWorker()
+        self._download_worker = CudaDownloadWorker(archive_path)
         self._download_worker.moveToThread(self._download_thread)
         
         self._download_thread.started.connect(self._download_worker.run)
         self._download_worker.progress.connect(self._on_download_progress)
         self._download_worker.finished.connect(self._on_download_finished)
+        self._download_thread.finished.connect(self._download_worker.deleteLater)
         
         self._download_thread.start()
     
     def _on_download_progress(self, downloaded: int, total: int):
         """Update download progress."""
         if total > 0:
-            percent = int(downloaded * 100 / total)
+            percent = min(100, int(downloaded * 100 / total))
             self.cuda_progress.setValue(percent)
     
     def _on_download_finished(self, success: bool):
-        """Handle download completion."""
+        """Handle download or local import completion."""
         self.cuda_progress.setVisible(False)
         self.cuda_download_btn.setText(tr('download_cuda'))
+        self.cuda_import_btn.setText(tr('import_cuda'))
+        self.cuda_detect_btn.setEnabled(True)
+        self.cuda_remove_btn.setEnabled(True)
+        error = self._download_worker.error if self._download_worker else ''
         
         if self._download_thread:
             self._download_thread.quit()
             self._download_thread.wait()
+            self._download_thread.deleteLater()
             self._download_thread = None
             self._download_worker = None
         
         if success:
             InfoBar.success(
-                title=tr('cuda_download_success'),
-                content="",
+                title=tr('cuda_import_success' if self._importing_cuda else 'cuda_download_success'),
+                content=tr('cuda_restart_hint'),
                 parent=self,
                 position=InfoBarPosition.TOP
             )
         else:
             InfoBar.error(
-                title=tr('cuda_download_failed'),
-                content="",
+                title=tr('cuda_import_failed' if self._importing_cuda else 'cuda_download_failed'),
+                content=error,
                 parent=self,
                 position=InfoBarPosition.TOP
             )
@@ -363,7 +434,7 @@ class SettingsPanel(QWidget):
         self._update_cuda_status()
 
     def shutdown_worker(self):
-        """Cancel and join an active runtime download before window teardown."""
+        """Cancel and join an active runtime installation before window teardown."""
         worker = self._download_worker
         thread = self._download_thread
         if worker is not None:
@@ -385,7 +456,8 @@ class SettingsPanel(QWidget):
         """Remove installed CUDA runtime."""
         try:
             from raw_alchemy.onnx import gpu_runtime
-            gpu_runtime.remove_cuda_runtime()
+            if not gpu_runtime.remove_cuda_runtime():
+                raise OSError(tr('cuda_remove_failed'))
             InfoBar.success(
                 title=tr('cuda_removed'),
                 content="",

@@ -15,7 +15,7 @@ import zipfile
 import tarfile
 import tempfile
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, Callable
 from loguru import logger
 
@@ -72,7 +72,56 @@ import glob as _glob
 def _resolve_lib(directory: Path, pattern: str) -> Optional[str]:
     """Find the first file matching a glob pattern in a directory."""
     matches = sorted(_glob.glob(str(directory / pattern)))
-    return os.path.basename(matches[0]) if matches else None
+    return next((os.path.basename(p) for p in matches if Path(p).is_file()), None)
+
+
+def _cuda_libraries(directories: list[Path]) -> dict[str, Path]:
+    """Resolve dependencies across CUDA and cuDNN installation directories."""
+    found = {}
+    for pattern, _ in CUDA_LIBS.get(platform.system(), []):
+        for directory in directories:
+            name = _resolve_lib(directory, pattern)
+            if name:
+                found[pattern] = directory / name
+                break
+    return found
+
+
+def _missing_cuda_libraries(libraries: dict[str, Path]) -> list[str]:
+    return [
+        pattern for pattern, required in CUDA_LIBS.get(platform.system(), [])
+        if required and pattern not in libraries
+    ]
+
+
+def detect_cuda_runtime() -> dict:
+    """Inspect local libraries without downloading, loading DLLs or requiring a GPU.
+
+    CUDA and cuDNN may be installed separately. A driver or toolkit alone does
+    not satisfy the ONNX CUDA dependencies. The managed runtime is checked on
+    its own so a partial import cannot mask a missing system dependency.
+    """
+    supported = platform.system() in CUDA_LIBS
+    system_libraries = _cuda_libraries(_system_cuda_search_dirs()) if supported else {}
+    local_dir = get_cuda_runtime_dir()
+    local_libraries = _cuda_libraries([local_dir]) if supported else {}
+    system_missing = _missing_cuda_libraries(system_libraries)
+    local_missing = _missing_cuda_libraries(local_libraries)
+    system_installed = supported and not system_missing
+    local_installed = supported and not local_missing
+    source = 'system' if system_installed else 'local' if local_installed else None
+    libraries = system_libraries if source == 'system' else local_libraries
+    # Report the installation closest to complete when neither is usable.
+    missing = [] if source else min((system_missing, local_missing), key=len)
+    return {
+        'installed': source is not None,
+        'source': source,
+        'library_dirs': list(dict.fromkeys(str(p.parent) for p in libraries.values())) if source else [],
+        'local_installed': local_installed,
+        'local_present': local_dir.is_dir(),
+        'detected': bool(system_libraries or local_libraries),
+        'missing_libraries': missing,
+    }
 
 
 # Display-adapter device class; each numbered subkey is one installed adapter.
@@ -262,25 +311,7 @@ def get_cuda_version_file() -> Path:
 
 def is_cuda_runtime_installed() -> bool:
     """Check if CUDA runtime libraries are available (system or local)."""
-    system = platform.system()
-    if system not in CUDA_LIBS:
-        return False
-
-    # Check system CUDA first
-    if _find_system_cuda_dir() is not None:
-        return True
-
-    # Check locally downloaded runtime
-    cuda_dir = get_cuda_runtime_dir()
-    if not cuda_dir.exists():
-        return False
-
-    for pattern, is_required in CUDA_LIBS[system]:
-        if is_required and _resolve_lib(cuda_dir, pattern) is None:
-            logger.debug(f"Missing CUDA library matching: {pattern}")
-            return False
-
-    return True
+    return detect_cuda_runtime()['installed']
 
 
 def get_installed_cuda_version() -> Optional[str]:
@@ -296,9 +327,14 @@ def get_installed_cuda_version() -> Optional[str]:
 
 def is_cuda_update_available() -> bool:
     """Check if a newer CUDA runtime version is available."""
+    status = detect_cuda_runtime()
+    if not status['installed']:
+        return True
+    if status['source'] == 'system':
+        return False
     installed = get_installed_cuda_version()
     if installed is None:
-        return True  # Not installed, so "update" is available
+        return False  # Imported packages have no known release version.
     return installed != CUDA_RUNTIME_VERSION
 
 
@@ -355,6 +391,10 @@ def download_cuda_runtime(
     if system not in CUDA_PACKAGE_NAMES:
         logger.error(f"CUDA runtime not available for {system}")
         return False
+
+    if is_cuda_runtime_installed():
+        logger.info("CUDA/cuDNN libraries already installed; skipping download")
+        return True
     
     download_url = get_cuda_download_url()
     if not download_url:
@@ -362,10 +402,14 @@ def download_cuda_runtime(
         return False
     
     cuda_dir = get_cuda_runtime_dir()
-    cuda_dir.mkdir(parents=True, exist_ok=True)
+    cuda_dir.parent.mkdir(parents=True, exist_ok=True)
     
     package_name = CUDA_PACKAGE_NAMES[system]
-    temp_file = cuda_dir / f"temp_{package_name}"
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix='cuda-download-', suffix='-' + package_name, dir=cuda_dir.parent,
+    )
+    os.close(descriptor)
+    temp_file = Path(temp_name)
     
     try:
         logger.info(f"Downloading CUDA runtime from: {download_url}")
@@ -391,22 +435,11 @@ def download_cuda_runtime(
                     if progress_callback:
                         progress_callback(downloaded, total_size)
         
-        logger.info(f"Download complete, extracting...")
-        
-        # Extract the package
-        if package_name.endswith('.zip'):
-            with zipfile.ZipFile(temp_file, 'r') as zf:
-                zf.extractall(cuda_dir)
-        elif package_name.endswith('.tar.gz'):
-            with tarfile.open(temp_file, 'r:gz') as tf:
-                tf.extractall(cuda_dir)
-        
-        # Write version file
-        version_file = get_cuda_version_file()
-        version_file.write_text(CUDA_RUNTIME_VERSION)
-        
-        logger.info(f"CUDA runtime installed successfully to {cuda_dir}")
-        return True
+        logger.info("Download complete, validating CUDA runtime...")
+        success = import_cuda_runtime(temp_file, progress_callback, cancel_callback)
+        if success:
+            get_cuda_version_file().write_text(CUDA_RUNTIME_VERSION)
+        return success
         
     except urllib.error.URLError as e:
         logger.error(f"Failed to download CUDA runtime: {e}")
@@ -423,28 +456,100 @@ def download_cuda_runtime(
                 pass
 
 
-def _find_system_cuda_dir() -> Optional[Path]:
-    """
-    Detect system-installed CUDA toolkit (NVIDIA installer).
+def import_cuda_runtime(
+    archive_path: str | Path,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Import a ZIP/tar runtime, flattening library folders and validating first.
 
-    Checks:
-    1. CUDA_PATH / CUDA_HOME environment variable
-    2. Common install paths (Windows: Program Files, Linux: /usr/local/cuda)
-
-    Returns the bin directory containing CUDA DLLs/SOs, or None.
+    Only library file contents are copied; archive paths and links are never
+    extracted onto the filesystem. An incomplete or cancelled import leaves
+    the current runtime untouched. Raises ValueError for an invalid package.
     """
+    if platform.system() not in CUDA_LIBS:
+        raise ValueError("CUDA runtime is not supported on this platform")
+    archive_path = Path(archive_path)
+    cuda_dir = get_cuda_runtime_dir()
+    cuda_dir.parent.mkdir(parents=True, exist_ok=True)
+    is_zip = zipfile.is_zipfile(archive_path)
+    archive = zipfile.ZipFile(archive_path) if is_zip else tarfile.open(archive_path, 'r:*')
+    with archive, tempfile.TemporaryDirectory(prefix='.cuda-import-', dir=cuda_dir.parent) as temp:
+        staging = Path(temp) / 'runtime'
+        staging.mkdir()
+        entries = []
+        seen = set()
+        for member in archive.infolist() if is_zip else archive.getmembers():
+            name = member.filename if is_zip else member.name
+            path = PurePosixPath(name.replace('\\', '/'))
+            if path.is_absolute() or '..' in path.parts or (path.parts and ':' in path.parts[0]):
+                raise ValueError(f"Unsafe archive path: {name}")
+            if (member.is_dir() if is_zip else member.isdir()):
+                continue
+            basename = path.name
+            lower = basename.lower()
+            if not (lower.endswith('.dll') or lower.endswith('.so') or '.so.' in lower):
+                continue
+            if not is_zip and not (member.isfile() or member.issym() or member.islnk()):
+                raise ValueError(f"Unsupported archive entry: {name}")
+            if lower in seen:
+                raise ValueError(f"Duplicate CUDA library: {basename}")
+            seen.add(lower)
+            entries.append((member, basename))
+        total = sum(m.file_size if is_zip else m.size for m, _ in entries)
+        copied = 0
+        for member, basename in entries:
+            if cancel_callback and cancel_callback():
+                return False
+            source = archive.open(member) if is_zip else archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"Cannot read CUDA library: {basename}")
+            with source, (staging / basename).open('wb') as output:
+                while True:
+                    if cancel_callback and cancel_callback():
+                        return False
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    copied += len(chunk)
+                    if progress_callback:
+                        progress_callback(copied, total)
+        missing = _missing_cuda_libraries(_cuda_libraries([staging]))
+        if missing:
+            raise ValueError("Missing CUDA/cuDNN libraries: " + ', '.join(missing))
+        archive.close()
+        # An imported package is not necessarily the release identified by
+        # CUDA_RUNTIME_VERSION. Do not label arbitrary libraries as v1.0.0.
+        if cancel_callback and cancel_callback():
+            return False
+        backup = Path(temp) / 'previous'
+        if cuda_dir.exists():
+            cuda_dir.rename(backup)
+        try:
+            staging.rename(cuda_dir)
+        except Exception:
+            if backup.exists():
+                backup.rename(cuda_dir)
+            raise
+    logger.info(f"CUDA runtime imported to {cuda_dir}")
+    return True
+
+
+def _system_cuda_search_dirs() -> list[Path]:
+    """Known toolkit, cuDNN, loader and NVIDIA Python-package locations."""
     system = platform.system()
-    lib_list = CUDA_LIBS.get(system, [])
-    if not lib_list:
-        return None
+    if system not in CUDA_LIBS:
+        return []
 
     candidate_dirs: list[Path] = []
 
     # Environment variables set by NVIDIA installer
-    for env_var in ('CUDA_PATH', 'CUDA_HOME'):
+    for env_var in ('CUDA_PATH', 'CUDA_HOME', 'CUDNN_PATH', 'CUDNN_HOME'):
         env_val = os.environ.get(env_var)
         if env_val:
             p = Path(env_val)
+            candidate_dirs.append(p)
             if system == 'Windows':
                 candidate_dirs.append(p / 'bin')
             else:
@@ -460,6 +565,10 @@ def _find_system_cuda_dir() -> Optional[Path]:
                 for ver_dir in sorted(toolkit_root.iterdir(), reverse=True):
                     if ver_dir.name.startswith(('v13', 'v12')):
                         candidate_dirs.append(ver_dir / 'bin')
+        cudnn_root = Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'NVIDIA' / 'CUDNN'
+        if cudnn_root.is_dir():
+            candidate_dirs.extend(sorted(cudnn_root.glob('v9*/bin'), reverse=True))
+        candidate_dirs.extend(Path(p) for p in os.environ.get('PATH', '').split(os.pathsep) if p)
     else:
         # Linux common paths
         cuda_base = Path('/usr/local')
@@ -468,21 +577,25 @@ def _find_system_cuda_dir() -> Optional[Path]:
                 if d.name.startswith(('cuda-13', 'cuda-12')) or d.name == 'cuda':
                     candidate_dirs.append(d / 'lib64')
                     candidate_dirs.append(d / 'lib')
+        candidate_dirs.extend(Path(p) for p in os.environ.get('LD_LIBRARY_PATH', '').split(os.pathsep) if p)
+        candidate_dirs.extend([Path('/usr/lib/x86_64-linux-gnu'), Path('/usr/lib64')])
 
-    # Check each candidate for required libraries (using glob patterns)
-    for cdir in candidate_dirs:
-        if not cdir.is_dir():
-            continue
-        required_found = True
-        for pattern, is_required in lib_list:
-            if is_required and _resolve_lib(cdir, pattern) is None:
-                required_found = False
-                break
-        if required_found:
-            logger.info(f"Found system CUDA installation: {cdir}")
-            return cdir
+    import site
+    for base in site.getsitepackages() + [site.getusersitepackages()]:
+        nvidia_dir = Path(base) / 'nvidia'
+        if nvidia_dir.is_dir():
+            candidate_dirs.extend(nvidia_dir.glob('*/bin' if system == 'Windows' else '*/lib'))
+    local_dir = get_cuda_runtime_dir().resolve()
+    return list(dict.fromkeys(
+        p for p in candidate_dirs if p.is_dir() and p.resolve() != local_dir
+    ))
 
-    return None
+
+def _find_system_cuda_dir() -> Optional[Path]:
+    libraries = _cuda_libraries(_system_cuda_search_dirs())
+    if not libraries or _missing_cuda_libraries(libraries):
+        return None
+    return next(iter(libraries.values())).parent
 
 
 def setup_cuda_dll_paths() -> bool:
@@ -498,44 +611,33 @@ def setup_cuda_dll_paths() -> bool:
     Returns:
         True if CUDA paths were set up, False if CUDA is not available
     """
-    system = platform.system()
-
-    # --- Try system CUDA first ---
-    system_cuda = _find_system_cuda_dir()
-    if system_cuda is not None:
-        return _activate_cuda_dir(system_cuda)
-
-    # --- Fallback: locally downloaded runtime ---
-    if system != 'Windows':
-        cuda_dir = get_cuda_runtime_dir()
-        if cuda_dir.exists():
-            current_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
-            if str(cuda_dir) not in current_ld_path:
-                os.environ['LD_LIBRARY_PATH'] = f"{cuda_dir}:{current_ld_path}"
-            preload_cuda_dlls(cuda_dir)
-            return True
+    status = detect_cuda_runtime()
+    if not status['installed']:
         return False
+    return _activate_cuda_dirs([Path(p) for p in status['library_dirs']])
 
-    # Windows local runtime
-    cuda_dir = get_cuda_runtime_dir()
-    if not cuda_dir.exists() or not is_cuda_runtime_installed():
-        return False
 
-    return _activate_cuda_dir(cuda_dir)
+# DLL-directory registrations must stay alive for delay-loaded cuDNN components.
+_CUDA_DLL_DIRECTORIES = {}
 
 
 def _activate_cuda_dir(cuda_dir: Path) -> bool:
-    """Register a CUDA directory and pre-load its DLLs."""
+    return _activate_cuda_dirs([cuda_dir])
+
+
+def _activate_cuda_dirs(directories: list[Path]) -> bool:
+    """Register all dependency directories before loading any CUDA library."""
     try:
-        if platform.system() == 'Windows' and hasattr(os, 'add_dll_directory'):
-            os.add_dll_directory(str(cuda_dir))
-            logger.debug(f"Added CUDA DLL directory: {cuda_dir}")
-
-        current_path = os.environ.get('PATH', '')
-        if str(cuda_dir) not in current_path:
-            os.environ['PATH'] = f"{cuda_dir}{os.pathsep}{current_path}"
-
-        preload_cuda_dlls(cuda_dir)
+        if platform.system() == 'Windows':
+            for directory in directories:
+                key = str(directory)
+                if hasattr(os, 'add_dll_directory') and key not in _CUDA_DLL_DIRECTORIES:
+                    _CUDA_DLL_DIRECTORIES[key] = os.add_dll_directory(key)
+        variable = 'PATH' if platform.system() == 'Windows' else 'LD_LIBRARY_PATH'
+        existing = os.environ.get(variable, '').split(os.pathsep)
+        os.environ[variable] = os.pathsep.join(dict.fromkeys([str(p) for p in directories] + existing))
+        for directory in directories:
+            preload_cuda_dlls(directory)
         return True
 
     except Exception as e:
@@ -598,12 +700,13 @@ def get_cuda_status() -> dict:
     Returns:
         Dict with status information
     """
-    system_dir = _find_system_cuda_dir()
+    status = detect_cuda_runtime()
+    system_dir = status['library_dirs'][0] if status['source'] == 'system' else None
     return {
+        **status,
         'platform_supported': platform.system() in CUDA_PACKAGE_NAMES,
-        'installed': is_cuda_runtime_installed(),
-        'system_cuda': str(system_dir) if system_dir else None,
-        'installed_version': get_installed_cuda_version(),
+        'system_cuda': system_dir,
+        'installed_version': get_installed_cuda_version() if status['source'] == 'local' else None,
         'latest_version': CUDA_RUNTIME_VERSION,
         'update_available': is_cuda_update_available() and system_dir is None,
         'cuda_dir': str(system_dir or get_cuda_runtime_dir()),
