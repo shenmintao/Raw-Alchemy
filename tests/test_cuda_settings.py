@@ -2,6 +2,7 @@
 import time
 from unittest.mock import Mock
 
+import onnxruntime as ort
 import pytest
 
 from raw_alchemy.onnx import gpu_runtime as runtime
@@ -54,14 +55,51 @@ def test_existing_system_runtime_hides_install_buttons_and_never_downloads(setti
     start.assert_not_called()
 
 
-def test_directml_build_explains_cuda_is_unnecessary(settings, monkeypatch):
+@pytest.mark.parametrize('system_runtime_installed', [False, True])
+def test_directml_build_explains_cuda_is_unnecessary(settings, monkeypatch, tmp_path, system_runtime_installed):
     panel, ui, _ = settings
     monkeypatch.setattr(runtime, 'cuda_provider_bundled', lambda: False)
+    monkeypatch.setattr(ort, 'get_available_providers', lambda: ['DmlExecutionProvider', 'CPUExecutionProvider'])
+    monkeypatch.delenv('RAW_ALCHEMY_CPU_ONLY', raising=False)
+    session = Mock(side_effect=AssertionError('displaying backend status must not load a model'))
+    monkeypatch.setattr(ort, 'InferenceSession', session)
+    if system_runtime_installed:
+        system = tmp_path / 'system'
+        _install_libraries(system)
+        monkeypatch.setattr(runtime, '_system_cuda_search_dirs', lambda: [system])
     panel._update_cuda_status()
+    assert panel.backend_status_label.text() == ui.tr(
+        'inference_backend', backend=ui.tr('inference_backend_gpu', backend='DirectML'),
+    )
+    assert panel.backend_hint_label.text() == ui.tr('inference_backend_gpu_hint')
     assert panel.cuda_status_label.text() == ui.tr('cuda_not_required')
     assert panel.cuda_download_btn.isHidden()
     assert panel.cuda_import_btn.isHidden()
     assert ui.tr('cuda_provider_missing') in panel.cuda_details_label.text()
+    session.assert_not_called()
+
+
+def test_backend_refresh_respects_cpu_only_configuration(settings, monkeypatch):
+    panel, ui, _ = settings
+    monkeypatch.setattr(ort, 'get_available_providers', lambda: ['DmlExecutionProvider', 'CPUExecutionProvider'])
+    monkeypatch.setenv('RAW_ALCHEMY_CPU_ONLY', '1')
+    panel._update_cuda_status()
+    assert panel.backend_status_label.text() == ui.tr('inference_backend', backend='CPU')
+    assert panel.backend_hint_label.text() == ui.tr('inference_backend_cpu_hint')
+    monkeypatch.delenv('RAW_ALCHEMY_CPU_ONLY')
+    panel._update_cuda_status()
+    assert 'DirectML' in panel.backend_status_label.text()
+
+
+def test_backend_detection_failure_does_not_claim_cpu_or_hide_cuda_status(settings, monkeypatch):
+    panel, ui, _ = settings
+    monkeypatch.delenv('RAW_ALCHEMY_CPU_ONLY', raising=False)
+    monkeypatch.setattr(ort, 'get_available_providers', Mock(side_effect=RuntimeError('runtime unavailable')))
+    monkeypatch.setattr(runtime, 'cuda_provider_bundled', lambda: False)
+    panel._update_cuda_status()
+    assert panel.backend_status_label.text() == ui.tr('inference_backend_unknown')
+    assert panel.backend_hint_label.text() == ''
+    assert panel.cuda_status_label.text() == ui.tr('cuda_not_required')
 
 
 def test_incomplete_toolkit_lists_missing_cudnn(settings):

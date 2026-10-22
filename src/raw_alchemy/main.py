@@ -7,6 +7,7 @@ if __name__ == "__main__":
 
 import os
 import platform
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from raw_alchemy import i18n
@@ -38,6 +39,11 @@ def main():
     # 解决部分Windows环境下缩放问题
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
     os.environ["QT_SCALE_FACTOR"] = "1"
+
+    if platform.system() == 'Windows':
+        # Issue #37: native folder/save dialogs can raise COM thread faults.
+        # Apply this before QApplication so every file dialog uses Qt widgets.
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
 
     app = QApplication(sys.argv)
     # Configure the file log for the GUI process (worker/decode processes do

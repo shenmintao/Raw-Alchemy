@@ -178,6 +178,13 @@ class SettingsPanel(QWidget):
         self.gpu_info_label = BodyLabel("")
         self.gpu_info_label.setWordWrap(True)
         gpu_layout.addWidget(self.gpu_info_label)
+
+        self.backend_status_label = BodyLabel("")
+        self.backend_status_label.setWordWrap(True)
+        gpu_layout.addWidget(self.backend_status_label)
+        self.backend_hint_label = CaptionLabel("")
+        self.backend_hint_label.setWordWrap(True)
+        gpu_layout.addWidget(self.backend_hint_label)
         
         # CUDA status
         cuda_status_row = QHBoxLayout()
@@ -254,8 +261,33 @@ class SettingsPanel(QWidget):
         self.native_base_switch.setChecked(bool(enabled))
         self.native_base_switch.blockSignals(False)
     
+    def _update_backend_status(self):
+        """Show provider preference without initializing a model or claiming placement."""
+        try:
+            from raw_alchemy.onnx.denoiser import _get_providers
+
+            provider = _get_providers()[0]
+            backend = {
+                'DmlExecutionProvider': 'DirectML',
+                'ROCMExecutionProvider': 'ROCm',
+            }.get(provider, provider.removesuffix('ExecutionProvider'))
+            if provider in (
+                'CUDAExecutionProvider', 'DmlExecutionProvider',
+                'ROCMExecutionProvider', 'MIGraphXExecutionProvider',
+            ):
+                backend = tr('inference_backend_gpu', backend=backend)
+            self.backend_status_label.setText(tr('inference_backend', backend=backend))
+            hint = 'inference_backend_cpu_hint' if provider == 'CPUExecutionProvider' else 'inference_backend_gpu_hint'
+            self.backend_hint_label.setText(tr(hint))
+        except Exception as exc:
+            from loguru import logger
+            logger.warning(f"Could not detect inference backend: {exc}")
+            self.backend_status_label.setText(tr('inference_backend_unknown'))
+            self.backend_hint_label.setText('')
+
     def _update_cuda_status(self):
         """Update CUDA status display based on current state."""
+        self._update_backend_status()
         try:
             from raw_alchemy.onnx import gpu_runtime
             
@@ -264,12 +296,7 @@ class SettingsPanel(QWidget):
             gpu_info = gpu_runtime.detect_gpu_vendor()
             provider_missing = gpu_runtime.cuda_provider_bundled() is False
             can_install = gpu_info['cuda_compatible'] and not provider_missing
-            if gpu_info['cuda_compatible'] and provider_missing:
-                # A DirectML/CPU build cannot use a downloaded CUDA runtime.
-                self.gpu_info_label.setText(
-                    f"ℹ️ {tr('nvidia_gpu')}: {gpu_info['name']} - {tr('cuda_provider_missing')}"
-                )
-            elif gpu_info['cuda_compatible']:
+            if gpu_info['cuda_compatible']:
                 self.gpu_info_label.setText(f"✅ {tr('nvidia_gpu')}: {gpu_info['name']}")
             elif gpu_info['vendor'] == 'amd':
                 self.gpu_info_label.setText(f"⚠️ {tr('amd_gpu')}")
@@ -285,15 +312,16 @@ class SettingsPanel(QWidget):
             # Removal only affects files managed by this application.
             self.cuda_remove_btn.setVisible(status['local_present'])
             self.download_hint.setVisible(not status['installed'] and can_install)
-            if status['installed']:
+            if provider_missing:
+                # Installed CUDA libraries do not change this build's backend.
+                self.cuda_status_label.setText(tr('cuda_not_required'))
+                self.cuda_status_label.setStyleSheet("color: gray;")
+                self.cuda_details_label.setText(tr('cuda_provider_missing'))
+            elif status['installed']:
                 key = 'cuda_system_installed' if status['source'] == 'system' else 'cuda_installed'
                 self.cuda_status_label.setText(f"✅ {tr(key)}")
                 self.cuda_status_label.setStyleSheet("color: green;")
                 self.cuda_details_label.setText('\n'.join(status['library_dirs']))
-            elif provider_missing:
-                self.cuda_status_label.setText(tr('cuda_not_required'))
-                self.cuda_status_label.setStyleSheet("color: gray;")
-                self.cuda_details_label.setText(tr('cuda_provider_missing'))
             else:
                 key = 'cuda_incomplete' if status['detected'] else 'cuda_not_installed'
                 self.cuda_status_label.setText(f"❌ {tr(key)}")
