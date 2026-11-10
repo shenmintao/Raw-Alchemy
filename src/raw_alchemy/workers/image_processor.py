@@ -1558,6 +1558,12 @@ class ImageProcessor(QThread):
         else:
             corrected = src
 
+        # A skipped correction may return src or a view of it. The executor
+        # mutates and recycles that working buffer after this callback, so
+        # detach it before publishing linear pixels to the lens/export cache.
+        if np.shares_memory(corrected, src):
+            corrected = np.array(corrected, copy=True, order="C")
+
         if self._executor_using_proxy:
             self.cpu_proxy_corrected = corrected
             self.cached_proxy_lens_key = current_lens_key

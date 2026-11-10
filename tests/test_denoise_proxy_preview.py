@@ -181,7 +181,7 @@ def test_first_proxy_denoise_publishes_current_metering_source(monkeypatch, tmp_
 def test_lens_cache_key_includes_denoise_strength():
     """Changing strength must not reuse lens-corrected pixels from the old denoise."""
     p = _processor()
-    p.exif_data = None  # lens callback is a passthrough, making identity observable
+    p.exif_data = None  # skipped correction preserves each denoise strength's pixels
 
     class _EmptyCache:
         @staticmethod
@@ -197,7 +197,7 @@ def test_lens_cache_key_includes_denoise_strength():
         lens_correct=True, denoise_strength=0.25, custom_db_path=None
     )
     out_first = p._executor_lens_correct(first)
-    assert out_first is first
+    np.testing.assert_array_equal(out_first, first)
     assert p.cached_lens_key == (True, None, 0.25)
 
     p._executor_params = _preview_params(
@@ -205,7 +205,7 @@ def test_lens_cache_key_includes_denoise_strength():
     )
     out_second = p._executor_lens_correct(second)
 
-    assert out_second is second
+    np.testing.assert_array_equal(out_second, second)
     assert p.cached_lens_key == (True, None, 0.5)
 
 
