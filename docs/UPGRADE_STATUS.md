@@ -1,5 +1,25 @@
 # Upgrade Status
 
+## v0.6.5 — skipped lens correction cache ownership (2026-11-10)
+
+Issue [#38](https://github.com/shenmintao/Raw-Alchemy/issues/38) was reproduced
+with the reporter's original Xiaomi 14 Ultra `IMG_20260313_095519.dng` using
+CPU inference. A skipped lens correction cached the executor's mutable working
+buffer; later colour processing or pool reuse overwrote its linear pixels.
+Aliased results are now copied before publication to the lens, metering and
+export caches. Independent correction outputs retain their existing allocation.
+
+- Fourteen new regressions failed before the fix and pass afterwards, covering
+  full/proxy buffers, fused/per-operation rendering, repeated edits and resets,
+  output eviction, unavailable profiles, correction errors and tiled aliases.
+- Local Windows/Python 3.12: **682 passed, 11 skipped**; the two existing Canon
+  Log reference warnings remain. Ruff passed for all tracked Python files.
+- [Hosted CI](https://github.com/shenmintao/Raw-Alchemy/actions/runs/42749740727): **675 passed, 18 skipped** on each platform, including installed-wheel runtime,
+  Ruff and Nikon HE/HE-star sample checks.
+- [v0.6.5](https://github.com/shenmintao/Raw-Alchemy/releases/tag/v0.6.5) provides Windows, Linux and macOS packages plus
+  `SHA256SUMS.txt`. The manifest agrees with GitHub's SHA256 asset digests.
+  Both Homebrew Casks are updated from the final macOS checksum.
+
 ## Post-v0.6.2 — Lensfun development snapshot (2026-10-19)
 
 The upstream development branch is `master`, not `develop`. Source and future
